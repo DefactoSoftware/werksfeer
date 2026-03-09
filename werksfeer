@@ -527,17 +527,6 @@ prune_project() {
     return 0
   fi
 
-  # Collect active worktree directory basenames (sanitized)
-  local active_names=""
-  while IFS= read -r wt_line; do
-    local wt_path
-    wt_path="$(echo "$wt_line" | awk '{print $1}')"
-    local wt_basename
-    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
-    active_names="${active_names}${wt_basename}
-"
-  done < <(cd "$project_dir" && git worktree list 2>/dev/null)
-
   # Get all worktree_* databases
   local all_wt_dbs
   all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
@@ -547,40 +536,37 @@ prune_project() {
     return 0
   fi
 
-  # Get the sanitized project name for filtering
-  local project_name
-  project_name="$(cd "$project_dir" && sanitize_name "$(basename "$(get_main_worktree_path)")")"
+  # Build list of DB name stems from active worktrees
+  # DB naming: worktree_{branch}_{wt_name} and worktree_{branch}_{wt_name}_test
+  # So the stem to match is "worktree_{branch}_{wt_name}" (without _test)
+  local active_stems=""
+  while IFS= read -r wt_line; do
+    local wt_path wt_basename wt_branch
+    wt_path="$(echo "$wt_line" | awk '{print $1}')"
+    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
+    # Get branch for this worktree from porcelain output
+    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
+    active_stems="${active_stems}worktree_${wt_branch}_${wt_basename}
+"
+  done < <(cd "$project_dir" && git worktree list 2>/dev/null)
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue
 
-    # Only consider databases that could belong to this project
-    # DB format: worktree_{branch}_{wt_name}[_test]
-    # We strip the _test suffix for matching
-    local db_base
-    db_base="$(echo "$db" | sed 's/_test$//')"
+    # Get the stem: strip _test suffix if present
+    local db_stem
+    db_stem="$(echo "$db" | sed 's/_test$//')"
 
-    local is_orphan=true
-
-    # Check if any active worktree name appears at the end of the DB name
-    echo "$active_names" | while IFS= read -r name; do
-      [ -z "$name" ] && continue
-      if echo "$db_base" | grep -q "_${name}$"; then
-        is_orphan=false
-        break
-      fi
-    done
-
-    # The subshell above can't set is_orphan for us; use a different approach
+    # Check if this stem belongs to any active worktree
     local found=false
-    while IFS= read -r name; do
-      [ -z "$name" ] && continue
-      if echo "$db_base" | grep -q "_${name}$"; then
+    while IFS= read -r stem; do
+      [ -z "$stem" ] && continue
+      if [ "$db_stem" = "$stem" ]; then
         found=true
         break
       fi
     done <<EOF
-$active_names
+$active_stems
 EOF
 
     if [ "$found" = false ]; then
