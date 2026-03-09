@@ -1,0 +1,29 @@
+# werksfeer configuration
+# Copy this file to .worktree.toml in your project root and adjust as needed.
+# All sections and keys are optional — werksfeer auto-detects sensible defaults.
+
+[database]
+# Override the base database name (default: lowercase project directory name)
+# base_name = "myapp"
+
+# Override suffixes (Rails default: _development/_test, Elixir default: _dev/_test)
+# dev_suffix = "_development"
+# test_suffix = "_test"
+
+[sync]
+# Directories to symlink from the main worktree (overrides auto-detected defaults)
+# symlink = ["node_modules", "_build", "deps"]
+
+# Files to copy from the main worktree (overrides auto-detected defaults)
+# copy = [".env", ".envrc", ".tool-versions"]
+
+# Directories to never sync
+# skip = ["tmp"]
+
+[setup]
+# Override the auto-detected setup command
+# command = "bin/setup"
+
+[hooks]
+# Shell command to run after worktree setup is complete
+# post_setup = "echo 'ready!'"

@@ -1,0 +1,778 @@
+#!/usr/bin/env bash
+# werksfeer - Universal git worktree setup tool
+# https://github.com/DefactoSoftware/werksfeer
+#
+# Compatible with bash 3.2+ (macOS default), bash 5.x, and called from zsh/fish.
+# Requires: git, optionally psql for database cloning.
+
+set -euo pipefail
+
+WERKSFEER_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+log_info()  { echo "[werksfeer] $*" >&2; }
+log_warn()  { echo "[werksfeer] WARNING: $*" >&2; }
+log_error() { echo "[werksfeer] ERROR: $*" >&2; }
+log_debug() { [ "${WERKSFEER_DEBUG:-0}" = "1" ] && echo "[werksfeer] DEBUG: $*" >&2 || true; }
+log_step()  { echo "[werksfeer] ==> $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Minimal TOML parser
+# ---------------------------------------------------------------------------
+# Handles [section], key = "value", key = ["a", "b"], key = true/false/int.
+# Stores values in _TOML_<SECTION>_<KEY> variables.
+# Arrays are stored as newline-delimited strings.
+
+_TOML_PARSED=0
+
+toml_parse() {
+  local file="$1"
+  [ ! -f "$file" ] && return 0
+  _TOML_PARSED=1
+
+  local section=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Strip inline comments (only outside quotes — simplified: strip # not inside quotes)
+    line="$(echo "$line" | sed 's/[[:space:]]*#[^"]*$//')"
+    # Trim whitespace
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+
+    # Section header
+    if echo "$line" | grep -qE '^\[[a-zA-Z_][a-zA-Z0-9_]*\]$'; then
+      section="$(echo "$line" | sed 's/^\[\(.*\)\]$/\1/' | tr '[:lower:]' '[:upper:]')"
+      continue
+    fi
+
+    # Key = value
+    local key value
+    key="$(echo "$line" | sed 's/[[:space:]]*=.*//' | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_]/_/g')"
+    value="$(echo "$line" | sed 's/^[^=]*=[[:space:]]*//')"
+
+    [ -z "$key" ] && continue
+    [ -z "$section" ] && section="DEFAULT"
+
+    # Array value: ["a", "b", "c"]
+    if echo "$value" | grep -qE '^\['; then
+      # Strip brackets, quotes, split on comma
+      value="$(echo "$value" | sed 's/^\[//;s/\]$//;s/"//g;s/'\''//g' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')"
+    else
+      # Strip surrounding quotes from scalar
+      value="$(echo "$value" | sed 's/^"//;s/"$//;s/^'\''//;s/'\''$//')"
+    fi
+
+    local varname="_TOML_${section}_${key}"
+    eval "${varname}=\$(cat <<'_TOML_EOF_'
+${value}
+_TOML_EOF_
+)"
+  done < "$file"
+}
+
+toml_get() {
+  local section key default varname
+  section="$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+  key="$(echo "$2" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_]/_/g')"
+  default="${3:-}"
+  varname="_TOML_${section}_${key}"
+  eval "echo \"\${${varname}:-${default}}\""
+}
+
+toml_get_array() {
+  local section key varname
+  section="$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+  key="$(echo "$2" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_]/_/g')"
+  varname="_TOML_${section}_${key}"
+  eval "echo \"\${${varname}:-}\""
+}
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+is_git_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1
+}
+
+is_worktree() {
+  # In a worktree .git is a FILE (contains "gitdir: ..."), not a directory
+  [ -f ".git" ]
+}
+
+get_main_worktree_path() {
+  git worktree list --porcelain | head -1 | sed 's/^worktree //'
+}
+
+get_worktree_name() {
+  basename "$(pwd)"
+}
+
+get_worktree_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD"
+}
+
+get_project_name() {
+  basename "$(get_main_worktree_path)" | tr '[:upper:]' '[:lower:]'
+}
+
+sanitize_name() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//'
+}
+
+is_worktree_creation() {
+  local prev_head="${1:-}"
+  local new_head="${2:-}"
+  local flag="${3:-}"
+  local null_ref="0000000000000000000000000000000000000000"
+
+  # Must be a branch checkout (flag=1), from the null ref, and .git is a file
+  [ "$flag" = "1" ] && [ "$prev_head" = "$null_ref" ] && [ -f ".git" ]
+}
+
+# ---------------------------------------------------------------------------
+# Project detection
+# ---------------------------------------------------------------------------
+
+detect_project_type() {
+  local root="$1"
+
+  if [ -f "$root/Gemfile" ] && [ -f "$root/config/database.yml" ]; then
+    echo "rails"; return
+  fi
+  if [ -f "$root/mix.exs" ]; then
+    echo "elixir"; return
+  fi
+  if [ -f "$root/pyproject.toml" ] || [ -f "$root/requirements.txt" ] || [ -f "$root/Pipfile" ]; then
+    echo "python"; return
+  fi
+  if [ -f "$root/package.json" ]; then
+    echo "node"; return
+  fi
+  echo "unknown"
+}
+
+# ---------------------------------------------------------------------------
+# Default directories to symlink per project type
+# ---------------------------------------------------------------------------
+
+default_symlink_dirs() {
+  case "$1" in
+    rails)
+      printf '%s\n' node_modules .bundle tmp/cache
+      ;;
+    elixir)
+      printf '%s\n' _build deps node_modules
+      ;;
+    python)
+      printf '%s\n' .venv __pycache__ .mypy_cache .pytest_cache .ruff_cache
+      ;;
+    node)
+      printf '%s\n' node_modules .next .nuxt .svelte-kit .turbo .parcel-cache
+      ;;
+    *)
+      printf '%s\n' node_modules
+      ;;
+  esac
+}
+
+default_copy_files() {
+  case "$1" in
+    rails)
+      printf '%s\n' .env .sample.env .tool-versions
+      ;;
+    elixir)
+      printf '%s\n' .envrc .tool-versions
+      ;;
+    python)
+      printf '%s\n' .env .tool-versions .python-version
+      ;;
+    node)
+      printf '%s\n' .env .nvmrc .node-version .tool-versions
+      ;;
+    *)
+      printf '%s\n' .env
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# File sync
+# ---------------------------------------------------------------------------
+
+sync_env_files() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local project_type="$3"
+
+  local copy_files
+  copy_files="$(toml_get_array "sync" "copy")"
+  [ -z "$copy_files" ] && copy_files="$(default_copy_files "$project_type")"
+
+  echo "$copy_files" | while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    local src="$main_path/$file"
+    local dst="$worktree_path/$file"
+
+    if [ ! -f "$src" ]; then
+      log_debug "Skip copy $file (not in main worktree)"
+      continue
+    fi
+    if [ -f "$dst" ]; then
+      log_info "Skip copy $file (already exists)"
+      continue
+    fi
+
+    local parent
+    parent="$(dirname "$dst")"
+    [ ! -d "$parent" ] && mkdir -p "$parent"
+
+    cp "$src" "$dst"
+    log_info "Copied $file"
+  done
+}
+
+sync_build_dirs() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local project_type="$3"
+
+  local symlink_dirs
+  symlink_dirs="$(toml_get_array "sync" "symlink")"
+  [ -z "$symlink_dirs" ] && symlink_dirs="$(default_symlink_dirs "$project_type")"
+
+  local skip_dirs
+  skip_dirs="$(toml_get_array "sync" "skip")"
+
+  echo "$symlink_dirs" | while IFS= read -r dir; do
+    [ -z "$dir" ] && continue
+
+    # Check skip list
+    if [ -n "$skip_dirs" ] && echo "$skip_dirs" | grep -qxF "$dir"; then
+      log_info "Skip symlink $dir (in skip list)"
+      continue
+    fi
+
+    local src="$main_path/$dir"
+    local dst="$worktree_path/$dir"
+
+    if [ -L "$dst" ]; then
+      log_info "Skip symlink $dir (already linked)"
+      continue
+    fi
+    if [ -d "$dst" ]; then
+      log_warn "$dir exists as directory, not symlinking"
+      continue
+    fi
+    if [ ! -d "$src" ]; then
+      log_debug "Skip symlink $dir (not yet in main worktree)"
+      continue
+    fi
+
+    local parent
+    parent="$(dirname "$dst")"
+    [ ! -d "$parent" ] && mkdir -p "$parent"
+
+    ln -s "$src" "$dst"
+    log_info "Symlinked $dir -> $src"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Database operations
+# ---------------------------------------------------------------------------
+
+has_psql() {
+  command -v psql >/dev/null 2>&1
+}
+
+db_exists() {
+  psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+}
+
+get_base_db_names() {
+  local project_type="$1"
+  local project_name
+  project_name="$(sanitize_name "$(get_project_name)")"
+
+  # Allow override from config
+  local override
+  override="$(toml_get "database" "base_name" "")"
+  [ -n "$override" ] && project_name="$(sanitize_name "$override")"
+
+  local dev_suffix test_suffix
+  case "$project_type" in
+    rails)
+      dev_suffix="$(toml_get "database" "dev_suffix" "_development")"
+      test_suffix="$(toml_get "database" "test_suffix" "_test")"
+      ;;
+    elixir)
+      dev_suffix="$(toml_get "database" "dev_suffix" "_dev")"
+      test_suffix="$(toml_get "database" "test_suffix" "_test")"
+      ;;
+    *)
+      # No DB cloning for other project types by default
+      return 1
+      ;;
+  esac
+
+  echo "${project_name}${dev_suffix}" "${project_name}${test_suffix}"
+}
+
+clone_databases() {
+  local project_type="$1"
+
+  if ! has_psql; then
+    log_warn "psql not found, skipping database cloning"
+    return 0
+  fi
+
+  local db_names
+  db_names="$(get_base_db_names "$project_type")" || {
+    log_info "No database cloning needed for project type: $project_type"
+    return 0
+  }
+
+  local base_dev base_test
+  base_dev="$(echo "$db_names" | awk '{print $1}')"
+  base_test="$(echo "$db_names" | awk '{print $2}')"
+
+  local wt_name wt_branch
+  wt_name="$(sanitize_name "$(get_worktree_name)")"
+  wt_branch="$(sanitize_name "$(get_worktree_branch)")"
+
+  NEW_DEV_DB="worktree_${wt_branch}_${wt_name}"
+  NEW_TEST_DB="worktree_${wt_branch}_${wt_name}_test"
+
+  # Clone dev database
+  if db_exists "$NEW_DEV_DB"; then
+    log_info "Database $NEW_DEV_DB already exists, skipping"
+  elif ! db_exists "$base_dev"; then
+    log_warn "Template database $base_dev not found, skipping dev DB clone"
+  else
+    log_info "Cloning $base_dev -> $NEW_DEV_DB"
+    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
+      log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
+    fi
+  fi
+
+  # Clone test database
+  if db_exists "$NEW_TEST_DB"; then
+    log_info "Database $NEW_TEST_DB already exists, skipping"
+  elif ! db_exists "$base_test"; then
+    log_warn "Template database $base_test not found, skipping test DB clone"
+  else
+    log_info "Cloning $base_test -> $NEW_TEST_DB"
+    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
+      log_error "Failed to clone $base_test -> $NEW_TEST_DB"
+    fi
+  fi
+
+  # Write overrides
+  write_db_override "$project_type"
+}
+
+write_db_override() {
+  local project_type="$1"
+  local dev_db="${NEW_DEV_DB:-}"
+  local test_db="${NEW_TEST_DB:-}"
+  [ -z "$dev_db" ] && return 0
+
+  case "$project_type" in
+    rails)
+      local envfile=".env.local"
+      if [ -f "$envfile" ] && grep -q "DATABASE_NAME" "$envfile"; then
+        log_info "$envfile already has DATABASE_NAME, skipping"
+        return 0
+      fi
+      {
+        echo ""
+        echo "# Worktree database overrides (added by werksfeer)"
+        echo "DATABASE_NAME=\"${dev_db}\""
+        echo "TEST_DATABASE_NAME=\"${test_db}\""
+      } >> "$envfile"
+      log_info "Wrote DB overrides to $envfile"
+      ;;
+    elixir)
+      local envfile=".envrc"
+      if [ -f "$envfile" ] && grep -q "DATABASE_NAME" "$envfile"; then
+        log_info "$envfile already has DATABASE_NAME, skipping"
+        return 0
+      fi
+      {
+        echo ""
+        echo "# Worktree database overrides (added by werksfeer)"
+        echo "export DATABASE_NAME=\"${dev_db}\""
+        echo "export TEST_DATABASE_NAME=\"${test_db}\""
+      } >> "$envfile"
+      # Allow direnv if available
+      if command -v direnv >/dev/null 2>&1; then
+        direnv allow . 2>/dev/null || true
+      fi
+      log_info "Wrote DB overrides to $envfile"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Setup commands
+# ---------------------------------------------------------------------------
+
+detect_node_pm() {
+  local root="$1"
+  if [ -f "$root/bun.lockb" ] || [ -f "$root/bun.lock" ]; then echo "bun install --frozen-lockfile"
+  elif [ -f "$root/pnpm-lock.yaml" ]; then echo "pnpm install --frozen-lockfile"
+  elif [ -f "$root/yarn.lock" ]; then echo "yarn install --frozen-lockfile"
+  else echo "npm ci"
+  fi
+}
+
+run_setup_command() {
+  local project_type="$1"
+  local main_path="$2"
+
+  # Check for TOML override
+  local custom_cmd
+  custom_cmd="$(toml_get "setup" "command" "")"
+
+  if [ -n "$custom_cmd" ]; then
+    log_step "Running custom setup: $custom_cmd"
+    eval "$custom_cmd"
+    return
+  fi
+
+  case "$project_type" in
+    rails)
+      if [ -x "bin/setup" ]; then
+        log_step "Running bin/setup"
+        bin/setup
+      else
+        log_info "No bin/setup found, running bundle install"
+        bundle install
+      fi
+      ;;
+    elixir)
+      log_step "Running mix deps.get"
+      mix deps.get
+      # If we already cloned databases, skip ecto.setup
+      if [ -z "${NEW_DEV_DB:-}" ]; then
+        log_step "Running mix ecto.setup"
+        mix ecto.setup
+      else
+        log_info "Databases already cloned, skipping mix ecto.setup"
+      fi
+      ;;
+    python)
+      if [ -f "pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
+        log_step "Running uv sync"
+        uv sync
+      elif [ -f "Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
+        log_step "Running pipenv install"
+        pipenv install
+      elif [ -f "requirements.txt" ]; then
+        log_step "Running pip install -r requirements.txt"
+        pip install -r requirements.txt
+      fi
+      ;;
+    node)
+      local pm_cmd
+      pm_cmd="$(detect_node_pm "$(pwd)")"
+      log_step "Running $pm_cmd"
+      eval "$pm_cmd"
+      ;;
+    *)
+      log_info "Unknown project type, no setup command to run"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Project registry (for --prune-all)
+# ---------------------------------------------------------------------------
+
+registry_file() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/projects"
+}
+
+register_project() {
+  local reg
+  reg="$(registry_file)"
+  local project_root
+  project_root="$(get_main_worktree_path)"
+
+  mkdir -p "$(dirname "$reg")"
+  if ! grep -qxF "$project_root" "$reg" 2>/dev/null; then
+    echo "$project_root" >> "$reg"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Prune
+# ---------------------------------------------------------------------------
+
+prune_project() {
+  local project_dir="${1:-.}"
+
+  if ! has_psql; then
+    log_warn "psql not found, nothing to prune"
+    return 0
+  fi
+
+  if ! (cd "$project_dir" && is_git_repo); then
+    log_warn "$project_dir is not a git repo, skipping"
+    return 0
+  fi
+
+  # Collect active worktree directory basenames (sanitized)
+  local active_names=""
+  while IFS= read -r wt_line; do
+    local wt_path
+    wt_path="$(echo "$wt_line" | awk '{print $1}')"
+    local wt_basename
+    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
+    active_names="${active_names}${wt_basename}
+"
+  done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+
+  # Get all worktree_* databases
+  local all_wt_dbs
+  all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+
+  if [ -z "$all_wt_dbs" ]; then
+    log_info "No worktree databases found"
+    return 0
+  fi
+
+  # Get the sanitized project name for filtering
+  local project_name
+  project_name="$(cd "$project_dir" && sanitize_name "$(basename "$(get_main_worktree_path)")")"
+
+  echo "$all_wt_dbs" | while IFS= read -r db; do
+    [ -z "$db" ] && continue
+
+    # Only consider databases that could belong to this project
+    # DB format: worktree_{branch}_{wt_name}[_test]
+    # We strip the _test suffix for matching
+    local db_base
+    db_base="$(echo "$db" | sed 's/_test$//')"
+
+    local is_orphan=true
+
+    # Check if any active worktree name appears at the end of the DB name
+    echo "$active_names" | while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      if echo "$db_base" | grep -q "_${name}$"; then
+        is_orphan=false
+        break
+      fi
+    done
+
+    # The subshell above can't set is_orphan for us; use a different approach
+    local found=false
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      if echo "$db_base" | grep -q "_${name}$"; then
+        found=true
+        break
+      fi
+    done <<EOF
+$active_names
+EOF
+
+    if [ "$found" = false ]; then
+      log_info "Dropping orphaned database: $db"
+      dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+    else
+      log_debug "Keeping active database: $db"
+    fi
+  done
+}
+
+prune_current() {
+  if ! is_git_repo; then
+    log_error "Not in a git repository"
+    return 1
+  fi
+  local main_path
+  main_path="$(get_main_worktree_path)"
+  log_step "Pruning orphaned databases for: $(basename "$main_path")"
+  prune_project "$main_path"
+}
+
+prune_all() {
+  local reg
+  reg="$(registry_file)"
+
+  if [ ! -f "$reg" ]; then
+    log_warn "No projects registered yet. Run werksfeer in a project first."
+    return 0
+  fi
+
+  while IFS= read -r project_path; do
+    [ -z "$project_path" ] && continue
+    if [ ! -d "$project_path" ]; then
+      log_warn "Skipping $project_path (directory not found)"
+      continue
+    fi
+    log_step "Pruning databases for: $(basename "$project_path")"
+    prune_project "$project_path"
+  done < "$reg"
+}
+
+# ---------------------------------------------------------------------------
+# Core setup flow
+# ---------------------------------------------------------------------------
+
+run_setup() {
+  local main_path
+  main_path="$(get_main_worktree_path)"
+  local worktree_path
+  worktree_path="$(pwd)"
+
+  log_step "werksfeer v${WERKSFEER_VERSION} - Setting up worktree"
+  log_info "Main:     $main_path"
+  log_info "Worktree: $worktree_path"
+
+  # Parse .worktree.toml (check worktree first, then main)
+  if [ -f "$worktree_path/.worktree.toml" ]; then
+    toml_parse "$worktree_path/.worktree.toml"
+  elif [ -f "$main_path/.worktree.toml" ]; then
+    toml_parse "$main_path/.worktree.toml"
+  fi
+
+  # Detect project type
+  local project_type
+  project_type="$(detect_project_type "$main_path")"
+  log_info "Project type: $project_type"
+
+  # Register for prune-all
+  register_project
+
+  # Step 1: Copy env files
+  log_step "Copying environment files"
+  sync_env_files "$main_path" "$worktree_path" "$project_type"
+
+  # Step 2: Symlink build directories
+  log_step "Symlinking build directories"
+  sync_build_dirs "$main_path" "$worktree_path" "$project_type"
+
+  # Step 3: Clone databases
+  log_step "Setting up databases"
+  clone_databases "$project_type"
+
+  # Step 4: Run setup command
+  log_step "Running setup"
+  run_setup_command "$project_type" "$main_path"
+
+  # Step 5: Post-setup hook from config
+  local post_hook
+  post_hook="$(toml_get "hooks" "post_setup" "")"
+  if [ -n "$post_hook" ]; then
+    log_step "Running post-setup hook"
+    eval "$post_hook"
+  fi
+
+  log_step "Worktree setup complete!"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF_USAGE'
+werksfeer - Universal git worktree setup
+
+Usage:
+  werksfeer              Setup the current worktree (run from inside a worktree)
+  werksfeer --hook ...   Called from post-checkout git hook
+  werksfeer --prune      Drop orphaned worktree databases for current project
+  werksfeer --prune-all  Drop orphaned worktree databases for all registered projects
+  werksfeer --version    Print version
+  werksfeer --help       Print this help
+
+Environment:
+  WERKSFEER_DEBUG=1      Enable debug logging
+
+Werksfeer reads .worktree.toml from the project root for configuration.
+See https://github.com/DefactoSoftware/werksfeer for details.
+EOF_USAGE
+}
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+hook_mode() {
+  local prev_head="${1:-}"
+  local new_head="${2:-}"
+  local flag="${3:-}"
+
+  if ! is_worktree_creation "$prev_head" "$new_head" "$flag"; then
+    log_debug "Not a worktree creation, skipping"
+    return 0
+  fi
+
+  # Only activate when .worktree.toml exists
+  local main_path
+  main_path="$(get_main_worktree_path)"
+  if [ ! -f "$main_path/.worktree.toml" ] && [ ! -f ".worktree.toml" ]; then
+    log_debug "No .worktree.toml found, skipping"
+    return 0
+  fi
+
+  run_setup
+}
+
+direct_mode() {
+  if ! is_git_repo; then
+    log_error "Not inside a git repository"
+    return 1
+  fi
+
+  if ! is_worktree; then
+    log_error "Not inside a worktree (this is the main checkout)"
+    log_info "Run this from inside a worktree created with: git worktree add <path> <branch>"
+    return 1
+  fi
+
+  local main_path
+  main_path="$(get_main_worktree_path)"
+  if [ ! -f "$main_path/.worktree.toml" ] && [ ! -f ".worktree.toml" ]; then
+    log_error "No .worktree.toml found in $main_path"
+    log_info "Create one to configure werksfeer. See: werksfeer --help"
+    return 1
+  fi
+
+  run_setup
+}
+
+main() {
+  case "${1:-}" in
+    --hook)
+      shift
+      hook_mode "$@"
+      ;;
+    --prune)
+      prune_current
+      ;;
+    --prune-all)
+      prune_all
+      ;;
+    --version|-V)
+      echo "werksfeer $WERKSFEER_VERSION"
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      direct_mode
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# werksfeer post-checkout hook
+# Triggers worktree setup when a new worktree is created.
+# Install: copy to .git/hooks/post-checkout or set via core.hooksPath
+
+# Find werksfeer
+if command -v werksfeer >/dev/null 2>&1; then
+  werksfeer --hook "$@"
+elif [ -x "${HOME}/.local/bin/werksfeer" ]; then
+  "${HOME}/.local/bin/werksfeer" --hook "$@"
+fi
+
+# Chain to repo-specific hook if we're running from a global hooksPath
+REPO_HOOK="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/post-checkout"
+if [ -x "$REPO_HOOK" ] && [ "$REPO_HOOK" != "$0" ]; then
+  "$REPO_HOOK" "$@"
+fi
+
+# Never block git operations
+exit 0
