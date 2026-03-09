@@ -81,10 +81,22 @@ Add to `.claude/settings.json` (or `.claude/settings.local.json`):
           }
         ]
       }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'cat | jq -r .worktree_path | xargs werksfeer --cleanup'"
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+The `WorktreeRemove` hook drops the worktree's cloned databases when the session ends.
 
 ### Codex App
 
@@ -120,6 +132,16 @@ werksfeer
 ```
 
 If your agent supports post-worktree hooks or setup scripts, point them at `werksfeer`. It is idempotent and runs fully unattended.
+
+### Cleanup on worktree removal
+
+Only Claude Code has a worktree removal hook (`WorktreeRemove`), shown above. For Cursor, Codex, and other tools that lack removal hooks, use `werksfeer --prune` periodically to clean up orphaned databases from deleted worktrees.
+
+You can also clean up a specific worktree's databases manually:
+
+```sh
+werksfeer --cleanup /path/to/worktree
+```
 
 ## Supported project types
 

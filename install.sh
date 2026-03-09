@@ -76,6 +76,16 @@ CLAUDE CODE / CLAUDE DESKTOP — add to .claude/settings.json:
             }
           ]
         }
+      ],
+      "WorktreeRemove": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "bash -c 'cat | jq -r .worktree_path | xargs werksfeer --cleanup'"
+            }
+          ]
+        }
       ]
     }
   }
