@@ -533,37 +533,45 @@ register_project() {
 cleanup_worktree() {
   local worktree_path="$1"
 
-  if [ ! -d "$worktree_path" ]; then
-    log_warn "Worktree path does not exist: $worktree_path"
-    return 0
-  fi
-
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
     return 0
   fi
 
-  local wt_name wt_branch
+  local wt_name
   wt_name="$(sanitize_name "$(basename "$worktree_path")")"
-  wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
-
-  local dev_db="worktree_${wt_branch}_${wt_name}"
-  local test_db="worktree_${wt_branch}_${wt_name}_test"
 
   log_step "Cleaning up databases for worktree: $(basename "$worktree_path")"
 
-  if db_exists "$dev_db"; then
-    log_info "Dropping $dev_db"
-    dropdb --if-exists "$dev_db" 2>/dev/null || log_warn "Failed to drop $dev_db"
-  else
-    log_debug "Database $dev_db does not exist, skipping"
+  # Try to get the branch from the worktree if it still exists
+  local wt_branch=""
+  if [ -d "$worktree_path" ]; then
+    wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
   fi
 
-  if db_exists "$test_db"; then
-    log_info "Dropping $test_db"
-    dropdb --if-exists "$test_db" 2>/dev/null || log_warn "Failed to drop $test_db"
+  if [ -n "$wt_branch" ]; then
+    # We know the exact DB names
+    local dev_db="worktree_${wt_branch}_${wt_name}"
+    local test_db="worktree_${wt_branch}_${wt_name}_test"
+    for db in "$dev_db" "$test_db"; do
+      if db_exists "$db"; then
+        log_info "Dropping $db"
+        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      fi
+    done
   else
-    log_debug "Database $test_db does not exist, skipping"
+    # Worktree already deleted — find DBs by suffix match on the worktree name
+    log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
+    local all_wt_dbs
+    all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+    echo "$all_wt_dbs" | while IFS= read -r db; do
+      [ -z "$db" ] && continue
+      # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
+      if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
+        log_info "Dropping $db"
+        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      fi
+    done
   fi
 }
 
