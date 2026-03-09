@@ -382,11 +382,13 @@ write_db_override() {
   local test_db="${NEW_TEST_DB:-}"
   [ -z "$dev_db" ] && return 0
 
+  local marker="# Worktree database overrides (added by werksfeer)"
+
   case "$project_type" in
     rails)
       local envfile=".env.local"
-      if [ -f "$envfile" ] && grep -q "DATABASE_NAME" "$envfile"; then
-        log_info "$envfile already has DATABASE_NAME, skipping"
+      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
+        log_info "$envfile already has DB overrides, skipping"
         return 0
       fi
       {
@@ -399,8 +401,8 @@ write_db_override() {
       ;;
     elixir)
       local envfile=".envrc"
-      if [ -f "$envfile" ] && grep -q "DATABASE_NAME" "$envfile"; then
-        log_info "$envfile already has DATABASE_NAME, skipping"
+      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
+        log_info "$envfile already has DB overrides, skipping"
         return 0
       fi
       {
