@@ -386,18 +386,32 @@ write_db_override() {
 
   case "$project_type" in
     rails)
+      # .env.local is loaded by dotenv-rails in development but NOT in test.
+      # .env.test.local IS loaded in test. Write to both.
       local envfile=".env.local"
       if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
         log_info "$envfile already has DB overrides, skipping"
-        return 0
+      else
+        {
+          echo ""
+          echo "$marker"
+          echo "DATABASE_NAME=\"${dev_db}\""
+          echo "TEST_DATABASE_NAME=\"${test_db}\""
+        } >> "$envfile"
+        log_info "Wrote DB overrides to $envfile"
       fi
-      {
-        echo ""
-        echo "# Worktree database overrides (added by werksfeer)"
-        echo "DATABASE_NAME=\"${dev_db}\""
-        echo "TEST_DATABASE_NAME=\"${test_db}\""
-      } >> "$envfile"
-      log_info "Wrote DB overrides to $envfile"
+
+      local testenvfile=".env.test.local"
+      if [ -f "$testenvfile" ] && grep -qF "$marker" "$testenvfile"; then
+        log_info "$testenvfile already has DB overrides, skipping"
+      else
+        {
+          echo ""
+          echo "$marker"
+          echo "TEST_DATABASE_NAME=\"${test_db}\""
+        } >> "$testenvfile"
+        log_info "Wrote DB overrides to $testenvfile"
+      fi
       ;;
     elixir)
       local envfile=".envrc"
