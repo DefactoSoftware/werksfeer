@@ -42,11 +42,12 @@ touch .worktree.toml
 When a new worktree is created, werksfeer:
 
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
-2. **Symlinks build directories** (`node_modules`, `_build`, `deps`, etc.) to avoid redundant installs
-3. **Clones PostgreSQL databases** using `CREATE DATABASE ... WITH TEMPLATE` for instant isolation
-4. **Allocates a unique port and Redis database** per worktree, tracked in a registry
-5. **Writes overrides** (DB names, port, Redis URL) to `.env.local` (Rails) or `.envrc` (Elixir)
-6. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
+2. **Symlinks shared directories** (`node_modules`) to avoid redundant installs
+3. **Copies build directories** (`_build`, `deps`, `.bundle`, etc.) from the main worktree
+4. **Clones PostgreSQL databases** using `CREATE DATABASE ... WITH TEMPLATE` for instant isolation
+5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
+6. **Writes overrides** (DB names, port, Redis URL) to `.env.local` (Rails) or `.envrc` (Elixir)
+7. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
 
 Everything is idempotent — safe to re-run.
 
@@ -160,12 +161,12 @@ werksfeer --prune-all
 
 ## Supported project types
 
-| Type | Detected by | Symlinked dirs | Setup command | DB pattern |
-|------|------------|----------------|---------------|------------|
-| Rails | `Gemfile` + `config/database.yml` | `node_modules`, `.bundle`, `tmp/cache` | `bin/setup` | `{name}_development` / `{name}_test` |
-| Elixir | `mix.exs` | `_build`, `deps`, `node_modules` | `mix deps.get` | `{name}_dev` / `{name}_test` |
-| Python | `pyproject.toml` / `requirements.txt` | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
-| Node | `package.json` | `node_modules`, `.next`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
+| Type | Detected by | Symlinked | Copied | Setup command | DB pattern |
+|------|------------|-----------|--------|---------------|------------|
+| Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bin/setup` | `{name}_development` / `{name}_test` |
+| Elixir | `mix.exs` | `node_modules` | `_build`, `deps` | `mix deps.get` | `{name}_dev` / `{name}_test` |
+| Python | `pyproject.toml` / `requirements.txt` | — | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
+| Node | `package.json` | `node_modules` | `.next`, `.nuxt`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
 
 ## Project setup
 
@@ -215,8 +216,10 @@ base = 3000
 url = "redis://localhost:6379"
 
 [sync]
-# Override directories to symlink
-symlink = ["node_modules", "_build", "deps"]
+# Override directories to symlink (default: node_modules)
+symlink = ["node_modules"]
+# Override directories to copy (default: build dirs per project type)
+copy_dirs = ["_build", "deps"]
 # Override files to copy
 copy = [".env", ".envrc"]
 # Directories to skip

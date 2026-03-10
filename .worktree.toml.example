@@ -23,8 +23,11 @@
 # url = "redis://localhost:6379"
 
 [sync]
-# Directories to symlink from the main worktree (overrides auto-detected defaults)
-# symlink = ["node_modules", "_build", "deps"]
+# Directories to symlink from the main worktree (default: node_modules)
+# symlink = ["node_modules"]
+
+# Directories to copy from the main worktree (default: build dirs per project type)
+# copy_dirs = ["_build", "deps"]
 
 # Files to copy from the main worktree (overrides auto-detected defaults)
 # copy = [".env", ".envrc", ".tool-versions"]

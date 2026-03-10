@@ -242,25 +242,38 @@ detect_project_type() {
 }
 
 # ---------------------------------------------------------------------------
-# Default directories to symlink per project type
+# Default directories to symlink per project type (large, identical across worktrees)
 # ---------------------------------------------------------------------------
 
 default_symlink_dirs() {
   case "$1" in
+    rails|elixir|node)
+      printf '%s\n' node_modules
+      ;;
+    *)
+      # Python, unknown: nothing to symlink by default
+      ;;
+  esac
+}
+
+# Default directories to copy per project type (build artifacts, caches)
+# ---------------------------------------------------------------------------
+
+default_copy_dirs() {
+  case "$1" in
     rails)
-      printf '%s\n' node_modules .bundle tmp/cache
+      printf '%s\n' .bundle tmp/cache
       ;;
     elixir)
-      printf '%s\n' _build deps node_modules
+      printf '%s\n' _build deps
       ;;
     python)
       printf '%s\n' .venv __pycache__ .mypy_cache .pytest_cache .ruff_cache
       ;;
     node)
-      printf '%s\n' node_modules .next .nuxt .svelte-kit .turbo .parcel-cache
+      printf '%s\n' .next .nuxt .svelte-kit .turbo .parcel-cache
       ;;
     *)
-      printf '%s\n' node_modules
       ;;
   esac
 }
@@ -321,7 +334,7 @@ sync_env_files() {
   done
 }
 
-sync_build_dirs() {
+sync_symlink_dirs() {
   local main_path="$1"
   local worktree_path="$2"
   local project_type="$3"
@@ -329,6 +342,7 @@ sync_build_dirs() {
   local symlink_dirs
   symlink_dirs="$(toml_get_array "sync" "symlink")"
   [ -z "$symlink_dirs" ] && symlink_dirs="$(default_symlink_dirs "$project_type")"
+  [ -z "$symlink_dirs" ] && return 0
 
   local skip_dirs
   skip_dirs="$(toml_get_array "sync" "skip")"
@@ -364,6 +378,49 @@ sync_build_dirs() {
 
     ln -s "$src" "$dst"
     log_info "Symlinked $dir -> $src"
+  done
+}
+
+copy_build_dirs() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local project_type="$3"
+
+  local copy_dirs
+  copy_dirs="$(toml_get_array "sync" "copy_dirs")"
+  [ -z "$copy_dirs" ] && copy_dirs="$(default_copy_dirs "$project_type")"
+  [ -z "$copy_dirs" ] && return 0
+
+  local skip_dirs
+  skip_dirs="$(toml_get_array "sync" "skip")"
+
+  echo "$copy_dirs" | while IFS= read -r dir; do
+    [ -z "$dir" ] && continue
+
+    # Check skip list
+    if [ -n "$skip_dirs" ] && echo "$skip_dirs" | grep -qxF "$dir"; then
+      log_info "Skip copy $dir (in skip list)"
+      continue
+    fi
+
+    local src="$main_path/$dir"
+    local dst="$worktree_path/$dir"
+
+    if [ -L "$dst" ] || [ -d "$dst" ]; then
+      log_info "Skip copy $dir (already exists)"
+      continue
+    fi
+    if [ ! -d "$src" ]; then
+      log_debug "Skip copy $dir (not yet in main worktree)"
+      continue
+    fi
+
+    local parent
+    parent="$(dirname "$dst")"
+    [ ! -d "$parent" ] && mkdir -p "$parent"
+
+    cp -R "$src" "$dst"
+    log_info "Copied $dir"
   done
 }
 
@@ -888,23 +945,27 @@ run_setup() {
   log_step "Copying environment files"
   sync_env_files "$main_path" "$worktree_path" "$project_type"
 
-  # Step 2: Symlink build directories
-  log_step "Symlinking build directories"
-  sync_build_dirs "$main_path" "$worktree_path" "$project_type"
+  # Step 2: Symlink shared directories (node_modules)
+  log_step "Symlinking shared directories"
+  sync_symlink_dirs "$main_path" "$worktree_path" "$project_type"
 
-  # Step 3: Clone databases
+  # Step 3: Copy build directories
+  log_step "Copying build directories"
+  copy_build_dirs "$main_path" "$worktree_path" "$project_type"
+
+  # Step 4: Clone databases
   log_step "Setting up databases"
   clone_databases "$project_type"
 
-  # Step 4: Write environment overrides (DB names, ports, Redis)
+  # Step 5: Write environment overrides (DB names, ports, Redis)
   log_step "Writing environment overrides"
   write_env_overrides "$project_type"
 
-  # Step 5: Run setup command
+  # Step 6: Run setup command
   log_step "Running setup"
   run_setup_command "$project_type" "$main_path"
 
-  # Step 6: Post-setup hook from config
+  # Step 7: Post-setup hook from config
   local post_hook
   post_hook="$(toml_get "hooks" "post_setup" "")"
   if [ -n "$post_hook" ]; then
