@@ -163,6 +163,10 @@ werksfeer --prune-all
 | Python | `pyproject.toml` / `requirements.txt` | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
 | Node | `package.json` | `node_modules`, `.next`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
 
+## Project setup
+
+Your project needs to read the environment variables werksfeer sets (`PORT`, `DATABASE_NAME`, `TEST_DATABASE_NAME`, `REDIS_URL`). See **[docs/project-setup.md](docs/project-setup.md)** for a step-by-step guide with examples for Rails and Elixir/Phoenix.
+
 ## Port and Redis allocation
 
 Each worktree gets a unique port and Redis database number, so you can run multiple worktrees simultaneously without conflicts.
