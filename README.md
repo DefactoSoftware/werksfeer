@@ -64,7 +64,7 @@ git config --global core.hooksPath ~/.local/share/werksfeer/hooks
 cp ~/.local/share/werksfeer/hooks/post-checkout .git/hooks/
 ```
 
-### Claude Code / Claude Desktop
+### Claude Code (CLI)
 
 Claude Code's `WorktreeCreate` hook replaces the default worktree creation, so the hook must create the worktree itself and print its path to stdout.
 
@@ -97,7 +97,11 @@ Add to `.claude/settings.json` (or `.claude/settings.local.json`):
 }
 ```
 
-The `WorktreeRemove` hook drops the worktree's cloned databases when the session ends.
+The `WorktreeRemove` hook drops the worktree's cloned databases when the session ends. Note that Claude Code does not always fire this hook reliably (e.g. when the worktree directory is already deleted before the hook runs). Use `werksfeer --prune` periodically to catch any missed cleanups.
+
+### Claude Desktop
+
+Claude Desktop does **not** fire `WorktreeCreate` or `WorktreeRemove` hooks. Use the [git hooks](#git-hooks) approach instead, and run `werksfeer --prune` to clean up after worktrees are removed.
 
 ### Codex App
 
@@ -136,9 +140,9 @@ If your agent supports post-worktree hooks or setup scripts, point them at `werk
 
 ### Cleanup on worktree removal
 
-When a worktree is removed, `--cleanup` drops its cloned databases and releases its port/redis allocations. Claude Code calls this automatically via the `WorktreeRemove` hook shown above.
+When a worktree is removed, `--cleanup` drops its cloned databases and releases its port/redis allocations. You can run this manually from inside a worktree before deleting it, or pass a path.
 
-For Cursor, Codex, and other tools that lack removal hooks, use `--prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees.
+Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Use `werksfeer --prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees — this is the most reliable approach.
 
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)
