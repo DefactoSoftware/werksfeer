@@ -123,30 +123,90 @@ sanitize_name() {
 }
 
 # ---------------------------------------------------------------------------
-# Port / Redis hashing
+# Port / Redis allocation registry
 # ---------------------------------------------------------------------------
+# File: ~/.local/share/werksfeer/allocations
+# Format: project_path<TAB>worktree_name<TAB>port<TAB>redis_db
 
-# Produces a stable numeric hash from a string using cksum (POSIX).
-_hash_string() {
-  printf '%s' "$1" | cksum | awk '{print $1}'
+allocations_file() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/allocations"
 }
 
-# Returns a port number for a worktree: base_port + (hash % 900) + 100
-# Range: base+100 to base+999 (avoids the base port itself)
-hash_port() {
-  local name="$1"
-  local base_port="$2"
-  local h
-  h="$(_hash_string "$name")"
-  echo $(( base_port + (h % 900) + 100 ))
+# Find the next available port starting from base+1, skipping any already in the registry.
+allocate_port() {
+  local base_port="$1"
+  local alloc
+  alloc="$(allocations_file)"
+  local port=$(( base_port + 1 ))
+
+  while true; do
+    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $3}' "$alloc" | grep -qxF "$port"; then
+      echo "$port"
+      return
+    fi
+    port=$(( port + 1 ))
+  done
 }
 
-# Returns a Redis database number 1-15 (leaves 0 for main worktree)
-hash_redis_db() {
-  local name="$1"
-  local h
-  h="$(_hash_string "$name")"
-  echo $(( (h % 15) + 1 ))
+# Find the next available Redis DB (1-15) for a given project, skipping any in use.
+allocate_redis_db() {
+  local project="$1"
+  local alloc
+  alloc="$(allocations_file)"
+  local db=1
+
+  while [ "$db" -le 15 ]; do
+    if [ ! -f "$alloc" ] || ! awk -F'\t' -v p="$project" '$1 == p {print $4}' "$alloc" | grep -qxF "$db"; then
+      echo "$db"
+      return
+    fi
+    db=$(( db + 1 ))
+  done
+
+  # All 15 slots taken — fall back to 1
+  log_warn "All 15 Redis databases in use for this project, reusing DB 1"
+  echo 1
+}
+
+# Register an allocation
+register_allocation() {
+  local project="$1"
+  local wt_name="$2"
+  local port="$3"
+  local redis_db="$4"
+  local alloc
+  alloc="$(allocations_file)"
+
+  mkdir -p "$(dirname "$alloc")"
+  printf '%s\t%s\t%s\t%s\n' "$project" "$wt_name" "$port" "$redis_db" >> "$alloc"
+}
+
+# Remove an allocation by worktree name (and optionally project)
+deregister_allocation() {
+  local wt_name="$1"
+  local project="${2:-}"
+  local alloc
+  alloc="$(allocations_file)"
+  [ ! -f "$alloc" ] && return 0
+
+  local tmp="${alloc}.tmp"
+  if [ -n "$project" ]; then
+    awk -F'\t' -v p="$project" -v w="$wt_name" '!($1 == p && $2 == w)' "$alloc" > "$tmp"
+  else
+    awk -F'\t' -v w="$wt_name" '$2 != w' "$alloc" > "$tmp"
+  fi
+  mv "$tmp" "$alloc"
+}
+
+# Look up existing allocation for a worktree. Prints "port<TAB>redis_db" or empty.
+lookup_allocation() {
+  local project="$1"
+  local wt_name="$2"
+  local alloc
+  alloc="$(allocations_file)"
+  [ ! -f "$alloc" ] && return 0
+
+  awk -F'\t' -v p="$project" -v w="$wt_name" '$1 == p && $2 == w {printf "%s\t%s", $3, $4}' "$alloc"
 }
 
 is_worktree_creation() {
@@ -426,23 +486,33 @@ write_env_overrides() {
   local project_type="$1"
   local wt_name
   wt_name="$(get_worktree_name)"
+  local project_root
+  project_root="$(get_main_worktree_path)"
 
   local marker="# Worktree overrides (added by werksfeer)"
 
-  # Compute port
-  local base_port
-  base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
-  local wt_port
-  wt_port="$(hash_port "$wt_name" "$base_port")"
+  # Check for existing allocation (idempotent)
+  local existing
+  existing="$(lookup_allocation "$project_root" "$wt_name")"
 
-  # Compute Redis URL (if applicable)
+  local wt_port redis_db
+  if [ -n "$existing" ]; then
+    wt_port="$(echo "$existing" | cut -f1)"
+    redis_db="$(echo "$existing" | cut -f2)"
+    log_debug "Reusing allocation: port=$wt_port redis_db=$redis_db"
+  else
+    local base_port
+    base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
+    wt_port="$(allocate_port "$base_port")"
+    redis_db="$(allocate_redis_db "$project_root")"
+    register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db"
+  fi
+
+  # Build Redis URL (if applicable)
   local base_redis
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
   local wt_redis=""
   if [ -n "$base_redis" ]; then
-    local redis_db
-    redis_db="$(hash_redis_db "$wt_name")"
-    # Strip any existing /N suffix and append the new DB number
     wt_redis="$(echo "$base_redis" | sed 's|/[0-9]*$||')/${redis_db}"
   fi
 
@@ -616,16 +686,21 @@ register_project() {
 
 cleanup_worktree() {
   local worktree_path="$1"
+  local wt_name
+  wt_name="$(basename "$worktree_path")"
+
+  log_step "Cleaning up worktree: $wt_name"
+
+  # Deregister port/redis allocation
+  deregister_allocation "$wt_name"
+  log_info "Released port/redis allocation"
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
     return 0
   fi
 
-  local wt_name
-  wt_name="$(sanitize_name "$(basename "$worktree_path")")"
-
-  log_step "Cleaning up databases for worktree: $(basename "$worktree_path")"
+  wt_name="$(sanitize_name "$wt_name")"
 
   # Try to get the branch from the worktree if it still exists
   local wt_branch=""
@@ -666,13 +741,36 @@ cleanup_worktree() {
 prune_project() {
   local project_dir="${1:-.}"
 
-  if ! has_psql; then
-    log_warn "psql not found, nothing to prune"
+  if ! (cd "$project_dir" && is_git_repo); then
+    log_warn "$project_dir is not a git repo, skipping"
     return 0
   fi
 
-  if ! (cd "$project_dir" && is_git_repo); then
-    log_warn "$project_dir is not a git repo, skipping"
+  # Prune stale allocations: remove entries for worktrees that no longer exist
+  local alloc
+  alloc="$(allocations_file)"
+  if [ -f "$alloc" ]; then
+    local active_wt_names=""
+    while IFS= read -r wt_line; do
+      local wt_path
+      wt_path="$(echo "$wt_line" | awk '{print $1}')"
+      active_wt_names="${active_wt_names}$(basename "$wt_path")
+"
+    done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+
+    local tmp="${alloc}.tmp"
+    while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
+      if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
+        log_info "Released allocation: port=$a_port redis_db=$a_redis (worktree: $a_wt)"
+      else
+        printf '%s\t%s\t%s\t%s\n' "$a_project" "$a_wt" "$a_port" "$a_redis"
+      fi
+    done < "$alloc" > "$tmp"
+    mv "$tmp" "$alloc"
+  fi
+
+  if ! has_psql; then
+    log_warn "psql not found, skipping database prune"
     return 0
   fi
 

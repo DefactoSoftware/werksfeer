@@ -12,12 +12,14 @@
 
 [port]
 # Base port for the web server (default: 3000 for Rails/Node, 4000 for Elixir, 8000 for Python)
-# Worktrees get a deterministic port derived from: base + hash(worktree_name)
+# Each worktree gets the next available port starting from base+1.
+# Allocations are tracked in ~/.local/share/werksfeer/allocations and
+# released on --cleanup or --prune.
 # base = 3000
 
 [redis]
 # Base Redis URL (default: redis://localhost:6379 for Rails, empty for others)
-# Worktrees get a separate Redis database number: hash(worktree_name) % 15 + 1
+# Each worktree gets the next available Redis database number (1-15).
 # url = "redis://localhost:6379"
 
 [sync]
