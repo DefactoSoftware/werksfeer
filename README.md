@@ -44,8 +44,9 @@ When a new worktree is created, werksfeer:
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
 2. **Symlinks build directories** (`node_modules`, `_build`, `deps`, etc.) to avoid redundant installs
 3. **Clones PostgreSQL databases** using `CREATE DATABASE ... WITH TEMPLATE` for instant isolation
-4. **Writes DB overrides** to `.env.local` (Rails) or appends to `.envrc` (Elixir)
-5. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
+4. **Allocates a unique port and Redis database** per worktree, tracked in a registry
+5. **Writes overrides** (DB names, port, Redis URL) to `.env.local` (Rails) or `.envrc` (Elixir)
+6. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
 
 Everything is idempotent — safe to re-run.
 
@@ -135,12 +136,19 @@ If your agent supports post-worktree hooks or setup scripts, point them at `werk
 
 ### Cleanup on worktree removal
 
-Only Claude Code has a worktree removal hook (`WorktreeRemove`), shown above. For Cursor, Codex, and other tools that lack removal hooks, use `werksfeer --prune` periodically to clean up orphaned databases from deleted worktrees.
+When a worktree is removed, `--cleanup` drops its cloned databases and releases its port/redis allocations. Claude Code calls this automatically via the `WorktreeRemove` hook shown above.
 
-You can also clean up a specific worktree's databases manually:
+For Cursor, Codex, and other tools that lack removal hooks, use `--prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees.
 
 ```sh
+# Clean up a specific worktree (drops DBs, releases port/redis)
 werksfeer --cleanup /path/to/worktree
+
+# Prune current project — drops orphaned DBs and stale allocations
+werksfeer --prune
+
+# Prune all registered projects
+werksfeer --prune-all
 ```
 
 ## Supported project types
@@ -151,6 +159,27 @@ werksfeer --cleanup /path/to/worktree
 | Elixir | `mix.exs` | `_build`, `deps`, `node_modules` | `mix deps.get` | `{name}_dev` / `{name}_test` |
 | Python | `pyproject.toml` / `requirements.txt` | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
 | Node | `package.json` | `node_modules`, `.next`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
+
+## Port and Redis allocation
+
+Each worktree gets a unique port and Redis database number, so you can run multiple worktrees simultaneously without conflicts.
+
+- **Ports** are allocated sequentially starting from the base port + 1 (e.g. 3001, 3002, ... for Rails). Ports are globally unique across all projects.
+- **Redis databases** are allocated per-project from 1–15 (the Redis default limit).
+- Allocations are tracked in a registry at `~/.local/share/werksfeer/allocations` and released on `--cleanup` or `--prune`.
+
+Your project needs to read the `PORT` environment variable for this to work. Examples:
+
+**Rails** — `Procfile.dev`:
+```
+web: bin/rails server -p ${PORT:-3000}
+```
+
+**Elixir** — `config/dev.exs`:
+```elixir
+config :myapp, MyAppWeb.Endpoint,
+  http: [port: String.to_integer(System.get_env("PORT") || "4000")]
+```
 
 ## Configuration
 
@@ -163,6 +192,16 @@ base_name = "myapp"
 # Override suffixes
 dev_suffix = "_development"
 test_suffix = "_test"
+
+[port]
+# Base port for the web server (default: 3000 for Rails/Node, 4000 for Elixir, 8000 for Python)
+# Worktrees are allocated ports starting from base+1.
+base = 3000
+
+[redis]
+# Base Redis URL (default: redis://localhost:6379 for Rails, empty for others)
+# Each worktree gets a unique Redis database number (1-15) appended to this URL.
+url = "redis://localhost:6379"
 
 [sync]
 # Override directories to symlink
@@ -183,17 +222,17 @@ post_setup = "echo done"
 
 ## Pruning orphaned databases
 
-When worktrees are deleted, their cloned databases remain. Werksfeer can clean them up:
+When worktrees are deleted, their cloned databases and port/redis allocations remain. Werksfeer can clean them up:
 
 ```sh
-# Prune current project (only drops DBs of deleted worktrees)
+# Prune current project (drops orphaned DBs, releases stale allocations)
 werksfeer --prune
 
 # Prune all registered projects
 werksfeer --prune-all
 ```
 
-Smart pruning compares `worktree_*` databases against `git worktree list` — only orphaned databases are dropped.
+Smart pruning compares `worktree_*` databases against `git worktree list` — only orphaned databases are dropped and only stale allocations are released.
 
 ## How the git hook works
 
