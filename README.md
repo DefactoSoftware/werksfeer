@@ -141,7 +141,10 @@ When a worktree is removed, `--cleanup` drops its cloned databases and releases 
 For Cursor, Codex, and other tools that lack removal hooks, use `--prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees.
 
 ```sh
-# Clean up a specific worktree (drops DBs, releases port/redis)
+# Clean up current worktree (drops DBs, releases port/redis)
+werksfeer --cleanup
+
+# Or specify a path
 werksfeer --cleanup /path/to/worktree
 
 # Prune current project — drops orphaned DBs and stale allocations

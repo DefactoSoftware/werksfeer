@@ -924,7 +924,7 @@ werksfeer - Universal git worktree setup
 Usage:
   werksfeer                  Setup the current worktree (run from inside a worktree)
   werksfeer --hook ...       Called from post-checkout git hook
-  werksfeer --cleanup PATH   Drop databases for a specific worktree (by path)
+  werksfeer --cleanup [PATH]  Drop databases for a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
   werksfeer --version        Print version
@@ -994,7 +994,7 @@ main() {
       ;;
     --cleanup)
       shift
-      cleanup_worktree "${1:?Usage: werksfeer --cleanup PATH}"
+      cleanup_worktree "${1:-$(pwd)}"
       ;;
     --prune)
       prune_current
