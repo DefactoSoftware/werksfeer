@@ -585,7 +585,9 @@ write_env_overrides() {
   esac
 
   log_info "Port: ${wt_port}"
-  [ -n "$wt_redis" ] && log_info "Redis: ${wt_redis}"
+  if [ -n "$wt_redis" ]; then
+    log_info "Redis: ${wt_redis}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
