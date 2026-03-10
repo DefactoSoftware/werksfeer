@@ -122,6 +122,33 @@ sanitize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g' | sed 's/__*/_/g' | sed 's/^_//;s/_$//'
 }
 
+# ---------------------------------------------------------------------------
+# Port / Redis hashing
+# ---------------------------------------------------------------------------
+
+# Produces a stable numeric hash from a string using cksum (POSIX).
+_hash_string() {
+  printf '%s' "$1" | cksum | awk '{print $1}'
+}
+
+# Returns a port number for a worktree: base_port + (hash % 900) + 100
+# Range: base+100 to base+999 (avoids the base port itself)
+hash_port() {
+  local name="$1"
+  local base_port="$2"
+  local h
+  h="$(_hash_string "$name")"
+  echo $(( base_port + (h % 900) + 100 ))
+}
+
+# Returns a Redis database number 1-15 (leaves 0 for main worktree)
+hash_redis_db() {
+  local name="$1"
+  local h
+  h="$(_hash_string "$name")"
+  echo $(( (h % 15) + 1 ))
+}
+
 is_worktree_creation() {
   local prev_head="${1:-}"
   local new_head="${2:-}"
@@ -372,17 +399,56 @@ clone_databases() {
     fi
   fi
 
-  # Write overrides
-  write_db_override "$project_type"
 }
 
-write_db_override() {
+# ---------------------------------------------------------------------------
+# Environment overrides (DB names, ports, Redis)
+# ---------------------------------------------------------------------------
+
+default_base_port() {
+  case "$1" in
+    rails)  echo 3000 ;;
+    elixir) echo 4000 ;;
+    python) echo 8000 ;;
+    node)   echo 3000 ;;
+    *)      echo 3000 ;;
+  esac
+}
+
+default_redis_url() {
+  case "$1" in
+    rails) echo "redis://localhost:6379" ;;
+    *)     echo "" ;;
+  esac
+}
+
+write_env_overrides() {
   local project_type="$1"
+  local wt_name
+  wt_name="$(get_worktree_name)"
+
+  local marker="# Worktree overrides (added by werksfeer)"
+
+  # Compute port
+  local base_port
+  base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
+  local wt_port
+  wt_port="$(hash_port "$wt_name" "$base_port")"
+
+  # Compute Redis URL (if applicable)
+  local base_redis
+  base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
+  local wt_redis=""
+  if [ -n "$base_redis" ]; then
+    local redis_db
+    redis_db="$(hash_redis_db "$wt_name")"
+    # Strip any existing /N suffix and append the new DB number
+    wt_redis="$(echo "$base_redis" | sed 's|/[0-9]*$||')/${redis_db}"
+  fi
+
+  # DB names (set by clone_databases)
   local dev_db="${NEW_DEV_DB:-}"
   local test_db="${NEW_TEST_DB:-}"
-  [ -z "$dev_db" ] && return 0
-
-  local marker="# Worktree database overrides (added by werksfeer)"
 
   case "$project_type" in
     rails)
@@ -390,48 +456,66 @@ write_db_override() {
       # .env.test.local IS loaded in test. Write to both.
       local envfile=".env.local"
       if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
-        log_info "$envfile already has DB overrides, skipping"
+        log_info "$envfile already has overrides, skipping"
       else
         {
           echo ""
           echo "$marker"
-          echo "DATABASE_NAME=\"${dev_db}\""
-          echo "TEST_DATABASE_NAME=\"${test_db}\""
+          echo "PORT=\"${wt_port}\""
+          [ -n "$wt_redis" ] && echo "REDIS_URL=\"${wt_redis}\""
+          [ -n "$dev_db" ] && echo "DATABASE_NAME=\"${dev_db}\""
+          [ -n "$test_db" ] && echo "TEST_DATABASE_NAME=\"${test_db}\""
         } >> "$envfile"
-        log_info "Wrote DB overrides to $envfile"
+        log_info "Wrote overrides to $envfile"
       fi
 
       local testenvfile=".env.test.local"
       if [ -f "$testenvfile" ] && grep -qF "$marker" "$testenvfile"; then
-        log_info "$testenvfile already has DB overrides, skipping"
+        log_info "$testenvfile already has overrides, skipping"
       else
         {
           echo ""
           echo "$marker"
-          echo "TEST_DATABASE_NAME=\"${test_db}\""
+          [ -n "$test_db" ] && echo "TEST_DATABASE_NAME=\"${test_db}\""
         } >> "$testenvfile"
-        log_info "Wrote DB overrides to $testenvfile"
+        log_info "Wrote overrides to $testenvfile"
       fi
       ;;
     elixir)
       local envfile=".envrc"
       if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
-        log_info "$envfile already has DB overrides, skipping"
-        return 0
+        log_info "$envfile already has overrides, skipping"
+      else
+        {
+          echo ""
+          echo "$marker"
+          echo "export PORT=\"${wt_port}\""
+          [ -n "$dev_db" ] && echo "export DATABASE_NAME=\"${dev_db}\""
+          [ -n "$test_db" ] && echo "export TEST_DATABASE_NAME=\"${test_db}\""
+        } >> "$envfile"
+        if command -v direnv >/dev/null 2>&1; then
+          direnv allow . 2>/dev/null || true
+        fi
+        log_info "Wrote overrides to $envfile"
       fi
-      {
-        echo ""
-        echo "# Worktree database overrides (added by werksfeer)"
-        echo "export DATABASE_NAME=\"${dev_db}\""
-        echo "export TEST_DATABASE_NAME=\"${test_db}\""
-      } >> "$envfile"
-      # Allow direnv if available
-      if command -v direnv >/dev/null 2>&1; then
-        direnv allow . 2>/dev/null || true
+      ;;
+    python|node)
+      local envfile=".env"
+      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
+        log_info "$envfile already has overrides, skipping"
+      else
+        {
+          echo ""
+          echo "$marker"
+          echo "PORT=\"${wt_port}\""
+        } >> "$envfile"
+        log_info "Wrote overrides to $envfile"
       fi
-      log_info "Wrote DB overrides to $envfile"
       ;;
   esac
+
+  log_info "Port: ${wt_port}"
+  [ -n "$wt_redis" ] && log_info "Redis: ${wt_redis}"
 }
 
 # ---------------------------------------------------------------------------
@@ -712,11 +796,15 @@ run_setup() {
   log_step "Setting up databases"
   clone_databases "$project_type"
 
-  # Step 4: Run setup command
+  # Step 4: Write environment overrides (DB names, ports, Redis)
+  log_step "Writing environment overrides"
+  write_env_overrides "$project_type"
+
+  # Step 5: Run setup command
   log_step "Running setup"
   run_setup_command "$project_type" "$main_path"
 
-  # Step 5: Post-setup hook from config
+  # Step 6: Post-setup hook from config
   local post_hook
   post_hook="$(toml_get "hooks" "post_setup" "")"
   if [ -n "$post_hook" ]; then
