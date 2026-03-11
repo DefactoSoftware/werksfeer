@@ -572,7 +572,7 @@ write_env_overrides() {
   local base_redis
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
 
-  local wt_port redis_db redis_port
+  local wt_port redis_db redis_port=""
   if [ -n "$existing" ]; then
     wt_port="$(echo "$existing" | cut -f1)"
     redis_db="$(echo "$existing" | cut -f2)"
