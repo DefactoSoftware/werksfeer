@@ -676,12 +676,11 @@ run_setup_command() {
 
   case "$project_type" in
     rails)
-      if [ -x "bin/setup" ]; then
-        log_step "Running bin/setup"
-        bin/setup
-      else
-        log_info "No bin/setup found, running bundle install"
-        bundle install
+      log_step "Running bundle install"
+      bundle install
+      if [ -x "bin/rails" ]; then
+        log_step "Running bin/rails db:prepare"
+        bin/rails db:prepare
       fi
       ;;
     elixir)
