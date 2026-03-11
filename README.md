@@ -170,14 +170,15 @@ werksfeer --prune-all
 
 ## Project setup
 
-Your project needs to read the environment variables werksfeer sets (`PORT`, `DATABASE_NAME`, `TEST_DATABASE_NAME`, `REDIS_URL`). See **[docs/project-setup.md](docs/project-setup.md)** for a step-by-step guide with examples for Rails and Elixir/Phoenix.
+Your project needs to read the environment variables werksfeer sets (`PORT`, `DATABASE_NAME`, `TEST_DATABASE_NAME`, `REDIS_URL`, `REDIS_PORT`). See **[docs/project-setup.md](docs/project-setup.md)** for a step-by-step guide with examples for Rails and Elixir/Phoenix.
 
 ## Port and Redis allocation
 
-Each worktree gets a unique port and Redis database number, so you can run multiple worktrees simultaneously without conflicts.
+Each worktree gets a unique port, Redis port, and Redis database number, so you can run multiple worktrees simultaneously without conflicts.
 
 - **Ports** are allocated sequentially starting from the base port + 1 (e.g. 3001, 3002, ... for Rails). Ports are globally unique across all projects.
-- **Redis databases** are allocated per-project from 1–15 (the Redis default limit).
+- **Redis ports** are allocated sequentially starting from 6380. Each worktree runs its own Redis instance.
+- **Redis databases** are allocated per-project from 1–15 for extra isolation.
 - Allocations are tracked in a registry at `~/.local/share/werksfeer/allocations` and released on `--cleanup` or `--prune`.
 
 Your project needs to read the `PORT` environment variable for this to work. Examples:
@@ -185,6 +186,7 @@ Your project needs to read the `PORT` environment variable for this to work. Exa
 **Rails** — `Procfile.dev`:
 ```
 web: bin/rails server -p ${PORT:-3000}
+redis: redis-server --port ${REDIS_PORT:-6379}
 ```
 
 **Elixir** — `config/dev.exs`:
@@ -212,7 +214,7 @@ base = 3000
 
 [redis]
 # Base Redis URL (default: redis://localhost:6379 for Rails, empty for others)
-# Each worktree gets a unique Redis database number (1-15) appended to this URL.
+# Each worktree gets a unique Redis port (starting from 6380) and database number.
 url = "redis://localhost:6379"
 
 [sync]

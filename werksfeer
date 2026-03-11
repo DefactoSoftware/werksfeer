@@ -168,17 +168,34 @@ allocate_redis_db() {
   echo 1
 }
 
+# Find the next available Redis port starting from base+1, skipping any already in the registry.
+allocate_redis_port() {
+  local base_port="$1"
+  local alloc
+  alloc="$(allocations_file)"
+  local port=$(( base_port + 1 ))
+
+  while true; do
+    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $5}' "$alloc" | grep -qxF "$port"; then
+      echo "$port"
+      return
+    fi
+    port=$(( port + 1 ))
+  done
+}
+
 # Register an allocation
 register_allocation() {
   local project="$1"
   local wt_name="$2"
   local port="$3"
   local redis_db="$4"
+  local redis_port="${5:-}"
   local alloc
   alloc="$(allocations_file)"
 
   mkdir -p "$(dirname "$alloc")"
-  printf '%s\t%s\t%s\t%s\n' "$project" "$wt_name" "$port" "$redis_db" >> "$alloc"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$project" "$wt_name" "$port" "$redis_db" "$redis_port" >> "$alloc"
 }
 
 # Remove an allocation by worktree name (and optionally project)
@@ -198,7 +215,7 @@ deregister_allocation() {
   mv "$tmp" "$alloc"
 }
 
-# Look up existing allocation for a worktree. Prints "port<TAB>redis_db" or empty.
+# Look up existing allocation for a worktree. Prints "port<TAB>redis_db<TAB>redis_port" or empty.
 lookup_allocation() {
   local project="$1"
   local wt_name="$2"
@@ -206,7 +223,7 @@ lookup_allocation() {
   alloc="$(allocations_file)"
   [ ! -f "$alloc" ] && return 0
 
-  awk -F'\t' -v p="$project" -v w="$wt_name" '$1 == p && $2 == w {printf "%s\t%s", $3, $4}' "$alloc"
+  awk -F'\t' -v p="$project" -v w="$wt_name" '$1 == p && $2 == w {printf "%s\t%s\t%s", $3, $4, $5}' "$alloc"
 }
 
 is_worktree_creation() {
@@ -552,25 +569,44 @@ write_env_overrides() {
   local existing
   existing="$(lookup_allocation "$project_root" "$wt_name")"
 
-  local wt_port redis_db
+  local base_redis
+  base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
+
+  local wt_port redis_db redis_port
   if [ -n "$existing" ]; then
     wt_port="$(echo "$existing" | cut -f1)"
     redis_db="$(echo "$existing" | cut -f2)"
-    log_debug "Reusing allocation: port=$wt_port redis_db=$redis_db"
+    redis_port="$(echo "$existing" | cut -f3)"
+    log_debug "Reusing allocation: port=$wt_port redis_db=$redis_db redis_port=$redis_port"
   else
     local base_port
     base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
     wt_port="$(allocate_port "$base_port")"
     redis_db="$(allocate_redis_db "$project_root")"
-    register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db"
+  fi
+
+  # Allocate Redis port if not yet assigned (new worktree or old-format allocation)
+  if [ -n "$base_redis" ] && [ -z "$redis_port" ]; then
+    local base_redis_port
+    base_redis_port="$(echo "$base_redis" | grep -oE ':[0-9]+' | tail -1 | tr -d ':')"
+    base_redis_port="${base_redis_port:-6379}"
+    redis_port="$(allocate_redis_port "$base_redis_port")"
+  fi
+
+  if [ -z "$existing" ]; then
+    register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
   fi
 
   # Build Redis URL (if applicable)
-  local base_redis
-  base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
   local wt_redis=""
   if [ -n "$base_redis" ]; then
-    wt_redis="$(echo "$base_redis" | sed 's|/[0-9]*$||')/${redis_db}"
+    local base_stripped
+    base_stripped="$(echo "$base_redis" | sed 's|/[0-9]*$||')"
+    if [ -n "$redis_port" ]; then
+      wt_redis="$(echo "$base_stripped" | sed "s|:[0-9]*$|:${redis_port}|")/${redis_db}"
+    else
+      wt_redis="${base_stripped}/${redis_db}"
+    fi
   fi
 
   # DB names (set by clone_databases)
@@ -590,6 +626,7 @@ write_env_overrides() {
           echo "$marker"
           echo "PORT=\"${wt_port}\""
           [ -n "$wt_redis" ] && echo "REDIS_URL=\"${wt_redis}\""
+          [ -n "$redis_port" ] && echo "REDIS_PORT=\"${redis_port}\""
           [ -n "$dev_db" ] && echo "DATABASE_NAME=\"${dev_db}\""
           [ -n "$test_db" ] && echo "TEST_DATABASE_NAME=\"${test_db}\""
         } >> "$envfile"
