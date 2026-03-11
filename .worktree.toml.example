@@ -19,7 +19,7 @@
 
 [redis]
 # Base Redis URL (default: redis://localhost:6379 for Rails, empty for others)
-# Each worktree gets the next available Redis database number (1-15).
+# Each worktree gets a unique Redis port (starting from 6380) and database number.
 # url = "redis://localhost:6379"
 
 [sync]

@@ -9,7 +9,8 @@ Werksfeer writes the following env vars per worktree:
 | `PORT` | `.env.local` / `.envrc` | Unique web server port |
 | `DATABASE_NAME` | `.env.local` / `.envrc` | Dev database name |
 | `TEST_DATABASE_NAME` | `.env.local` / `.env.test.local` / `.envrc` | Test database name |
-| `REDIS_URL` | `.env.local` | Redis URL with unique DB number (Rails) |
+| `REDIS_URL` | `.env.local` | Redis URL with unique port and DB number (Rails) |
+| `REDIS_PORT` | `.env.local` | Unique Redis server port (Rails) |
 
 ## Ruby on Rails
 
@@ -60,7 +61,16 @@ This only modifies the cookie name in development when PORT is set. Production i
 
 ### 4. Redis
 
-Rails apps usually read `REDIS_URL` already (Sidekiq, Action Cable, cache store). Werksfeer writes a `REDIS_URL` with a unique database number (e.g. `redis://localhost:6379/2`). No project changes needed if you already use `ENV["REDIS_URL"]`.
+Rails apps usually read `REDIS_URL` already (Sidekiq, Action Cable, cache store). Werksfeer writes a `REDIS_URL` with a unique port and database number (e.g. `redis://localhost:6380/2`).
+
+If your `Procfile.dev` starts Redis, use the `REDIS_PORT` variable:
+
+```diff
+-redis: redis-server
++redis: redis-server --port ${REDIS_PORT:-6379}
+```
+
+No other project changes needed if you already use `ENV["REDIS_URL"]`.
 
 ### 5. Gitignore
 
