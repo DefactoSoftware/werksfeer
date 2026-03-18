@@ -87,18 +87,35 @@ A trailing `/` only matches directories, not symlinks.
 
 ### 1. Port
 
-Make the endpoint read `PORT` from the environment at compile time.
+Read `PORT` in `config/runtime.exs` so it's picked up at startup — not baked in at compile time. This is important because werksfeer copies `_build` between worktrees, and compile-time env vars would be stale.
 
-**`config/dev.exs`:**
+**`config/runtime.exs`:**
+```elixir
+# Add this outside any prod-only block (applies to all environments):
+config :myapp, MyAppWeb.Endpoint,
+  http: [port: String.to_integer(System.get_env("PORT") || "4000")]
+```
+
+Remove any hardcoded or compile-time port from `config/dev.exs`:
 ```diff
  config :myapp, MyAppWeb.Endpoint,
 -  http: [port: 4000],
-+  http: [port: String.to_integer(System.get_env("PORT") || "4000")],
++  # port is set in runtime.exs
+   debug_errors: true,
 ```
 
 ### 2. Database
 
-Use separate env vars for dev and test databases. The key change is in `config/runtime.exs` — use `DATABASE_NAME` for dev and `TEST_DATABASE_NAME` for test:
+Use separate env vars for dev and test databases in `config/runtime.exs`. Remove any hardcoded database name from `config/dev.exs`:
+
+**`config/dev.exs`:**
+```diff
+ config :myapp, MyApp.Repo,
+   adapter: Ecto.Adapters.Postgres,
+-  database: "myapp_dev",
++  # database is set in runtime.exs via DATABASE_NAME env var
+   pool_size: 10
+```
 
 **`config/runtime.exs`:**
 ```elixir
