@@ -1070,7 +1070,7 @@ direct_mode() {
 
   if ! is_worktree; then
     log_error "Not inside a worktree (this is the main checkout)"
-    log_info "Run this from inside a worktree created with: git worktree add <path> <branch>"
+    log_info "Run this from inside a worktree created with: wt switch -c <branch>"
     return 1
   fi
 

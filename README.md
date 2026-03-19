@@ -29,6 +29,10 @@ touch .worktree.toml
 
 3. Create a worktree — werksfeer runs automatically:
 
+```sh
+wt switch -c my-feature
+```
+
 ```
 [werksfeer] ==> Setting up worktree
 [werksfeer] Copied .env
@@ -55,7 +59,7 @@ Everything is idempotent — safe to re-run.
 
 ### Git hooks
 
-The included `post-checkout` hook triggers werksfeer automatically on `git worktree add`. It only activates for worktree creation (not regular branch checkouts) and only when `.worktree.toml` exists.
+The included `post-checkout` hook triggers werksfeer automatically on worktree creation (via `wt switch -c` or `git worktree add`). It only activates for worktree creation (not regular branch checkouts) and only when `.worktree.toml` exists.
 
 ```sh
 # Global — all repos (note: replaces per-repo hooks):
@@ -127,9 +131,30 @@ Add to `.cursor/worktrees.json`:
 }
 ```
 
+### WorkTrunk (`wt`)
+
+We recommend [WorkTrunk](https://github.com/max-sixty/worktrunk) for managing worktrees. With git hooks configured, werksfeer runs automatically:
+
+```sh
+wt switch -c my-feature
+```
+
+To launch an AI agent in a new worktree:
+
+```sh
+wt switch -x claude -c feature-auth -- 'Add user authentication'
+```
+
 ### Other agents / manual use
 
 Run werksfeer after creating a worktree:
+
+```sh
+wt switch -c my-feature
+werksfeer
+```
+
+Or with plain git:
 
 ```sh
 git worktree add ../my-feature feature-branch
@@ -238,7 +263,7 @@ post_setup = "echo done"
 
 ## Pruning orphaned databases
 
-When worktrees are deleted, their cloned databases and port/redis allocations remain. Werksfeer can clean them up:
+When worktrees are deleted (via `wt remove` or `git worktree remove`), their cloned databases and port/redis allocations remain. Werksfeer can clean them up:
 
 ```sh
 # Prune current project (drops orphaned DBs, releases stale allocations)
@@ -248,11 +273,11 @@ werksfeer --prune
 werksfeer --prune-all
 ```
 
-Smart pruning compares `worktree_*` databases against `git worktree list` — only orphaned databases are dropped and only stale allocations are released.
+Smart pruning compares `worktree_*` databases against active worktrees — only orphaned databases are dropped and only stale allocations are released.
 
 ## How the git hook works
 
-The `post-checkout` hook fires on every `git checkout` and `git worktree add`. Werksfeer only activates when all three conditions are met:
+The `post-checkout` hook fires on every `git checkout` and worktree creation (via `wt switch -c` or `git worktree add`). Werksfeer only activates when all three conditions are met:
 
 1. It's a branch checkout (not a file checkout)
 2. The previous HEAD is the null ref (new worktree, not a branch switch)
@@ -263,7 +288,7 @@ If `.worktree.toml` doesn't exist in the repo, the hook exits silently.
 ## Requirements
 
 - **bash** 3.2+ (ships with macOS, Linux, WSL)
-- **git** 2.5+ (worktree support)
+- **git** 2.5+ (worktree support) — [WorkTrunk](https://github.com/max-sixty/worktrunk) (`wt`) recommended for worktree management
 - **psql** (optional — only needed for database cloning)
 - **curl** (only for installation)
 
