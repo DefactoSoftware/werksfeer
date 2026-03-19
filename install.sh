@@ -53,7 +53,7 @@ Then set up werksfeer for your workflow. Pick one:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-GIT HOOKS — runs automatically on "git worktree add"
+GIT HOOKS — runs automatically on worktree creation (wt switch -c / git worktree add)
 
   # Global (all repos — replaces per-repo hooks):
   git config --global core.hooksPath ${HOOKS_DIR}
@@ -111,7 +111,23 @@ CURSOR — add to .cursor/worktrees.json:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+WORKTRUNK (recommended) — better CLI for worktree management:
+
+  # Install: https://github.com/max-sixty/worktrunk
+  wt switch -c my-feature          # create & switch
+  wt switch -x claude -c feat -- 'prompt'  # launch agent in worktree
+  wt remove                        # clean up
+
+  With git hooks configured, werksfeer runs automatically on wt switch -c.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 OTHER AGENTS — run after worktree creation:
+
+  wt switch -c my-feature
+  werksfeer
+
+  Or with plain git:
 
   git worktree add ../my-feature feature-branch
   cd ../my-feature
