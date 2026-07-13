@@ -256,9 +256,60 @@ skip = ["tmp"]
 # Override setup command
 command = "make setup"
 
+[warmup]
+# Branch --warmup updates (default: origin's default branch)
+branch = "main"
+# Override the auto-detected warmup command
+command = "bin/setup"
+# Skip if the last warmup was less than N minutes ago (default: 0, always run)
+min_interval = 45
+# Max seconds setup waits for a running warmup (default: 1800)
+wait_timeout = 1800
+
 [hooks]
 # Run after setup completes
 post_setup = "echo done"
+```
+
+## Keeping the main worktree warm
+
+New worktrees are only as fresh as the main worktree they copy from: stale
+`_build`/`deps` means long compiles, an unmigrated main database means every
+clone starts behind. `--warmup` keeps main fresh:
+
+```sh
+werksfeer --warmup           # update main: pull, deps, build, migrate
+werksfeer --warmup --force   # ignore the min_interval throttle
+```
+
+Per project type it runs (override with `[warmup] command`):
+
+| Type | Warmup command |
+|------|----------------|
+| Rails | `bundle install && bin/rails db:prepare` |
+| Elixir | `mix deps.get && mix compile && mix ecto.migrate` (+ JS install if `package.json` exists) |
+| Python | `uv sync` / `pipenv install` / `pip install -r requirements.txt` |
+| Node | `npm ci` / `yarn` / `pnpm` / `bun` |
+
+Before running the command it checks out the default branch (from
+`origin/HEAD`, override with `[warmup] branch`) and pulls with `--ff-only`.
+It refuses to touch a main worktree with uncommitted changes.
+
+While a warmup runs it holds a per-project lock under
+`~/.local/share/werksfeer/warmup/`. Worktree setup waits on that lock (up to
+`[warmup] wait_timeout` seconds, default 1800), so a new worktree never
+copies a half-built cache. Stale locks from crashed runs are detected by PID
+and cleaned up automatically.
+
+Trigger it however suits you — the `min_interval` throttle makes overlapping
+triggers cheap:
+
+```sh
+# cron: hourly during work hours (Linux)
+0 9-18 * * 1-5 cd ~/projects/myapp && werksfeer --warmup
+
+# macOS: launchd StartCalendarInterval, or simply from your shell startup:
+(cd ~/projects/myapp && werksfeer --warmup >/dev/null 2>&1 &)
 ```
 
 ## Pruning orphaned databases

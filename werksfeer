@@ -756,6 +756,185 @@ run_setup_command() {
 }
 
 # ---------------------------------------------------------------------------
+# Warmup (keep the main worktree fresh so new worktrees copy warm caches)
+# ---------------------------------------------------------------------------
+# `werksfeer --warmup` updates the main worktree (pull + deps + build +
+# migrate per project type) while holding a lock. The normal setup flow
+# waits on that lock, so a new worktree never copies a half-built cache.
+# State: ~/.local/share/werksfeer/warmup/<project-id>.{lock,last}
+
+warmup_state_dir() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/warmup"
+}
+
+# Filesystem-safe id for a main worktree path
+warmup_id() {
+  sanitize_name "$(echo "$1" | tr '/' '_')"
+}
+
+warmup_lock_dir()   { echo "$(warmup_state_dir)/$(warmup_id "$1").lock"; }
+warmup_stamp_file() { echo "$(warmup_state_dir)/$(warmup_id "$1").last"; }
+
+# Returns 0 if a live warmup holds the lock; removes stale locks.
+warmup_lock_alive() {
+  local lock="$1"
+  [ -d "$lock" ] || return 1
+
+  local pid
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  log_info "Removing stale warmup lock (pid ${pid:-unknown} gone)"
+  rm -rf "$lock"
+  return 1
+}
+
+default_warmup_command() {
+  local project_type="$1"
+  local main_path="$2"
+
+  case "$project_type" in
+    rails)
+      echo "bundle install && bin/rails db:prepare"
+      ;;
+    elixir)
+      local cmd="mix deps.get && mix compile && mix ecto.migrate"
+      if [ -f "$main_path/package.json" ]; then
+        cmd="$cmd && $(detect_node_pm "$main_path")"
+      fi
+      echo "$cmd"
+      ;;
+    python)
+      if [ -f "$main_path/pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
+        echo "uv sync"
+      elif [ -f "$main_path/Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
+        echo "pipenv install"
+      elif [ -f "$main_path/requirements.txt" ]; then
+        echo "pip install -r requirements.txt"
+      fi
+      ;;
+    node)
+      detect_node_pm "$main_path"
+      ;;
+    *)
+      ;;
+  esac
+}
+
+# Update the main worktree's default branch. Refuses to touch a dirty tree.
+warmup_update_git() {
+  local main_path="$1"
+
+  # Untracked files are fine (build output, local env files); only modified
+  # tracked files make checkout/pull unsafe.
+  if [ -n "$(git -C "$main_path" status --porcelain --untracked-files=no)" ]; then
+    log_error "Main worktree has uncommitted changes, refusing to update"
+    return 1
+  fi
+
+  local branch
+  branch="$(toml_get "warmup" "branch" "")"
+  if [ -z "$branch" ]; then
+    branch="$(git -C "$main_path" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+  fi
+  if [ -z "$branch" ]; then
+    branch="$(git -C "$main_path" rev-parse --abbrev-ref HEAD)"
+    log_debug "origin/HEAD not set, staying on current branch: $branch"
+  fi
+
+  local current
+  current="$(git -C "$main_path" rev-parse --abbrev-ref HEAD)"
+  if [ "$current" != "$branch" ]; then
+    log_step "Checking out $branch"
+    git -C "$main_path" checkout "$branch"
+  fi
+
+  log_step "Pulling $branch (--ff-only)"
+  git -C "$main_path" pull --ff-only
+}
+
+run_warmup() {
+  local force="${1:-0}"
+
+  if ! is_git_repo; then
+    log_error "Not inside a git repository"
+    return 1
+  fi
+
+  local main_path
+  main_path="$(get_main_worktree_path)"
+  [ -f "$main_path/.worktree.toml" ] && toml_parse "$main_path/.worktree.toml"
+
+  local project_type
+  project_type="$(detect_project_type "$main_path")"
+
+  # Throttle: skip if the last successful warmup is fresher than min_interval
+  local min_interval stamp
+  min_interval="$(toml_get "warmup" "min_interval" "0")"
+  stamp="$(warmup_stamp_file "$main_path")"
+  if [ "$force" != "1" ] && [ "$min_interval" -gt 0 ] && [ -f "$stamp" ] \
+      && [ -z "$(find "$stamp" -mmin +"$min_interval" 2>/dev/null)" ]; then
+    log_info "Warmup ran less than ${min_interval}m ago, skipping (use --warmup --force)"
+    return 0
+  fi
+
+  mkdir -p "$(warmup_state_dir)"
+  local lock
+  lock="$(warmup_lock_dir "$main_path")"
+  if warmup_lock_alive "$lock"; then
+    log_info "Warmup already running (pid $(cat "$lock/pid" 2>/dev/null))"
+    return 0
+  fi
+  if ! mkdir "$lock" 2>/dev/null; then
+    log_info "Warmup already running"
+    return 0
+  fi
+  echo $$ > "$lock/pid"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock'" EXIT INT TERM
+
+  log_step "werksfeer v${WERKSFEER_VERSION} - Warming up main worktree"
+  log_info "Main: $main_path"
+  log_info "Project type: $project_type"
+
+  warmup_update_git "$main_path"
+
+  local cmd
+  cmd="$(toml_get "warmup" "command" "")"
+  [ -z "$cmd" ] && cmd="$(default_warmup_command "$project_type" "$main_path")"
+
+  if [ -n "$cmd" ]; then
+    log_step "Running: $cmd"
+    (cd "$main_path" && eval "$cmd")
+  else
+    log_info "No warmup command for project type: $project_type"
+  fi
+
+  touch "$stamp"
+  log_step "Warmup complete!"
+}
+
+# Block while a warmup holds the lock, so setup never copies mid-build.
+wait_for_warmup() {
+  local main_path="$1"
+
+  local lock timeout waited=0
+  lock="$(warmup_lock_dir "$main_path")"
+  timeout="$(toml_get "warmup" "wait_timeout" "1800")"
+
+  while warmup_lock_alive "$lock"; do
+    [ "$waited" -eq 0 ] && log_info "Warmup in progress on main worktree, waiting..."
+    sleep 2
+    waited=$(( waited + 2 ))
+    if [ "$waited" -ge "$timeout" ]; then
+      log_warn "Warmup still running after ${timeout}s, continuing anyway"
+      break
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Project registry (for --prune-all)
 # ---------------------------------------------------------------------------
 
@@ -977,6 +1156,9 @@ run_setup() {
   # Register for prune-all
   register_project
 
+  # Wait for any in-progress warmup before copying from the main worktree
+  wait_for_warmup "$main_path"
+
   # Step 1: Copy env files
   log_step "Copying environment files"
   sync_env_files "$main_path" "$worktree_path" "$project_type"
@@ -1023,6 +1205,9 @@ werksfeer - Universal git worktree setup
 Usage:
   werksfeer                  Setup the current worktree (run from inside a worktree)
   werksfeer --hook ...       Called from post-checkout git hook
+  werksfeer --warmup [--force]  Update the main worktree (pull, deps, build,
+                             migrate) so new worktrees copy warm caches.
+                             Setup waits while a warmup is running.
   werksfeer --cleanup [PATH]  Drop databases for a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
@@ -1090,6 +1275,12 @@ main() {
     --hook)
       shift
       hook_mode "$@"
+      ;;
+    --warmup)
+      shift
+      local force=0
+      [ "${1:-}" = "--force" ] && force=1
+      run_warmup "$force"
       ;;
     --cleanup)
       shift

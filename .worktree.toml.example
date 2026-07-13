@@ -39,6 +39,25 @@
 # Override the auto-detected setup command
 # command = "bin/setup"
 
+[warmup]
+# `werksfeer --warmup` updates the main worktree so new worktrees copy warm
+# build caches. While it runs, worktree setup waits (never copies mid-build).
+# Refuses to run if the main worktree has uncommitted changes.
+
+# Branch to update (default: origin's default branch, else the current branch)
+# branch = "main"
+
+# Override the auto-detected warmup command (default per project type, e.g.
+# Elixir: "mix deps.get && mix compile && mix ecto.migrate && npm ci")
+# command = "bin/setup"
+
+# Skip if the last successful warmup was less than N minutes ago (default: 0,
+# always run). Useful when triggering from cron/launchd or shell startup.
+# min_interval = 45
+
+# Max seconds setup waits for a running warmup before continuing (default: 1800)
+# wait_timeout = 1800
+
 [hooks]
 # Shell command to run after worktree setup is complete
 # post_setup = "echo 'ready!'"
