@@ -6,6 +6,18 @@ set -euo pipefail
 REPO="DefactoSoftware/werksfeer"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)"
+
+install_asset() {
+  local source_path="$1"
+  local destination="$2"
+
+  if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/${source_path}" ]; then
+    cp "${SCRIPT_DIR}/${source_path}" "$destination"
+  else
+    curl -fsSL "${BASE_URL}/${source_path}" -o "$destination"
+  fi
+}
 
 echo "Installing werksfeer..."
 
@@ -18,17 +30,24 @@ else
 fi
 
 # Download main script
-curl -fsSL "${BASE_URL}/werksfeer" -o "${INSTALL_DIR}/werksfeer"
+install_asset "werksfeer" "${INSTALL_DIR}/werksfeer"
 chmod +x "${INSTALL_DIR}/werksfeer"
+
+# Download service modules
+LIB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/lib"
+mkdir -p "${LIB_DIR}/services"
+install_asset "lib/werksfeer/services.sh" "${LIB_DIR}/services.sh"
+install_asset "lib/werksfeer/services/postgres.sh" "${LIB_DIR}/services/postgres.sh"
 
 # Download hook template
 HOOKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/hooks"
 mkdir -p "$HOOKS_DIR"
-curl -fsSL "${BASE_URL}/hooks/post-checkout" -o "${HOOKS_DIR}/post-checkout"
+install_asset "hooks/post-checkout" "${HOOKS_DIR}/post-checkout"
 chmod +x "${HOOKS_DIR}/post-checkout"
 
 echo ""
 echo "Installed werksfeer to ${INSTALL_DIR}/werksfeer"
+echo "Service modules at ${LIB_DIR}"
 echo "Hook template at ${HOOKS_DIR}/post-checkout"
 echo ""
 

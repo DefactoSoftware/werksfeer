@@ -11,6 +11,8 @@ Werksfeer writes the following env vars per worktree:
 | `TEST_DATABASE_NAME` | `.env.local` / `.env.test.local` / `.envrc` | Test database name |
 | `REDIS_URL` | `.env.local` | Redis URL with unique port and DB number (Rails) |
 | `REDIS_PORT` | `.env.local` | Unique Redis server port (Rails) |
+| `DATABASE_SOCKET_DIR` | `.env.local` / `.env.test.local` / `.envrc` | Private PostgreSQL Unix socket directory |
+| `PGHOST`, `PGPORT`, `PGUSER` | `.env.local` / `.env.test.local` / `.envrc` | Standard libpq connection settings |
 
 ## Ruby on Rails
 
@@ -35,12 +37,34 @@ Your `database.yml` should reference these:
 ```yaml
 development:
   database: <%= ENV.fetch("DATABASE_NAME", "myapp_development") %>
+  host: <%= ENV.fetch("DATABASE_HOST", "localhost") %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+  username: <%= ENV.fetch("DATABASE_USER", "postgres") %>
 
 test:
   database: <%= ENV.fetch("TEST_DATABASE_NAME", "myapp_test") %>
+  host: <%= ENV.fetch("DATABASE_HOST", "localhost") %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+  username: <%= ENV.fetch("DATABASE_USER", "postgres") %>
 ```
 
 > **Note:** `dotenv-rails` does NOT load `.env.local` in the test environment, which is why werksfeer also writes `TEST_DATABASE_NAME` to `.env.test.local`.
+
+When using the private PostgreSQL provider, start services before Rails loads
+`database.yml`. One durable option is to add this near the top of `bin/rails`,
+before `require_relative "../config/boot"`:
+
+```ruby
+root = File.expand_path("..", __dir__)
+
+if File.file?(File.join(root, ".git")) && ENV.fetch("WERKSFEER_POSTGRES", "true") != "false"
+  system("werksfeer", "services", "start", chdir: root) ||
+    abort("Could not start worktree services")
+end
+```
+
+This covers `bin/rails server`, test commands, migrations, and `db:prepare`.
+Main checkouts and CI remain no-ops.
 
 ### 3. Session cookie
 
@@ -130,6 +154,22 @@ config :myapp, MyApp.Repo,
     )
 ```
 
+When the private PostgreSQL provider is enabled, add its socket option:
+
+```elixir
+repo_config =
+  case System.get_env("DATABASE_SOCKET_DIR") do
+    nil -> repo_config
+    socket_dir -> Keyword.put(repo_config, :socket_dir, socket_dir)
+  end
+```
+
+For applications that must also work before direnv has loaded, resolve the
+socket with `werksfeer postgres socket-dir` during development runtime config.
+
+Prepend `werksfeer services start` to the Mix aliases for `phx.server`, tests,
+and Ecto tasks. The Detroit repository is a complete example of this pattern.
+
 If you use plain `System.get_env` instead of a custom `Env` module:
 
 ```elixir
@@ -192,3 +232,5 @@ Document the new env vars so other developers know they exist:
 - [ ] Session cookie key includes port in development
 - [ ] `.gitignore` matches `node_modules` symlinks (no trailing `/`)
 - [ ] `.worktree.toml` exists in project root (can be empty)
+- [ ] Private PostgreSQL, when enabled, is started from the normal server/test command
+- [ ] `.pg_data/` is ignored when the private PostgreSQL provider is enabled
