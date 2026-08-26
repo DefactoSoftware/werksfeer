@@ -572,6 +572,10 @@ postgres_publish_template() {
     log_debug "Not publishing PostgreSQL template: HEAD is not $template_ref"
     return 0
   }
+  [ -z "$(git -C "$project_root" status --porcelain --untracked-files=all)" ] || {
+    log_debug "Not publishing PostgreSQL template from a dirty worktree"
+    return 0
+  }
 
   postgres_load_tools
   version_root="$(postgres_template_version_root "$project_root")"

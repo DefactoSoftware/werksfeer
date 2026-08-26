@@ -179,7 +179,8 @@ commit is an ancestor of the new worktree and whose committed seed inputs are
 identical. When found, it clones that stopped cluster and Ecto only applies
 pending migrations. When seed inputs changed, the first worktree performs the
 normal `ecto.setup`; werksfeer then publishes its clean result for later
-worktrees at the same remote base.
+worktrees at the same remote base. Publication also requires a clean Git
+worktree, so delayed setup cannot share uncommitted migrations or seeds.
 
 The same rule applies to Rails, using `db/seeds.rb`/`db/seeds` as seed inputs
 and `db:prepare` as the framework setup command. Custom `[setup] command`

@@ -270,9 +270,10 @@ The cache refresh is demand-driven rather than clock-driven:
 5. changed seed inputs force one fresh seed before publishing a new snapshot.
 
 Only a database newly created during unattended setup can be published, and
-only when `HEAD` exactly matches the configured remote ref. Existing developer
-databases and feature-branch commits are never cached. Three templates are kept
-by default. Inspect the current selection with:
+only when `HEAD` exactly matches the configured remote ref and the worktree is
+clean. Existing developer databases, uncommitted changes, and feature-branch
+commits are never cached. Three templates are kept by default. Inspect the
+current selection with:
 
 ```sh
 werksfeer postgres template-status
