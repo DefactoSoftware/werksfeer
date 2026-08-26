@@ -98,6 +98,51 @@ teardown() {
   [[ "$output" == *"WERKSFEER_POSTGRES must be true, false, 1, or 0"* ]]
 }
 
+@test "PostgreSQL template fingerprints only committed seed inputs" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+
+  run bash -c "source \"$provider\"; postgres_template_seed_fingerprint \"$WORKTREE_ONE\" elixir"
+  [ "$status" -eq 0 ]
+  initial_fingerprint="$output"
+
+  mkdir -p "${WORKTREE_ONE}/priv/repo/seeds"
+  printf ':ok\n' > "${WORKTREE_ONE}/priv/repo/seeds/seeds.exs"
+  run bash -c "source \"$provider\"; postgres_template_seed_fingerprint \"$WORKTREE_ONE\" elixir"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$initial_fingerprint" ]
+
+  git -C "$WORKTREE_ONE" add priv/repo/seeds/seeds.exs
+  git -C "$WORKTREE_ONE" commit -qm seeds
+  run bash -c "source \"$provider\"; postgres_template_seed_fingerprint \"$WORKTREE_ONE\" elixir"
+  [ "$status" -eq 0 ]
+  [ "$output" != "$initial_fingerprint" ]
+}
+
+@test "custom setup commands require an explicit PostgreSQL template opt-in" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+
+  run bash -c 'toml_get() { if [ "$1.$2" = "setup.command" ]; then printf "custom\n"; else printf "%s\n" "$3"; fi; }; source "$1"; postgres_template_cache_enabled' _ "$provider"
+  [ "$status" -eq 1 ]
+
+  run bash -c 'toml_get() { case "$1.$2" in setup.command) printf "custom\n" ;; postgres.template_cache) printf "true\n" ;; *) printf "%s\n" "$3" ;; esac; }; source "$1"; postgres_template_cache_enabled' _ "$provider"
+  [ "$status" -eq 0 ]
+}
+
+@test "PostgreSQL template trees clone without sharing mutable files" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+  source_dir="${TEST_ROOT}/template-source"
+  destination="${TEST_ROOT}/template-copy"
+  mkdir -p "$source_dir/base"
+  printf 'template\n' > "$source_dir/base/value"
+
+  run bash -c "log_error() { printf '%s\\n' \"\$*\" >&2; }; source \"$provider\"; postgres_copy_tree \"$source_dir\" \"$destination\""
+  [ "$status" -eq 0 ]
+  [ "$(cat "${destination}/base/value")" = "template" ]
+
+  printf 'worktree\n' > "${destination}/base/value"
+  [ "$(cat "${source_dir}/base/value")" = "template" ]
+}
+
 @test "setup writes one replaceable managed environment block" {
   run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]

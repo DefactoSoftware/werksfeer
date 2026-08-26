@@ -172,6 +172,21 @@ database:
 Werksfeer writes these env vars to `.envrc`, adds the generic service-start
 hook, and runs `direnv allow`.
 
+### Seed/template behavior
+
+For a new private cluster, werksfeer first looks for a cached template whose
+commit is an ancestor of the new worktree and whose committed seed inputs are
+identical. When found, it clones that stopped cluster and Ecto only applies
+pending migrations. When seed inputs changed, the first worktree performs the
+normal `ecto.setup`; werksfeer then publishes its clean result for later
+worktrees at the same remote base.
+
+The same rule applies to Rails, using `db/seeds.rb`/`db/seeds` as seed inputs
+and `db:prepare` as the framework setup command. Custom `[setup] command`
+configurations disable template publication by default because their database
+semantics are unknown; explicitly set `postgres.template_cache = true` only
+when that setup remains safe to snapshot.
+
 ### 3. Session cookie
 
 Append the port to the session cookie key in development so worktrees on different ports don't share sessions.

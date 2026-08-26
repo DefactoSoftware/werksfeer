@@ -234,6 +234,392 @@ postgres_major_version() {
   "$POSTGRES_SERVER" --version | sed -E 's/.* ([0-9]+)(\..*)?$/\1/'
 }
 
+postgres_template_cache_enabled() {
+  local configured configured_in_file
+  if [ "${WERKSFEER_POSTGRES_TEMPLATE_CACHE+x}" = "x" ]; then
+    configured="$WERKSFEER_POSTGRES_TEMPLATE_CACHE"
+  else
+    configured_in_file="$(toml_get "postgres" "template_cache" "__unset__")"
+
+    # A custom setup can have arbitrary database semantics. Repositories that
+    # want caching alongside one must opt back in explicitly.
+    if [ -n "$(toml_get "setup" "command" "")" ] &&
+        [ "$configured_in_file" = "__unset__" ]; then
+      return 1
+    fi
+
+    if [ "$configured_in_file" = "__unset__" ]; then
+      configured="true"
+    else
+      configured="$configured_in_file"
+    fi
+  fi
+
+  case "$configured" in
+    1|true) return 0 ;;
+    0|false) return 1 ;;
+    *)
+      log_error "postgres.template_cache must be true, false, 1, or 0"
+      return 2
+      ;;
+  esac
+}
+
+postgres_template_ref() {
+  local project_root="$1"
+  local configured="${WERKSFEER_POSTGRES_TEMPLATE_REF:-$(toml_get "postgres" "template_ref" "")}"
+
+  if [ -n "$configured" ]; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+
+  local main_path remote_head
+  main_path="$(cd "$project_root" && get_main_worktree_path)"
+  remote_head="$(git -C "$main_path" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$remote_head" ]; then
+    printf '%s\n' "$remote_head"
+  elif git -C "$main_path" show-ref --verify --quiet refs/remotes/origin/main; then
+    printf 'origin/main\n'
+  elif git -C "$main_path" show-ref --verify --quiet refs/remotes/origin/master; then
+    printf 'origin/master\n'
+  else
+    return 1
+  fi
+}
+
+postgres_template_seed_paths() {
+  case "$1" in
+    elixir) printf '%s\n' priv/repo/seeds.exs priv/repo/seeds ;;
+    rails) printf '%s\n' db/seeds.rb db/seeds ;;
+    *) return 1 ;;
+  esac
+}
+
+postgres_template_seed_fingerprint() {
+  local project_root="$1"
+  local project_type="$2"
+  local seed_paths
+  seed_paths="$(postgres_template_seed_paths "$project_type")" || return 1
+
+  # Hash committed seed inputs rather than timestamps or a mutable working
+  # tree. Identical seeds can safely reuse an older ancestor and migrate it.
+  local listing=""
+  while IFS= read -r seed_path; do
+    [ -z "$seed_path" ] && continue
+    listing="${listing}$(git -C "$project_root" ls-tree -r HEAD -- "$seed_path")
+"
+  done <<EOF_SEED_PATHS
+$seed_paths
+EOF_SEED_PATHS
+
+  printf '%s' "${listing:-no-committed-seeds}" | postgres_sha256
+}
+
+postgres_template_repository_key() {
+  local project_root="$1"
+  local main_path
+  main_path="$(cd "$project_root" && get_main_worktree_path)"
+  main_path="$(cd "$main_path" && pwd -P)"
+  printf '%s' "$main_path" | postgres_sha256
+}
+
+postgres_template_version_root() {
+  local project_root="$1"
+  local repository_key
+  repository_key="$(postgres_template_repository_key "$project_root")"
+  printf '%s/werksfeer/postgres-templates/%s/pg%s\n' \
+    "${XDG_CACHE_HOME:-$HOME/.cache}" \
+    "${repository_key:0:16}" \
+    "$(postgres_major_version)"
+}
+
+postgres_template_compatibility_key() {
+  local project_root="$1"
+  local project_type="$2"
+  local db_names extensions seed_fingerprint
+  db_names="$(get_base_db_names "$project_type")" || return 1
+  extensions="$(toml_get_array "postgres" "required_extensions")"
+  seed_fingerprint="$(postgres_template_seed_fingerprint "$project_root" "$project_type")" || return 1
+
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$project_type" \
+    "$db_names" \
+    "$(postgres_user)" \
+    "$extensions" \
+    "$seed_fingerprint" | postgres_sha256
+}
+
+postgres_template_compatibility_root() {
+  local project_root="$1"
+  local project_type="$2"
+  local compatibility_key
+  compatibility_key="$(postgres_template_compatibility_key "$project_root" "$project_type")" || return 1
+  printf '%s/%s\n' \
+    "$(postgres_template_version_root "$project_root")" \
+    "${compatibility_key:0:24}"
+}
+
+postgres_copy_tree() {
+  local source="$1"
+  local destination="$2"
+
+  [ -d "$source" ] || return 1
+  [ ! -e "$destination" ] || {
+    log_error "Refusing to overwrite template copy destination: $destination"
+    return 1
+  }
+  mkdir -p "$(dirname "$destination")"
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # clonefile-backed copies are copy-on-write on APFS.
+    if cp -cR "$source" "$destination" 2>/dev/null; then
+      return 0
+    fi
+  elif cp --reflink=auto -a "$source" "$destination" 2>/dev/null; then
+    return 0
+  fi
+
+  [ ! -e "$destination" ] || {
+    log_error "Copy-on-write template copy left a partial destination: $destination"
+    return 1
+  }
+
+  cp -Rp "$source" "$destination"
+}
+
+postgres_remove_template_staging() {
+  local staging="$1"
+  local expected_parent="$2"
+
+  case "$staging" in
+    "${expected_parent}"/.template-*) rm -rf -- "$staging" ;;
+    *)
+      log_error "Refusing to remove unexpected template staging path: $staging"
+      return 1
+      ;;
+  esac
+}
+
+postgres_find_compatible_template() {
+  local project_root="$1"
+  local project_type="$2"
+  local compatibility_root candidate candidate_commit distance
+  local best="" best_distance=""
+  compatibility_root="$(postgres_template_compatibility_root "$project_root" "$project_type")" || return 1
+
+  for candidate in "${compatibility_root}"/*; do
+    [ ! -L "$candidate" ] || continue
+    [ -f "${candidate}/READY" ] || continue
+    [ -f "${candidate}/data/PG_VERSION" ] || continue
+    [ ! -L "${candidate}/data" ] || continue
+    [ "$(postgres_directory_owner "${candidate}/data")" = "$(id -u)" ] || continue
+    candidate_commit="$(basename "$candidate")"
+    case "$candidate_commit" in
+      *[!0-9a-f]*) continue ;;
+    esac
+    git -C "$project_root" merge-base --is-ancestor "$candidate_commit" HEAD 2>/dev/null || continue
+    distance="$(git -C "$project_root" rev-list --count "${candidate_commit}..HEAD")"
+    if [ -z "$best_distance" ] || [ "$distance" -lt "$best_distance" ]; then
+      best="$candidate"
+      best_distance="$distance"
+    fi
+  done
+
+  [ -n "$best" ] && printf '%s\n' "$best"
+}
+
+postgres_hydrate_from_template() {
+  local project_root="$1"
+  local project_type="$2"
+  if postgres_setting_enabled "$project_root"; then
+    :
+  else
+    local setting_status=$?
+    [ "$setting_status" -eq 1 ] && return 0
+    return "$setting_status"
+  fi
+
+  local data_directory template staging
+  data_directory="$(postgres_data_directory "$project_root")"
+
+  [ ! -f "${data_directory}/PG_VERSION" ] || return 0
+  postgres_template_cache_enabled || {
+    local enabled_status=$?
+    [ "$enabled_status" -eq 1 ] && return 0
+    return "$enabled_status"
+  }
+
+  # Only a cluster created as part of this unattended setup may become a
+  # shared template. Never snapshot an existing developer database.
+  POSTGRES_TEMPLATE_PUBLISH_ELIGIBLE=1
+
+  postgres_load_tools
+  template="$(postgres_find_compatible_template "$project_root" "$project_type")" || template=""
+  [ -n "$template" ] || {
+    log_info "No compatible PostgreSQL template is cached; this worktree will seed a fresh database"
+    return 0
+  }
+
+  if [ -d "$data_directory" ]; then
+    [ -z "$(find "$data_directory" -mindepth 1 -maxdepth 1 -print -quit)" ] || return 0
+    rmdir "$data_directory"
+  elif [ -e "$data_directory" ]; then
+    return 0
+  fi
+
+  log_info "Hydrating PostgreSQL from cached template $(basename "$template")"
+  staging="${data_directory}.template.$$"
+  if ! postgres_copy_tree "${template}/data" "$staging"; then
+    case "$staging" in
+      "${data_directory}".template.*) rm -rf -- "$staging" ;;
+    esac
+    log_warn "Could not hydrate the cached PostgreSQL template; initializing a fresh cluster instead"
+    return 0
+  fi
+  if ! mv "$staging" "$data_directory"; then
+    case "$staging" in
+      "${data_directory}".template.*) rm -rf -- "$staging" ;;
+    esac
+    log_error "Could not install the hydrated PostgreSQL template"
+    return 1
+  fi
+}
+
+postgres_prune_templates() {
+  local version_root="$1"
+  local keep
+  keep="$(toml_get "postgres" "template_retention" "3")"
+  case "$keep" in
+    ""|*[!0-9]*)
+      log_error "postgres.template_retention must be a positive integer: $keep"
+      return 1
+      ;;
+  esac
+  [ "$keep" -ge 1 ] || {
+    log_error "postgres.template_retention must be at least 1"
+    return 1
+  }
+
+  local count=0 created ready template_dir compatibility_dir commit compatibility
+  while IFS="$(printf '\t')" read -r created ready; do
+    [ -n "$ready" ] || continue
+    count=$((count + 1))
+    [ "$count" -le "$keep" ] && continue
+
+    template_dir="$(dirname "$ready")"
+    compatibility_dir="$(dirname "$template_dir")"
+    commit="$(basename "$template_dir")"
+    compatibility="$(basename "$compatibility_dir")"
+    case "$commit" in
+      ""|*[!0-9a-f]*)
+        log_warn "Skipping unexpected cached template path: $template_dir"
+        continue
+        ;;
+    esac
+    case "$compatibility" in
+      ""|*[!0-9a-f]*)
+        log_warn "Skipping unexpected cached template path: $template_dir"
+        continue
+        ;;
+    esac
+    case "$template_dir" in
+      "${version_root}"/*/*)
+        log_info "Pruning old PostgreSQL template $commit"
+        rm -rf -- "$template_dir"
+        rmdir "$compatibility_dir" 2>/dev/null || true
+        ;;
+      *) log_warn "Skipping template outside cache root: $template_dir" ;;
+    esac
+  done <<EOF_TEMPLATES
+$(find "$version_root" -mindepth 3 -maxdepth 3 -type f -name READY -print 2>/dev/null | while IFS= read -r ready; do
+  created="$(sed -n '1p' "$ready")"
+  case "$created" in ""|*[!0-9]*) created=0 ;; esac
+  printf '%s\t%s\n' "$created" "$ready"
+done | sort -rn)
+EOF_TEMPLATES
+}
+
+postgres_publish_template() {
+  local project_root="$1"
+  local project_type="$2"
+  if postgres_setting_enabled "$project_root"; then
+    :
+  else
+    local setting_status=$?
+    [ "$setting_status" -eq 1 ] && return 0
+    return "$setting_status"
+  fi
+
+  postgres_template_cache_enabled || {
+    local enabled_status=$?
+    [ "$enabled_status" -eq 1 ] && return 0
+    return "$enabled_status"
+  }
+  [ "${POSTGRES_TEMPLATE_PUBLISH_ELIGIBLE:-0}" = "1" ] || {
+    log_debug "Not publishing PostgreSQL template from an existing worktree database"
+    return 0
+  }
+
+  local template_ref ref_commit current_commit compatibility_root version_root template_dir
+  template_ref="$(postgres_template_ref "$project_root")" || {
+    log_debug "No remote default branch is available for PostgreSQL template publishing"
+    return 0
+  }
+  ref_commit="$(git -C "$project_root" rev-parse "${template_ref}^{commit}" 2>/dev/null)" || return 0
+  current_commit="$(git -C "$project_root" rev-parse HEAD)"
+  [ "$current_commit" = "$ref_commit" ] || {
+    log_debug "Not publishing PostgreSQL template: HEAD is not $template_ref"
+    return 0
+  }
+
+  postgres_load_tools
+  version_root="$(postgres_template_version_root "$project_root")"
+  compatibility_root="$(postgres_template_compatibility_root "$project_root" "$project_type")" || return 0
+  template_dir="${compatibility_root}/${current_commit}"
+  [ ! -f "${template_dir}/READY" ] || return 0
+
+  local lock_dir="${compatibility_root}/.publish-${current_commit}.lock"
+  (umask 077 && mkdir -p "$compatibility_root")
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    log_info "Another process is publishing PostgreSQL template $current_commit"
+    return 0
+  fi
+
+  local data_directory staging status=0 was_running=false
+  data_directory="$(postgres_data_directory "$project_root")"
+  staging="${compatibility_root}/.template-${current_commit}.$$"
+  if postgres_cluster_running "$data_directory"; then
+    was_running=true
+  fi
+
+  log_info "Publishing clean PostgreSQL template for $template_ref"
+  werksfeer_service_postgres_stop "$project_root" || status=$?
+  if [ "$status" -eq 0 ]; then
+    (umask 077 && mkdir "$staging") || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    postgres_copy_tree "$data_directory" "${staging}/data" || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' "$(date +%s)" > "${staging}/READY"
+    printf 'ref=%s\ncommit=%s\n' "$template_ref" "$current_commit" > "${staging}/manifest"
+    mv "$staging" "$template_dir" || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    log_info "Cached PostgreSQL template at $template_dir"
+    postgres_prune_templates "$version_root" || status=$?
+  elif [ -e "$staging" ]; then
+    postgres_remove_template_staging "$staging" "$compatibility_root" 2>/dev/null || true
+  fi
+
+  rmdir "$lock_dir" 2>/dev/null || true
+  if [ "$was_running" = true ]; then
+    werksfeer_service_postgres_start "$project_root" || status=$?
+  fi
+  return "$status"
+}
+
 postgres_check_data_directory() {
   local data_directory="$1"
 
@@ -363,6 +749,46 @@ werksfeer_service_postgres_start() {
 
 werksfeer_service_postgres_prepare() {
   werksfeer_service_postgres_start "$1"
+}
+
+werksfeer_service_postgres_template_hydrate() {
+  postgres_hydrate_from_template "$1" "$2"
+}
+
+werksfeer_service_postgres_template_publish() {
+  postgres_publish_template "$1" "$2"
+}
+
+werksfeer_service_postgres_template_status() {
+  local project_root="$1"
+  local project_type template_ref ref_commit template=""
+  project_type="$(detect_project_type "$project_root")"
+
+  if postgres_template_cache_enabled; then
+    printf 'enabled=true\n'
+  else
+    local enabled_status=$?
+    if [ "$enabled_status" -eq 1 ]; then
+      printf 'enabled=false\n'
+      return 0
+    fi
+    return "$enabled_status"
+  fi
+
+  postgres_load_tools
+  template_ref="$(postgres_template_ref "$project_root")" || template_ref=""
+  if [ -n "$template_ref" ]; then
+    ref_commit="$(git -C "$project_root" rev-parse "${template_ref}^{commit}" 2>/dev/null || true)"
+  else
+    ref_commit=""
+  fi
+  template="$(postgres_find_compatible_template "$project_root" "$project_type")" || template=""
+
+  printf 'template_ref=%s\nref_commit=%s\ncache_root=%s\ncompatible_template=%s\n' \
+    "$template_ref" \
+    "$ref_commit" \
+    "$(postgres_template_version_root "$project_root")" \
+    "$template"
 }
 
 werksfeer_service_postgres_stop() {

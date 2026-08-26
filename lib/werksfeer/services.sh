@@ -83,7 +83,7 @@ Usage:
 Provider shortcut:
   werksfeer postgres COMMAND  Run one PostgreSQL provider command
 
-PostgreSQL additionally supports: socket-dir, database-exists NAME
+PostgreSQL additionally supports: socket-dir, database-exists NAME, template-status
 EOF_USAGE
 }
 
@@ -118,7 +118,7 @@ service_provider_cli() {
   fi
 
   case "$action" in
-    prepare|start|stop|status|doctor|env|socket-dir|database-exists)
+    prepare|start|stop|status|doctor|env|socket-dir|database-exists|template-status)
       run_service_action "$service" "$(echo "$action" | tr '-' '_')" "$project_root" "$@"
       ;;
     help|-h|--help|"")

@@ -244,12 +244,39 @@ werksfeer services doctor
 werksfeer services env
 werksfeer postgres socket-dir
 werksfeer postgres database-exists myapp_development
+werksfeer postgres template-status
 werksfeer exec bin/rails db:prepare
 ```
 
 The generated `.envrc` starts configured services when a direnv-enabled shell
 enters the worktree. `werksfeer exec COMMAND` does the same for non-interactive
 agent and harness commands before loading the worktree environment.
+
+### Seeded template cache
+
+Private PostgreSQL setup maintains a cold, content-addressed template cache
+under `${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/postgres-templates`. A new
+worktree clones the newest cached ancestor with identical committed seed inputs,
+using copy-on-write on APFS and supported Linux filesystems, and then runs the
+application's pending migrations.
+
+The cache refresh is demand-driven rather than clock-driven:
+
+1. the first worktree at the current remote default ref is prepared normally;
+2. after setup succeeds, werksfeer stops its new cluster, snapshots it, and
+   restarts it;
+3. subsequent worktrees clone that immutable snapshot;
+4. new migrations reuse and advance an older compatible snapshot;
+5. changed seed inputs force one fresh seed before publishing a new snapshot.
+
+Only a database newly created during unattended setup can be published, and
+only when `HEAD` exactly matches the configured remote ref. Existing developer
+databases and feature-branch commits are never cached. Three templates are kept
+by default. Inspect the current selection with:
+
+```sh
+werksfeer postgres template-status
+```
 
 `werksfeer --cleanup` stops configured services before releasing allocations.
 Set `WERKSFEER_POSTGRES=false` to opt one worktree out, or `true` to run the
@@ -303,6 +330,11 @@ port = 5432
 user = "postgres"
 # Validate extension control files before initializing or starting the cluster
 required_extensions = ["citext", "pg_trgm", "vector"]
+# Seeded cold-cluster cache (defaults shown)
+template_cache = true
+# Auto-detected from origin/HEAD, then origin/main or origin/master
+# template_ref = "origin/main"
+template_retention = 3
 
 [port]
 # Base port for the web server (default: 3000 for Rails/Node, 4000 for Elixir, 8000 for Python)

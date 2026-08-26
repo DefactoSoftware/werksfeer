@@ -598,9 +598,10 @@ setup_databases() {
   local project_root="$2"
 
   if use_private_postgres_cluster; then
+    set_private_cluster_database_names "$project_type"
+    run_service_action "postgres" "template_hydrate" "$project_root" "$project_type"
     run_services_action "prepare" "$project_root"
     export WERKSFEER_SERVICES_READY=1
-    set_private_cluster_database_names "$project_type"
   else
     clone_databases "$project_type"
   fi
@@ -1165,6 +1166,15 @@ run_setup() {
   # Step 6: Run setup command
   log_step "Running setup"
   run_setup_command "$project_type" "$worktree_path"
+
+  # Publish only a cleanly stopped, fully prepared database whose HEAD exactly
+  # matches the configured remote template ref. Feature-branch state is never
+  # shared with unrelated worktrees.
+  if use_private_postgres_cluster; then
+    if ! run_service_action "postgres" "template_publish" "$worktree_path" "$project_type"; then
+      log_warn "PostgreSQL template publication failed; the worktree database remains usable"
+    fi
+  fi
 
   # Step 7: Post-setup hook from config
   local post_hook
