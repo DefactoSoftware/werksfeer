@@ -91,6 +91,13 @@ teardown() {
   [[ "$output" == *"WERKSFEER_POSTGRES must be true, false, 1, or 0"* ]]
 }
 
+@test "exec starts configured services before running a command" {
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=maybe \"$WERKSFEER\" exec true"
+
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"WERKSFEER_POSTGRES must be true, false, 1, or 0"* ]]
+}
+
 @test "setup writes one replaceable managed environment block" {
   run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
@@ -103,35 +110,49 @@ teardown() {
   [ "$output" = "1" ]
   grep -q 'export DATABASE_NAME="example_dev"' "${WORKTREE_ONE}/.envrc"
   grep -q 'export TEST_DATABASE_NAME="example_test"' "${WORKTREE_ONE}/.envrc"
+  grep -q 'werksfeer services start' "${WORKTREE_ONE}/.envrc"
 }
 
 @test "Rails setup writes development and test dotenv files" {
   rails_main="${TEST_ROOT}/rails-app"
   rails_worktree="${TEST_ROOT}/worktrees/rails"
-  mkdir -p "${rails_main}/config"
+  fake_bin="${TEST_ROOT}/bin"
+  command_log="${TEST_ROOT}/rails-commands.log"
+  mkdir -p "${rails_main}/config" "${rails_main}/bin" "$fake_bin"
   git -C "$rails_main" init -q
   git -C "$rails_main" config user.email test@example.com
   git -C "$rails_main" config user.name "Werksfeer Test"
   printf 'source "https://rubygems.org"\n' > "${rails_main}/Gemfile"
   printf 'development:\n  adapter: postgresql\n' > "${rails_main}/config/database.yml"
+  cat > "${fake_bin}/bundle" <<'EOF_BUNDLE'
+#!/usr/bin/env bash
+printf 'bundle:%s\n' "$*" >> "$COMMAND_LOG"
+EOF_BUNDLE
+  cat > "${rails_main}/bin/rails" <<'EOF_RAILS'
+#!/usr/bin/env bash
+printf 'rails:%s:%s\n' "${RAILS_ENV:-development}" "$*" >> "$COMMAND_LOG"
+EOF_RAILS
+  chmod +x "${fake_bin}/bundle" "${rails_main}/bin/rails"
   cat > "${rails_main}/.worktree.toml" <<'EOF_CONFIG'
 [services]
 enabled = ["postgres"]
 
 [database]
 base_name = "rails_example"
-
-[setup]
-command = "true"
 EOF_CONFIG
-  git -C "$rails_main" add Gemfile config/database.yml .worktree.toml
+  git -C "$rails_main" add Gemfile bin/rails config/database.yml .worktree.toml
   git -C "$rails_main" commit -qm initial
   git -C "$rails_main" -c core.hooksPath=/dev/null worktree add -q --detach "$rails_worktree" HEAD
 
-  run bash -c "cd \"$rails_worktree\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  run bash -c "cd \"$rails_worktree\" && PATH=\"$fake_bin:\$PATH\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
 
+  grep -q '^bundle:install$' "$command_log"
+  grep -q '^rails:development:db:prepare$' "$command_log"
+  grep -q '^rails:test:db:prepare$' "$command_log"
   grep -q 'DATABASE_NAME="rails_example_development"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.test.local"
+  grep -q 'export DATABASE_NAME="rails_example_development"' "${rails_worktree}/.envrc"
+  grep -q 'werksfeer services start' "${rails_worktree}/.envrc"
 }

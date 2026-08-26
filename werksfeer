@@ -599,6 +599,7 @@ setup_databases() {
 
   if use_private_postgres_cluster; then
     run_services_action "prepare" "$project_root"
+    export WERKSFEER_SERVICES_READY=1
     set_private_cluster_database_names "$project_type"
   else
     clone_databases "$project_type"
@@ -673,6 +674,23 @@ write_managed_env_block() {
   log_info "Wrote managed environment to $envfile"
 }
 
+managed_shell_environment() {
+  local assignments="$1"
+
+  format_env_assignments "export " "$assignments"
+
+  if [ -n "$(service_names)" ]; then
+    cat <<'EOF_SERVICE_START'
+
+# Keep worktree services available when a new interactive shell enters here.
+if [ "${WERKSFEER_SERVICES_READY:-0}" != "1" ] && command -v werksfeer >/dev/null 2>&1; then
+  werksfeer services start
+  export WERKSFEER_SERVICES_READY=1
+fi
+EOF_SERVICE_START
+  fi
+}
+
 write_env_overrides() {
   local project_type="$1"
   local worktree_root="$2"
@@ -744,16 +762,17 @@ ${service_env}"
 ${service_env}"
       write_managed_env_block ".env.test.local" "$(format_env_assignments "" "$test_assignments")"
       ;;
-    elixir)
-      write_managed_env_block ".envrc" "$(format_env_assignments "export " "$common_assignments")"
-      if command -v direnv >/dev/null 2>&1; then
-        direnv allow . 2>/dev/null || true
-      fi
-      ;;
     python|node)
-      write_managed_env_block ".env" "$(format_env_assignments "" "PORT=${wt_port}")"
+      write_managed_env_block ".env" "$(format_env_assignments "" "$common_assignments")"
       ;;
   esac
+
+  # Every framework gets the same shell contract. Framework-specific dotenv
+  # files above remain available for processes that load them themselves.
+  write_managed_env_block ".envrc" "$(managed_shell_environment "$common_assignments")"
+  if command -v direnv >/dev/null 2>&1; then
+    direnv allow . 2>/dev/null || true
+  fi
 
   log_info "Port: ${wt_port}"
   if [ -n "$wt_redis" ]; then
@@ -770,7 +789,8 @@ detect_node_pm() {
   if [ -f "$root/bun.lockb" ] || [ -f "$root/bun.lock" ]; then echo "bun install --frozen-lockfile"
   elif [ -f "$root/pnpm-lock.yaml" ]; then echo "pnpm install --frozen-lockfile"
   elif [ -f "$root/yarn.lock" ]; then echo "yarn install --frozen-lockfile"
-  else echo "npm ci"
+  elif [ -f "$root/package-lock.json" ] || [ -f "$root/npm-shrinkwrap.json" ]; then echo "npm ci"
+  else echo "npm install"
   fi
 }
 
@@ -792,9 +812,23 @@ run_shell_in_project_environment() {
   fi
 }
 
+install_node_dependencies() {
+  [ -f "package.json" ] || return 0
+
+  if [ -L "node_modules" ]; then
+    log_info "Shared node_modules is already linked, skipping package installation"
+    return 0
+  fi
+
+  local pm_cmd
+  pm_cmd="$(detect_node_pm "$(pwd)")"
+  log_step "Running $pm_cmd"
+  run_shell_in_project_environment "$pm_cmd"
+}
+
 run_setup_command() {
   local project_type="$1"
-  local main_path="$2"
+  local worktree_root="$2"
 
   # Check for TOML override
   local custom_cmd
@@ -810,20 +844,40 @@ run_setup_command() {
     rails)
       log_step "Running bundle install"
       run_in_project_environment bundle install
+      install_node_dependencies
       if [ -x "bin/rails" ]; then
         log_step "Running bin/rails db:prepare"
         run_in_project_environment bin/rails db:prepare
+        log_step "Running bin/rails db:prepare for test"
+        run_in_project_environment env RAILS_ENV=test bin/rails db:prepare
       fi
       ;;
     elixir)
       log_step "Running mix deps.get"
       run_in_project_environment mix deps.get
+      log_step "Running mix deps.get for test"
+      run_in_project_environment env MIX_ENV=test mix deps.get
+      install_node_dependencies
+
       # Private clusters start empty and migrations remain application-owned.
       # Shared clones already contain the source database's schema and data.
       if use_private_postgres_cluster; then
-        log_step "Creating and migrating the private development database"
-        run_in_project_environment mix ecto.create --quiet
-        run_in_project_environment mix ecto.migrate
+        if postgres_setting_enabled "$worktree_root" &&
+            run_service_action "postgres" "database_exists" "$worktree_root" "$NEW_DEV_DB"; then
+          log_step "Migrating the private development database"
+          run_in_project_environment mix ecto.migrate
+        elif postgres_setting_enabled "$worktree_root"; then
+          log_step "Creating, migrating, and seeding the private development database"
+          run_in_project_environment mix ecto.setup
+        else
+          log_step "Creating and migrating the configured development database"
+          run_in_project_environment mix ecto.create --quiet
+          run_in_project_environment mix ecto.migrate
+        fi
+
+        log_step "Creating and migrating the private test database"
+        run_in_project_environment env MIX_ENV=test mix ecto.create --quiet
+        run_in_project_environment env MIX_ENV=test mix ecto.migrate --quiet
       elif [ -z "${NEW_DEV_DB:-}" ]; then
         log_step "Running mix ecto.setup"
         run_in_project_environment mix ecto.setup
@@ -844,10 +898,7 @@ run_setup_command() {
       fi
       ;;
     node)
-      local pm_cmd
-      pm_cmd="$(detect_node_pm "$(pwd)")"
-      log_step "Running $pm_cmd"
-      run_shell_in_project_environment "$pm_cmd"
+      install_node_dependencies
       ;;
     *)
       log_info "Unknown project type, no setup command to run"
@@ -1113,7 +1164,7 @@ run_setup() {
 
   # Step 6: Run setup command
   log_step "Running setup"
-  run_setup_command "$project_type" "$main_path"
+  run_setup_command "$project_type" "$worktree_path"
 
   # Step 7: Post-setup hook from config
   local post_hook
@@ -1237,6 +1288,12 @@ exec_mode() {
     log_error "Not inside a git repository"
     return 1
   fi
+
+  local project_root
+  project_root="$(current_project_root)"
+  load_project_configuration "$project_root"
+  run_services_action "start" "$project_root"
+  export WERKSFEER_SERVICES_READY=1
 
   run_in_project_environment "$@"
 }

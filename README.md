@@ -56,8 +56,8 @@ When a new worktree is created, werksfeer:
 3. **Copies build directories** (`_build`, `deps`, `.bundle`, etc.) from the main worktree
 4. **Provisions PostgreSQL** by cloning databases on a shared server or starting a private cluster on a Unix socket
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
-6. **Writes overrides** (DB names, port, Redis URL) to `.env.local` (Rails) or `.envrc` (Elixir)
-7. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
+6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
+7. **Runs framework setup** (dependencies, database preparation, migrations, and first-time seeds)
 
 Everything is idempotent — safe to re-run. Private services are opt-in, so
 existing repositories retain the shared-server cloning behavior.
@@ -195,8 +195,8 @@ werksfeer --prune-all
 
 | Type | Detected by | Symlinked | Copied | Setup command | Shared DB pattern |
 |------|------------|-----------|--------|---------------|------------|
-| Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bin/setup` | `{name}_development` / `{name}_test` |
-| Elixir | `mix.exs` | `node_modules` | `_build`, `deps` | `mix deps.get` | `{name}_dev` / `{name}_test` |
+| Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bundle install`, `db:prepare` | `{name}_development` / `{name}_test` |
+| Elixir | `mix.exs` | `node_modules` | `_build`, `deps` | deps, assets, Ecto setup/migrate | `{name}_dev` / `{name}_test` |
 | Python | `pyproject.toml` / `requirements.txt` | — | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
 | Node | `package.json` | `node_modules` | `.next`, `.nuxt`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
 
@@ -226,8 +226,9 @@ directory is owned by the current user with mode `0700`; PostgreSQL TCP
 listening is disabled.
 
 Application frameworks still own database creation, schema, migrations, and
-seeds. Rails can keep using `bin/rails db:prepare`; Phoenix can keep using Ecto.
-Werksfeer only manages the server process and writes connection variables:
+seeds. Werksfeer invokes their normal commands: `bin/rails db:prepare` for
+Rails and Ecto tasks for Phoenix. It manages the server process and writes
+connection variables:
 
 - libpq: `PGHOST`, `PGPORT`, `PGUSER`;
 - framework-neutral: `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`;
@@ -245,6 +246,10 @@ werksfeer postgres socket-dir
 werksfeer postgres database-exists myapp_development
 werksfeer exec bin/rails db:prepare
 ```
+
+The generated `.envrc` starts configured services when a direnv-enabled shell
+enters the worktree. `werksfeer exec COMMAND` does the same for non-interactive
+agent and harness commands before loading the worktree environment.
 
 `werksfeer --cleanup` stops configured services before releasing allocations.
 Set `WERKSFEER_POSTGRES=false` to opt one worktree out, or `true` to run the
@@ -366,6 +371,8 @@ If `.worktree.toml` doesn't exist in the repo, the hook exits silently.
 - **PostgreSQL client tools** (optional — needed for database cloning)
 - **PostgreSQL server tools** (optional — needed for the private provider;
   `pg_config` must resolve the matching `initdb`, `pg_ctl`, and `postgres`)
+- **direnv** (recommended — automatically loads each worktree environment and
+  starts its configured services in interactive shells)
 - **curl** (only for installation)
 
 ## Development
