@@ -513,3 +513,39 @@ managed_cache_status() (
   fi
   printf 'current=%s\n' "$([ -n "$ready_commit" ] && [ "$ready_commit" = "$current_ref_commit" ] && printf true || printf false)"
 )
+
+managed_cache_clean() (
+  local project_root="$1"
+  local main_path cache_root cache_parent owner_file owner_pid=""
+  main_path="$(cd "$project_root" && get_main_worktree_path)"
+  cache_root="$(managed_cache_root "$main_path")" || return 1
+  cache_parent="${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/build-caches"
+  owner_file="${cache_root}/OWNER"
+
+  case "$cache_root" in
+    "${cache_parent}/"*) ;;
+    *)
+      log_error "Refusing to clean unexpected build cache path: $cache_root"
+      return 1
+      ;;
+  esac
+
+  if [ ! -e "$cache_root" ]; then
+    log_info "No managed build cache exists for this repository"
+    return 0
+  fi
+  if [ ! -f "$owner_file" ] || [ "$(cat "$owner_file")" != "$main_path" ]; then
+    log_error "Refusing to clean an unowned build cache directory: $cache_root"
+    return 1
+  fi
+  if [ -f "${cache_root}/.warm.lock/pid" ]; then
+    owner_pid="$(cat "${cache_root}/.warm.lock/pid")"
+  fi
+  if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+    log_error "Cannot clean the managed build cache while it is warming"
+    return 1
+  fi
+
+  log_step "Removing managed build cache: $cache_root"
+  find "$cache_root" -depth -delete
+)

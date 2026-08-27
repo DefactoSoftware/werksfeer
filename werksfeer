@@ -1561,6 +1561,7 @@ Usage:
   werksfeer exec COMMAND...  Run a command through the worktree's project environment
   werksfeer cache warm      Refresh the managed dependency/build cache
   werksfeer cache status    Inspect the managed dependency/build cache
+  werksfeer cache clean     Remove the managed dependency/build cache
   werksfeer --cleanup [PATH] Stop services and clean a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
@@ -1686,9 +1687,10 @@ cache_mode() {
   case "$action" in
     warm) managed_cache_warm "$project_root" ;;
     status) managed_cache_status "$project_root" ;;
+    clean) managed_cache_clean "$project_root" ;;
     *)
       log_error "Unknown cache command: $action"
-      log_info "Available commands: warm, status"
+      log_info "Available commands: warm, status, clean"
       return 2
       ;;
   esac

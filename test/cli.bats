@@ -396,6 +396,11 @@ EOF_EXPECTED
   [ "$(git -C "$MAIN_REPO" rev-parse HEAD)" = "$main_head" ]
   [ -z "$(git -C "$MAIN_REPO" status --porcelain --untracked-files=all)" ]
   [ "$(git -C "$MAIN_REPO" worktree list --porcelain | grep -c '^worktree ')" = "$worktree_count" ]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache clean"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Removing managed build cache"* ]]
+  [ ! -e "$cache_root" ]
 }
 
 @test "managed cache updates incrementally when dependency inputs are unchanged" {

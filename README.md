@@ -91,6 +91,7 @@ Warm or inspect it explicitly from the main checkout or any linked worktree:
 ```sh
 werksfeer cache warm
 werksfeer cache status
+werksfeer cache clean
 ```
 
 When a ready managed cache is compatible with a new worktree, Werksfeer prefers
@@ -114,6 +115,10 @@ Node dependency inputs retain `node_modules`, while Mix, Bundler, and other
 package managers validate their own artifacts. Databases are deliberately not
 started, migrated, or included in this cache; private PostgreSQL uses its
 separate seeded-template cache.
+
+The cache may use several gigabytes for applications with multiple build
+environments. `werksfeer cache clean` safely removes only the cache owned by
+the current repository; the next warm recreates it from scratch.
 
 The defaults warm Rails dependencies, Python dependencies, Node dependencies,
 and both dev and test Elixir dependencies/builds. The configured
