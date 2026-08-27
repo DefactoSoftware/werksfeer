@@ -431,6 +431,77 @@ EOF_TOOLCHAIN
   [ "$worktree_changed_mtime" = "$worktree_changed_mtime_before" ]
 }
 
+@test "Mix safely incrementally compiles a cache from a diverged revision" {
+  mkdir -p "${MAIN_REPO}/lib"
+  cat > "${MAIN_REPO}/mix.exs" <<'EOF_MIX_PROJECT'
+defmodule Example.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :example,
+      version: "0.1.0",
+      elixirc_options: [check_cwd: false]
+    ]
+  end
+end
+EOF_MIX_PROJECT
+  cat > "${MAIN_REPO}/lib/unchanged.ex" <<'EOF_UNCHANGED'
+defmodule Example.Unchanged do
+  def value, do: :unchanged
+end
+EOF_UNCHANGED
+  cat > "${MAIN_REPO}/lib/changed.ex" <<'EOF_CHANGED'
+defmodule Example.Changed do
+  def value, do: :base
+end
+EOF_CHANGED
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[setup]
+command = "mix compile"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add mix.exs lib .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "add compilable project"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  cat > "${MAIN_REPO}/lib/main_only.ex" <<'EOF_MAIN_ONLY'
+defmodule Example.MainOnly do
+  def value, do: :main
+end
+EOF_MAIN_ONLY
+  git -C "$MAIN_REPO" add lib/main_only.ex
+  git -C "$MAIN_REPO" commit -qm "add main-only module"
+
+  run bash -c "cd \"$MAIN_REPO\" && mix compile"
+  [ "$status" -eq 0 ]
+  [ -f "${MAIN_REPO}/_build/dev/lib/example/ebin/Elixir.Example.MainOnly.beam" ]
+
+  cat > "${WORKTREE_ONE}/lib/changed.ex" <<'EOF_BRANCH_CHANGED'
+defmodule Example.Changed do
+  def value, do: :branch
+end
+EOF_BRANCH_CHANGED
+  cat > "${WORKTREE_ONE}/lib/branch_only.ex" <<'EOF_BRANCH_ONLY'
+defmodule Example.BranchOnly do
+  def value, do: :branch
+end
+EOF_BRANCH_ONLY
+  git -C "$WORKTREE_ONE" add lib
+  git -C "$WORKTREE_ONE" commit -qm "change branch modules"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Compiling 2 files (.ex)"* ]]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.Unchanged.beam" ]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.Changed.beam" ]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.BranchOnly.beam" ]
+  [ ! -e "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.MainOnly.beam" ]
+
+  run bash -c "cd \"$WORKTREE_ONE\" && mix compile"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 @test "clean diverged revisions reuse isolated worktree caches" {
   mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
   printf 'build\n' > "${MAIN_REPO}/_build/value"
