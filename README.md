@@ -271,9 +271,10 @@ werksfeer exec bin/rails db:prepare
 The generated `.envrc` starts configured services when a direnv-enabled shell
 enters the worktree. `werksfeer exec COMMAND` does the same for non-interactive
 agent and harness commands before loading the worktree environment. When a
-repository declares tools in `.tool-versions` or a Mise TOML file and `mise` is
-installed, setup and `werksfeer exec` also run through `mise exec --` so every
-harness uses the same language and package-manager versions.
+repository declares tools in `.tool-versions`, setup and `werksfeer exec` prefer
+Mise and fall back to asdf when only asdf is installed. Mise TOML files remain
+Mise-specific. In either case, repository-pinned binaries take precedence over
+system paths inherited from a GUI harness.
 
 ### Seeded template cache
 
@@ -459,8 +460,8 @@ If `.worktree.toml` doesn't exist in the repo, the hook exits silently.
   `pg_config` must resolve the matching `initdb`, `pg_ctl`, and `postgres`)
 - **direnv** (recommended — automatically loads each worktree environment and
   starts its configured services in interactive shells)
-- **mise** (optional — honors repository-pinned tools during setup and
-  `werksfeer exec` when a Mise or `.tool-versions` configuration is present)
+- **mise or asdf** (optional — honors repository-pinned tools during setup and
+  `werksfeer exec`; Mise is preferred when both are installed)
 - **curl** (only for installation)
 
 ## Development

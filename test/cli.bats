@@ -278,6 +278,38 @@ EOF_TOOLCHAIN
   [ "$(tail -n 1 "$command_log")" = "print-toolchain" ]
 }
 
+@test "exec falls back to asdf for .tool-versions repositories" {
+  fake_bin="${TEST_ROOT}/asdf-environment-bin"
+  asdf_data_dir="${TEST_ROOT}/asdf-data"
+  mkdir -p "$fake_bin" "${asdf_data_dir}/shims"
+  printf 'elixir 1.20.0-otp-29\n' > "${WORKTREE_ONE}/.tool-versions"
+  printf '# managed environment\n' > "${WORKTREE_ONE}/.envrc"
+
+  cat > "${fake_bin}/direnv" <<'EOF_DIRENV'
+#!/usr/bin/env bash
+[ "$1" = "exec" ] && [ "$2" = "." ] || exit 2
+shift 2
+exec "$@"
+EOF_DIRENV
+  cat > "${fake_bin}/asdf" <<'EOF_ASDF'
+#!/usr/bin/env bash
+exit 2
+EOF_ASDF
+  cat > "${asdf_data_dir}/shims/print-toolchain" <<'EOF_TOOLCHAIN'
+#!/usr/bin/env bash
+printf 'asdf=1\n'
+EOF_TOOLCHAIN
+  chmod +x \
+    "${fake_bin}/direnv" \
+    "${fake_bin}/asdf" \
+    "${asdf_data_dir}/shims/print-toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" ASDF_DATA_DIR=\"$asdf_data_dir\" WERKSFEER_POSTGRES=false \"$WERKSFEER\" exec print-toolchain"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "asdf=1" ]
+}
+
 @test "PostgreSQL template fingerprints only committed seed inputs" {
   provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
 

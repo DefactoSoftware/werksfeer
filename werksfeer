@@ -955,6 +955,14 @@ project_mise_bin() {
   command -v mise 2>/dev/null
 }
 
+project_asdf_bin() {
+  local project_root
+  project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+  [ -f "$project_root/.tool-versions" ] || return 1
+  command -v asdf 2>/dev/null
+}
+
 run_with_mise() {
   local mise_bin="$1"
   shift
@@ -979,18 +987,41 @@ run_with_mise() {
   fi
 }
 
+run_with_asdf() {
+  local asdf_bin="$1"
+  shift
+  local asdf_data_dir="${ASDF_DATA_DIR:-$HOME/.asdf}"
+  local shims_dir="${asdf_data_dir}/shims"
+
+  if [ -d "$shims_dir" ]; then
+    # asdf selects the .tool-versions entry through its shims. Put them first
+    # for GUI harnesses whose inherited PATH puts system tools ahead of asdf.
+    env PATH="${shims_dir}:${PATH}" "$@"
+  else
+    "$asdf_bin" exec "$@"
+  fi
+}
+
 run_in_project_environment() {
   local mise_bin=""
+  local asdf_bin=""
   mise_bin="$(project_mise_bin)" || true
+  if [ -z "$mise_bin" ]; then
+    asdf_bin="$(project_asdf_bin)" || true
+  fi
 
   if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
     if [ -n "$mise_bin" ]; then
       direnv exec . "${WERKSFEER_SCRIPT_DIR}/werksfeer" --mise-exec "$mise_bin" "$@"
+    elif [ -n "$asdf_bin" ]; then
+      direnv exec . "${WERKSFEER_SCRIPT_DIR}/werksfeer" --asdf-exec "$asdf_bin" "$@"
     else
       direnv exec . "$@"
     fi
   elif [ -n "$mise_bin" ]; then
     run_with_mise "$mise_bin" "$@"
+  elif [ -n "$asdf_bin" ]; then
+    run_with_asdf "$asdf_bin" "$@"
   else
     "$@"
   fi
@@ -1542,6 +1573,10 @@ main() {
     --mise-exec)
       shift
       run_with_mise "$@"
+      ;;
+    --asdf-exec)
+      shift
+      run_with_asdf "$@"
       ;;
     --hook)
       shift
