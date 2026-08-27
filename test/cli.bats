@@ -382,7 +382,7 @@ EOF_TOOLCHAIN
   [ "$(cat "${MAIN_REPO}/deps/native/artifact")" = "dependency" ]
 }
 
-@test "different revisions do not reuse worktree caches" {
+@test "clean descendant revisions reuse isolated caches but not shared directories" {
   mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps" "${MAIN_REPO}/node_modules/example"
   printf 'build\n' > "${MAIN_REPO}/_build/value"
   printf 'dependency\n' > "${MAIN_REPO}/deps/value"
@@ -395,13 +395,125 @@ EOF_TOOLCHAIN
   run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
   [[ "$output" == *"Skip shared directories"* ]]
-  [[ "$output" == *"Skip build cache"* ]]
-  [ ! -e "${WORKTREE_ONE}/_build" ]
-  [ ! -e "${WORKTREE_ONE}/deps" ]
+  [[ "$output" != *"Skip build cache"* ]]
+  [ -f "${WORKTREE_ONE}/_build/value" ]
+  [ -f "${WORKTREE_ONE}/deps/value" ]
   [ ! -e "${WORKTREE_ONE}/node_modules" ]
 }
 
-@test "exact precompiled Elixir caches skip dependency fetching" {
+@test "ancestor cache reuse preserves mtimes only for unchanged tracked files" {
+  printf 'unchanged\n' > "${MAIN_REPO}/unchanged.ex"
+  printf 'main version\n' > "${MAIN_REPO}/changed.ex"
+  git -C "$MAIN_REPO" add unchanged.ex changed.ex
+  git -C "$MAIN_REPO" commit -qm "add source files"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  touch -t 202001010101.01 "${MAIN_REPO}/unchanged.ex" "${MAIN_REPO}/changed.ex"
+  printf 'branch version\n' > "${WORKTREE_ONE}/changed.ex"
+  git -C "$WORKTREE_ONE" add changed.ex
+  git -C "$WORKTREE_ONE" commit -qm "change source file"
+  touch -t 202101010101.01 "${WORKTREE_ONE}/changed.ex"
+
+  mkdir -p "${MAIN_REPO}/_build"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  worktree_changed_mtime_before="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/changed.ex")"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+
+  main_unchanged_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${MAIN_REPO}/unchanged.ex")"
+  worktree_unchanged_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/unchanged.ex")"
+  main_changed_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${MAIN_REPO}/changed.ex")"
+  worktree_changed_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/changed.ex")"
+
+  [ "$worktree_unchanged_mtime" = "$main_unchanged_mtime" ]
+  [ "$worktree_changed_mtime" != "$main_changed_mtime" ]
+  [ "$worktree_changed_mtime" = "$worktree_changed_mtime_before" ]
+}
+
+@test "clean diverged revisions reuse isolated worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+
+  printf 'main revision\n' > "${MAIN_REPO}/main-revision"
+  git -C "$MAIN_REPO" add main-revision
+  git -C "$MAIN_REPO" commit -qm "main revision"
+  printf 'worktree revision\n' > "${WORKTREE_ONE}/worktree-revision"
+  git -C "$WORKTREE_ONE" add worktree-revision
+  git -C "$WORKTREE_ONE" commit -qm "worktree revision"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Skip build cache"* ]]
+  [ -f "${WORKTREE_ONE}/_build/value" ]
+  [ -f "${WORKTREE_ONE}/deps/value" ]
+}
+
+@test "unrelated histories do not reuse worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+
+  git -C "$WORKTREE_ONE" checkout -q --orphan unrelated-history
+  git -C "$WORKTREE_ONE" rm -qrf .
+  printf 'defmodule Example.MixProject do\nend\n' > "${WORKTREE_ONE}/mix.exs"
+  cat > "${WORKTREE_ONE}/.gitignore" <<'EOF_GITIGNORE'
+/_build
+/deps
+/node_modules
+/priv/static
+.worktree.local.toml
+.envrc
+EOF_GITIGNORE
+  cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_CONFIG'
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$WORKTREE_ONE" add mix.exs .gitignore .worktree.toml
+  git -C "$WORKTREE_ONE" commit -qm "unrelated history"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "dirty cache sources do not reuse worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+  printf 'dirty\n' > "${MAIN_REPO}/untracked-file"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "toolchain changes make ancestor build caches ineligible" {
+  printf '20.0.0\n' > "${MAIN_REPO}/.nvmrc"
+  git -C "$MAIN_REPO" add .nvmrc
+  git -C "$MAIN_REPO" commit -qm "pin toolchain"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+  printf '22.0.0\n' > "${WORKTREE_ONE}/.nvmrc"
+  git -C "$WORKTREE_ONE" add .nvmrc
+  git -C "$WORKTREE_ONE" commit -qm "upgrade toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "compatible ancestor Elixir caches skip dependency fetching" {
   fake_bin="${TEST_ROOT}/elixir-cache-bin"
   command_log="${TEST_ROOT}/elixir-cache-commands.log"
   mkdir -p "$fake_bin" "${MAIN_REPO}/_build/dev" "${MAIN_REPO}/deps/example"
@@ -413,6 +525,9 @@ EOF_CONFIG
   git -C "$MAIN_REPO" add .worktree.toml
   git -C "$MAIN_REPO" commit -qm "use automatic setup"
   git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+  printf 'branch revision\n' > "${WORKTREE_ONE}/revision"
+  git -C "$WORKTREE_ONE" add revision
+  git -C "$WORKTREE_ONE" commit -qm "branch revision"
 
   cat > "${fake_bin}/mix" <<'EOF_MIX'
 #!/usr/bin/env bash

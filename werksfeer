@@ -483,6 +483,33 @@ reusable_worktree_cache() {
   git_checkout_is_clean "$worktree_path" || return 1
 }
 
+reusable_build_cache() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local main_revision worktree_revision
+
+  main_revision="$(git -C "$main_path" rev-parse HEAD 2>/dev/null)" || return 1
+  worktree_revision="$(git -C "$worktree_path" rev-parse HEAD 2>/dev/null)" || return 1
+
+  git_checkout_is_clean "$main_path" || return 1
+  git_checkout_is_clean "$worktree_path" || return 1
+  git -C "$worktree_path" merge-base "$main_revision" "$worktree_revision" >/dev/null || return 1
+
+  # Compiled artifacts are not portable across runtime versions. Dependency
+  # lockfiles may differ safely because each package manager validates them,
+  # but a changed toolchain declaration makes the entire cache ineligible.
+  git -C "$worktree_path" diff --quiet "$main_revision" "$worktree_revision" -- \
+    .tool-versions \
+    mise.toml \
+    .mise.toml \
+    mise.local.toml \
+    .mise.local.toml \
+    .ruby-version \
+    .node-version \
+    .nvmrc \
+    .python-version || return 1
+}
+
 copy_tree() {
   local source="$1"
   local destination="$2"
@@ -529,17 +556,49 @@ remove_relocated_cmake_state() {
 sync_tracked_file_times() {
   local main_path="$1"
   local worktree_path="$2"
+  local main_revision worktree_revision
 
-  # Mix compiler manifests record source mtimes. An exact Git checkout has the
-  # same contents but newly-created file times, which otherwise makes every
-  # module stale. Mirror only tracked regular files from the validated source.
-  # Use one Elixir VM instead of spawning `touch` once per source file; large
-  # Phoenix applications can contain thousands of tracked files.
+  main_revision="$(git -C "$main_path" rev-parse HEAD)"
+  worktree_revision="$(git -C "$worktree_path" rev-parse HEAD)"
+
+  # Mix compiler manifests record source mtimes. Mirror times only for tracked
+  # files that Git says are identical between the cache source and target.
+  # Changed and newly-added files retain their worktree times so Mix sees them
+  # as stale. Use one Elixir VM instead of spawning `touch` once per file;
+  # large Phoenix applications can contain thousands of tracked files.
   git -C "$main_path" ls-files -z |
-    WERKSFEER_MTIME_SOURCE="$main_path" WERKSFEER_MTIME_TARGET="$worktree_path" \
+    WERKSFEER_MTIME_SOURCE="$main_path" \
+      WERKSFEER_MTIME_TARGET="$worktree_path" \
+      WERKSFEER_MTIME_SOURCE_REVISION="$main_revision" \
+      WERKSFEER_MTIME_TARGET_REVISION="$worktree_revision" \
       elixir -e '
         source = System.fetch_env!("WERKSFEER_MTIME_SOURCE")
         target = System.fetch_env!("WERKSFEER_MTIME_TARGET")
+        source_revision = System.fetch_env!("WERKSFEER_MTIME_SOURCE_REVISION")
+        target_revision = System.fetch_env!("WERKSFEER_MTIME_TARGET_REVISION")
+
+        changed_files =
+          case System.cmd(
+                 "git",
+                 [
+                   "-C",
+                   target,
+                   "diff",
+                   "--name-only",
+                   "-z",
+                   source_revision,
+                   target_revision,
+                   "--"
+                 ]
+               ) do
+            {output, 0} ->
+              output
+              |> :binary.split(<<0>>, [:global])
+              |> MapSet.new()
+
+            {_output, _status} ->
+              System.halt(1)
+          end
 
         IO.binread(:stdio, :eof)
         |> :binary.split(<<0>>, [:global])
@@ -551,7 +610,8 @@ sync_tracked_file_times() {
             source_file = Path.join(source, relative_path)
             target_file = Path.join(target, relative_path)
 
-            with {:ok, stat} <- File.stat(source_file, time: :posix),
+            with false <- MapSet.member?(changed_files, relative_path),
+                 {:ok, stat} <- File.stat(source_file, time: :posix),
                  true <- File.regular?(target_file) do
               File.touch!(target_file, stat.mtime)
             end
@@ -578,8 +638,8 @@ copy_build_dirs() {
   [ -z "$copy_dirs" ] && copy_dirs="$(default_copy_dirs "$project_type")"
   [ -z "$copy_dirs" ] && return 0
 
-  if ! reusable_worktree_cache "$main_path" "$worktree_path"; then
-    log_info "Skip build cache (main checkout is not the exact, clean worktree revision)"
+  if ! reusable_build_cache "$main_path" "$worktree_path"; then
+    log_info "Skip build cache (main checkout is not a clean, toolchain-compatible related revision)"
     return 0
   fi
 
@@ -1068,7 +1128,7 @@ run_dependency_setup() {
       if [ "${WERKSFEER_REUSED_ELIXIR_BUILD:-0}" = "1" ] &&
           run_in_project_environment mix deps.loadpaths --no-compile >/dev/null 2>&1 &&
           run_in_project_environment env MIX_ENV=test mix deps.loadpaths --no-compile >/dev/null 2>&1; then
-        log_info "Exact-revision Elixir dependencies are ready, skipping mix deps.get"
+        log_info "Reused Elixir dependencies are ready, skipping mix deps.get"
       else
         log_step "Running mix deps.get"
         run_in_project_environment mix deps.get

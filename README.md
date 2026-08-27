@@ -53,7 +53,7 @@ When a new worktree is created, werksfeer:
 
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
 2. **Symlinks shared directories** (`node_modules`) when the main checkout is an exact, clean revision match
-3. **Copy-on-write clones build caches** (`_build`, `deps`, `priv/static`, etc.) from that same validated checkout
+3. **Copy-on-write clones build caches** (`_build`, `deps`, `priv/static`, etc.) from a clean, toolchain-compatible related revision
 4. **Provisions PostgreSQL** by cloning databases on a shared server or starting a private cluster on a Unix socket
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
 6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
@@ -63,17 +63,21 @@ Everything is idempotent — safe to re-run. Private services are opt-in, so
 existing repositories retain the shared-server cloning behavior.
 
 Build and dependency caches are deliberately stricter than environment-file
-copying. Werksfeer only reuses them when both checkouts are clean and point at
-the same commit. This prevents a stale local main checkout from making a newer
-worktree appear compiled. For Elixir projects, tracked source mtimes are copied
-from that validated checkout and relocation-sensitive CMake metadata is
-discarded. If the copied dev and test dependencies pass Mix's read-only check,
-Werksfeer skips `mix deps.get`; the normal compiler still performs its own
-dependency and staleness checks.
+copying. Werksfeer only copies them when both checkouts are clean, their
+revisions share Git history, and their tracked toolchain declarations match.
+This supports descendant and diverged feature branches while rejecting
+unrelated histories. Mutable shared directories remain restricted to an exact
+revision. For Elixir projects, source mtimes are copied only for files that are
+Git-identical between the two revisions; changed and new worktree files keep
+their newer times so Mix recompiles them and their dependents.
+Relocation-sensitive CMake metadata is discarded. If the copied dev and test
+dependencies pass Mix's read-only check, Werksfeer skips `mix deps.get`; the
+normal compiler still performs its own lockfile, dependency, and staleness
+checks.
 
 Mix normally recompiles Elixir modules when a project moves to another absolute
-path. Applications that intentionally reuse an exact-revision `_build` cache
-between worktrees should opt out of that path check for dev/test in `mix.exs`:
+path. Applications that intentionally reuse an `_build` cache between
+worktrees should opt out of that path check for dev/test in `mix.exs`:
 
 ```elixir
 elixirc_options: [check_cwd: Mix.env() == :prod]
