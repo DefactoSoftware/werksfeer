@@ -127,6 +127,20 @@ postgres_user() {
   toml_get "postgres" "user" "postgres"
 }
 
+postgres_encoding() {
+  printf 'UTF8\n'
+}
+
+postgres_locale() {
+  # Pass the locale explicitly so an invalid inherited LANG cannot make
+  # initdb fail before it applies the repository's intended cluster locale.
+  toml_get "postgres" "locale" "en_US.UTF-8"
+}
+
+postgres_normalize_locale() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '_.-'
+}
+
 postgres_resolve_pg_config() {
   if [ -n "${PG_CONFIG:-}" ] && [ -x "${PG_CONFIG}" ]; then
     printf '%s\n' "${PG_CONFIG}"
@@ -355,10 +369,12 @@ postgres_template_compatibility_key() {
   extensions="$(toml_get_array "postgres" "required_extensions")"
   seed_fingerprint="$(postgres_template_seed_fingerprint "$project_root" "$project_type")" || return 1
 
-  printf '%s\n%s\n%s\n%s\n%s\n' \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$project_type" \
     "$db_names" \
     "$(postgres_user)" \
+    "$(postgres_encoding)" \
+    "$(postgres_locale)" \
     "$extensions" \
     "$seed_fingerprint" | postgres_sha256
 }
@@ -682,10 +698,45 @@ postgres_initialize_cluster() {
   "$POSTGRES_INITDB" \
     --pgdata="$data_directory" \
     --username="$(postgres_user)" \
-    --encoding=UTF8 \
+    --encoding="$(postgres_encoding)" \
+    --locale="$(postgres_locale)" \
     --auth-local=trust \
     --auth-host=reject \
     --no-instructions
+}
+
+postgres_check_cluster_metadata() {
+  local project_root="$1"
+  local data_directory="$2"
+  local metadata actual_encoding actual_collation actual_ctype expected_locale
+
+  metadata="$("$POSTGRES_PSQL" \
+    --host="$(postgres_socket_directory "$project_root")" \
+    --port="$(postgres_port)" \
+    --username="$(postgres_user)" \
+    --dbname=postgres \
+    --no-align \
+    --tuples-only \
+    --field-separator='|' \
+    --set=ON_ERROR_STOP=1 \
+    --command="SELECT pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database WHERE datname = 'template1'")" || {
+      log_error "Could not inspect PostgreSQL encoding and locale in $data_directory"
+      return 1
+    }
+
+  IFS='|' read -r actual_encoding actual_collation actual_ctype <<EOF_METADATA
+$metadata
+EOF_METADATA
+  expected_locale="$(postgres_locale)"
+
+  if [ "$actual_encoding" != "$(postgres_encoding)" ] ||
+      [ "$(postgres_normalize_locale "$actual_collation")" != "$(postgres_normalize_locale "$expected_locale")" ] ||
+      [ "$(postgres_normalize_locale "$actual_ctype")" != "$(postgres_normalize_locale "$expected_locale")" ]; then
+    log_error "$data_directory uses ${actual_encoding:-unknown}/${actual_collation:-unknown}/${actual_ctype:-unknown}"
+    log_error "Expected $(postgres_encoding)/${expected_locale}/${expected_locale}"
+    log_error "Stop the old server and move or remove this worktree's data directory to rebuild it"
+    return 1
+  fi
 }
 
 postgres_ensure_cluster_include() {
@@ -744,7 +795,8 @@ werksfeer_service_postgres_start() {
   if postgres_cluster_running "$data_directory"; then
     if "$POSTGRES_PG_ISREADY" --quiet --host="$socket_dir" --port="$(postgres_port)"; then
       log_info "PostgreSQL is already running at $socket_dir"
-      return 0
+      postgres_check_cluster_metadata "$project_root" "$data_directory"
+      return $?
     fi
 
     log_error "pg_ctl reports a running cluster, but it is not ready at $socket_dir"
@@ -762,6 +814,15 @@ werksfeer_service_postgres_start() {
     log_error "PostgreSQL started but did not become ready at $socket_dir"
     return 1
   }
+
+  if ! postgres_check_cluster_metadata "$project_root" "$data_directory"; then
+    "$POSTGRES_PG_CTL" stop \
+      --pgdata="$data_directory" \
+      --mode=fast \
+      --wait \
+      --timeout=30 || true
+    return 1
+  fi
 }
 
 werksfeer_service_postgres_prepare() {
@@ -886,13 +947,15 @@ werksfeer_service_postgres_doctor() {
   postgres_load_tools
   postgres_check_required_extensions
 
-  printf 'enabled=%s\ndata_directory=%s\nsocket_directory=%s\npg_config=%s\npostgres=%s\npostgres_version=%s\nextensions=ok\n' \
+  printf 'enabled=%s\ndata_directory=%s\nsocket_directory=%s\npg_config=%s\npostgres=%s\npostgres_version=%s\nencoding=%s\nlocale=%s\nextensions=ok\n' \
     "$enabled" \
     "$(postgres_data_directory "$project_root")" \
     "$(postgres_socket_directory "$project_root")" \
     "$POSTGRES_PG_CONFIG" \
     "$POSTGRES_SERVER" \
-    "$(postgres_major_version)"
+    "$(postgres_major_version)" \
+    "$(postgres_encoding)" \
+    "$(postgres_locale)"
 }
 
 werksfeer_service_postgres_env() {

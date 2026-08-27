@@ -49,14 +49,14 @@ teardown() {
   run "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.0" ]
+  [ "$output" = "werksfeer 0.2.1" ]
 }
 
 @test "runs with the system Bash used by macOS" {
   run env PATH="/usr/bin:/bin" "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.0" ]
+  [ "$output" = "werksfeer 0.2.1" ]
 }
 
 @test "derives a stable short socket path for each worktree" {
@@ -90,6 +90,76 @@ teardown() {
 
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "initializes PostgreSQL with the standard UTF-8 locale" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+  fake_initdb="${TEST_ROOT}/initdb"
+  command_log="${TEST_ROOT}/initdb-arguments.log"
+
+  cat > "$fake_initdb" <<'EOF_INITDB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$COMMAND_LOG"
+EOF_INITDB
+  chmod +x "$fake_initdb"
+
+  run env COMMAND_LOG="$command_log" bash -c '
+    toml_get() { printf "%s\n" "$3"; }
+    log_info() { :; }
+    source "$1"
+    POSTGRES_INITDB="$2"
+    postgres_initialize_cluster "$3"
+  ' _ "$provider" "$fake_initdb" "${TEST_ROOT}/postgres-data"
+
+  [ "$status" -eq 0 ]
+  grep -Fqx -- '--encoding=UTF8' "$command_log"
+  grep -Fqx -- '--locale=en_US.UTF-8' "$command_log"
+}
+
+@test "accepts equivalent PostgreSQL locale spellings" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+  fake_psql="${TEST_ROOT}/psql"
+
+  cat > "$fake_psql" <<'EOF_PSQL'
+#!/usr/bin/env bash
+printf 'UTF8|en_US.utf8|en_US.utf8\n'
+EOF_PSQL
+  chmod +x "$fake_psql"
+
+  run bash -c '
+    toml_get() { printf "%s\n" "$3"; }
+    log_error() { printf "%s\n" "$*" >&2; }
+    source "$1"
+    POSTGRES_PSQL="$2"
+    postgres_socket_directory() { printf "/tmp/example\n"; }
+    postgres_check_cluster_metadata "$3" "$3/.pg_data"
+  ' _ "$provider" "$fake_psql" "$WORKTREE_ONE"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "rejects an existing PostgreSQL cluster with incompatible metadata" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+  fake_psql="${TEST_ROOT}/psql"
+
+  cat > "$fake_psql" <<'EOF_PSQL'
+#!/usr/bin/env bash
+printf 'UTF8|C|C\n'
+EOF_PSQL
+  chmod +x "$fake_psql"
+
+  run bash -c '
+    toml_get() { printf "%s\n" "$3"; }
+    log_error() { printf "%s\n" "$*" >&2; }
+    source "$1"
+    POSTGRES_PSQL="$2"
+    postgres_socket_directory() { printf "/tmp/example\n"; }
+    postgres_check_cluster_metadata "$3" "$3/.pg_data"
+  ' _ "$provider" "$fake_psql" "$WORKTREE_ONE"
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"uses UTF8/C/C"* ]]
+  [[ "$output" == *"Expected UTF8/en_US.UTF-8/en_US.UTF-8"* ]]
 }
 
 @test "main checkout local config opts all worktrees out of private PostgreSQL" {
