@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-WERKSFEER_VERSION="0.2.0"
+WERKSFEER_VERSION="0.2.1"
 
 WERKSFEER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
@@ -833,6 +833,12 @@ EOF_SERVICE_START
   fi
 }
 
+allow_project_environment() {
+  if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
+    direnv allow . 2>/dev/null || true
+  fi
+}
+
 write_env_overrides() {
   local project_type="$1"
   local worktree_root="$2"
@@ -912,9 +918,7 @@ ${service_env}"
   # Every framework gets the same shell contract. Framework-specific dotenv
   # files above remain available for processes that load them themselves.
   write_managed_env_block ".envrc" "$(managed_shell_environment "$common_assignments")"
-  if command -v direnv >/dev/null 2>&1; then
-    direnv allow . 2>/dev/null || true
-  fi
+  allow_project_environment
 
   log_info "Port: ${wt_port}"
   if [ -n "$wt_redis" ]; then
@@ -1325,6 +1329,9 @@ run_setup() {
   # Step 1: Copy env files
   log_step "Copying environment files"
   sync_env_files "$main_path" "$worktree_path" "$project_type"
+  # Harnesses may still launch an agent to diagnose a later setup failure.
+  # Approve a copied .envrc now, then approve its managed rewrite below too.
+  allow_project_environment
 
   # Step 2: Symlink shared directories (node_modules)
   log_step "Symlinking shared directories"

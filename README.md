@@ -367,6 +367,8 @@ data_dir = ".pg_data"
 socket_root = "/tmp"
 port = 5432
 user = "postgres"
+# Default libc collation/ctype; the cluster encoding remains UTF-8
+locale = "en_US.UTF-8"
 # Validate extension control files before initializing or starting the cluster
 required_extensions = ["citext", "pg_trgm", "vector"]
 # Seeded cold-cluster cache (defaults shown)
@@ -407,6 +409,12 @@ post_dependencies = "npm run-script build"
 # Run after setup completes
 post_setup = "echo done"
 ```
+
+Encoding and locale are part of the seeded-template compatibility key. If
+either setting changes, Werksfeer will not reuse older cached templates. An
+existing worktree data directory is never rewritten in place; if its metadata
+does not match the current configuration, Werksfeer refuses to use it and
+prints the path that must be moved or removed before rebuilding.
 
 ## Pruning orphaned databases
 
