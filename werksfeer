@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-WERKSFEER_VERSION="0.2.2"
+WERKSFEER_VERSION="0.3.0"
 
 WERKSFEER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
@@ -33,8 +33,10 @@ load_werksfeer_modules() {
     lib_dir="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/lib"
   fi
 
-  if [ ! -f "${lib_dir}/services.sh" ] || [ ! -f "${lib_dir}/services/postgres.sh" ]; then
-    log_error "Werksfeer service modules were not found in $lib_dir"
+  if [ ! -f "${lib_dir}/services.sh" ] ||
+      [ ! -f "${lib_dir}/services/postgres.sh" ] ||
+      [ ! -f "${lib_dir}/cache.sh" ]; then
+    log_error "Werksfeer modules were not found in $lib_dir"
     log_info "Reinstall werksfeer with install.sh or set WERKSFEER_LIB_DIR"
     return 1
   fi
@@ -43,6 +45,8 @@ load_werksfeer_modules() {
   source "${lib_dir}/services.sh"
   # shellcheck source=/dev/null
   source "${lib_dir}/services/postgres.sh"
+  # shellcheck source=/dev/null
+  source "${lib_dir}/cache.sh"
 }
 
 # ---------------------------------------------------------------------------
@@ -113,6 +117,14 @@ toml_get_array() {
   key="$(echo "$2" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_]/_/g')"
   varname="_TOML_${section}_${key}"
   eval "echo \"\${${varname}:-}\""
+}
+
+toml_reset() {
+  local variable_name
+  while IFS= read -r variable_name; do
+    unset "$variable_name"
+  done < <(compgen -A variable _TOML_)
+  _TOML_PARSED=0
 }
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1106,11 @@ run_shell_in_project_environment() {
 install_node_dependencies() {
   [ -f "package.json" ] || return 0
 
+  if [ "${WERKSFEER_REUSED_NODE_DEPENDENCIES:-0}" = "1" ]; then
+    log_info "Reused node_modules is ready, skipping package installation"
+    return 0
+  fi
+
   if [ -L "node_modules" ]; then
     log_info "Shared node_modules is already linked, skipping package installation"
     return 0
@@ -1456,6 +1473,23 @@ run_setup() {
   project_type="$(detect_project_type "$main_path")"
   log_info "Project type: $project_type"
 
+  if managed_cache_auto_warm_enabled; then
+    if ! managed_cache_warm "$worktree_path"; then
+      log_warn "Managed build cache warming failed; continuing with available local caches"
+    fi
+  else
+    local auto_warm_status=$?
+    [ "$auto_warm_status" -eq 1 ] || return "$auto_warm_status"
+  fi
+
+  local build_cache_source="$main_path"
+  local managed_source=""
+  managed_source="$(managed_cache_source "$main_path" "$worktree_path")" || managed_source=""
+  if [ -n "$managed_source" ]; then
+    build_cache_source="$managed_source"
+    log_info "Using managed build cache: $managed_source"
+  fi
+
   # Register for prune-all
   register_project
 
@@ -1466,13 +1500,18 @@ run_setup() {
   # Approve a copied .envrc now, then approve its managed rewrite below too.
   allow_project_environment
 
-  # Step 2: Symlink shared directories (node_modules)
-  log_step "Symlinking shared directories"
-  sync_symlink_dirs "$main_path" "$worktree_path" "$project_type"
+  # Step 2: Restore shared directories (node_modules). Managed caches are
+  # copied so a feature worktree can never mutate the authoritative cache.
+  log_step "Restoring shared directories"
+  if [ -n "$managed_source" ]; then
+    sync_managed_shared_dirs "$build_cache_source" "$worktree_path" "$project_type"
+  else
+    sync_symlink_dirs "$main_path" "$worktree_path" "$project_type"
+  fi
 
   # Step 3: Copy build directories
   log_step "Copying build directories"
-  copy_build_dirs "$main_path" "$worktree_path" "$project_type"
+  copy_build_dirs "$build_cache_source" "$worktree_path" "$project_type"
 
   # Step 4: Provision databases/services
   log_step "Setting up databases"
@@ -1520,6 +1559,8 @@ Usage:
   werksfeer services COMMAND Manage configured worktree services
   werksfeer postgres COMMAND Manage the PostgreSQL service directly
   werksfeer exec COMMAND...  Run a command through the worktree's project environment
+  werksfeer cache warm      Refresh the managed dependency/build cache
+  werksfeer cache status    Inspect the managed dependency/build cache
   werksfeer --cleanup [PATH] Stop services and clean a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
@@ -1529,6 +1570,7 @@ Usage:
 Environment:
   WERKSFEER_DEBUG=1         Enable debug logging
   WERKSFEER_POSTGRES=false Disable private PostgreSQL for this shell
+  WERKSFEER_CACHE_AUTO_WARM=true|false Override automatic cache warming
   WERKSFEER_LIB_DIR=PATH    Override the service module directory
 
 Werksfeer reads .worktree.toml, then overlays ignored .worktree.local.toml
@@ -1628,6 +1670,30 @@ exec_mode() {
   run_in_project_environment "$@"
 }
 
+cache_mode() {
+  shift
+  local action="${1:-status}"
+
+  if ! is_git_repo; then
+    log_error "Not inside a git repository"
+    return 1
+  fi
+
+  local project_root
+  project_root="$(current_project_root)"
+  load_project_configuration "$project_root"
+
+  case "$action" in
+    warm) managed_cache_warm "$project_root" ;;
+    status) managed_cache_status "$project_root" ;;
+    *)
+      log_error "Unknown cache command: $action"
+      log_info "Available commands: warm, status"
+      return 2
+      ;;
+  esac
+}
+
 main() {
   case "${1:-}" in
     --mise-exec)
@@ -1660,6 +1726,9 @@ main() {
       ;;
     exec)
       exec_mode "$@"
+      ;;
+    cache)
+      cache_mode "$@"
       ;;
     --version|-V)
       echo "werksfeer $WERKSFEER_VERSION"

@@ -38,6 +38,7 @@ LIB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/lib"
 mkdir -p "${LIB_DIR}/services"
 install_asset "lib/werksfeer/services.sh" "${LIB_DIR}/services.sh"
 install_asset "lib/werksfeer/services/postgres.sh" "${LIB_DIR}/services/postgres.sh"
+install_asset "lib/werksfeer/cache.sh" "${LIB_DIR}/cache.sh"
 
 # Download hook template
 HOOKS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/hooks"
@@ -48,6 +49,7 @@ chmod +x "${HOOKS_DIR}/post-checkout"
 echo ""
 echo "Installed werksfeer to ${INSTALL_DIR}/werksfeer"
 echo "Service modules at ${LIB_DIR}"
+echo "Cache module at ${LIB_DIR}/cache.sh"
 echo "Hook template at ${HOOKS_DIR}/post-checkout"
 echo ""
 
