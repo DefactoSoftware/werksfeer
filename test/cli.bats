@@ -236,6 +236,48 @@ EOF_LOCAL_CONFIG
   [[ "$output" == *"WERKSFEER_POSTGRES must be true, false, 1, or 0"* ]]
 }
 
+@test "exec composes direnv with the repository Mise toolchain" {
+  fake_bin="${TEST_ROOT}/project-environment-bin"
+  command_log="${TEST_ROOT}/mise-arguments.log"
+  mkdir -p "$fake_bin"
+  printf 'elixir 1.20.0-otp-29\n' > "${WORKTREE_ONE}/.tool-versions"
+  printf '# managed environment\n' > "${WORKTREE_ONE}/.envrc"
+
+  cat > "${fake_bin}/direnv" <<'EOF_DIRENV'
+#!/usr/bin/env bash
+[ "$1" = "exec" ] && [ "$2" = "." ] || exit 2
+shift 2
+exec "$@"
+EOF_DIRENV
+  cat > "${fake_bin}/mise" <<'EOF_MISE'
+#!/usr/bin/env bash
+if [ "$1" = "bin-paths" ]; then
+  dirname "$0"
+  exit 0
+fi
+printf '%s\n' "$@" > "$COMMAND_LOG"
+[ "$1" = "exec" ] && [ "$2" = "--" ] || exit 2
+shift 2
+export TEST_MISE_ACTIVE=1
+exec "$@"
+EOF_MISE
+  cat > "${fake_bin}/print-toolchain" <<'EOF_TOOLCHAIN'
+#!/usr/bin/env bash
+printf 'mise=%s\n' "$TEST_MISE_ACTIVE"
+EOF_TOOLCHAIN
+  chmod +x "${fake_bin}/direnv" "${fake_bin}/mise" "${fake_bin}/print-toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\" exec print-toolchain"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "mise=1" ]
+  [ "$(sed -n '1p' "$command_log")" = "exec" ]
+  [ "$(sed -n '2p' "$command_log")" = "--" ]
+  [ "$(sed -n '3p' "$command_log")" = "env" ]
+  grep -Fq "PATH=${fake_bin}:" "$command_log"
+  [ "$(tail -n 1 "$command_log")" = "print-toolchain" ]
+}
+
 @test "PostgreSQL template fingerprints only committed seed inputs" {
   provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
 

@@ -940,22 +940,64 @@ detect_node_pm() {
   fi
 }
 
+project_mise_bin() {
+  local project_root
+  project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+  if [ ! -f "$project_root/.tool-versions" ] &&
+      [ ! -f "$project_root/mise.toml" ] &&
+      [ ! -f "$project_root/.mise.toml" ] &&
+      [ ! -f "$project_root/mise.local.toml" ] &&
+      [ ! -f "$project_root/.mise.local.toml" ]; then
+    return 1
+  fi
+
+  command -v mise 2>/dev/null
+}
+
+run_with_mise() {
+  local mise_bin="$1"
+  shift
+  local bin_path=""
+  local bin_paths=""
+
+  while IFS= read -r bin_path; do
+    [ -z "$bin_path" ] && continue
+    if [ -n "$bin_paths" ]; then
+      bin_paths="${bin_paths}:${bin_path}"
+    else
+      bin_paths="$bin_path"
+    fi
+  done <<< "$("$mise_bin" bin-paths)"
+
+  if [ -n "$bin_paths" ]; then
+    # Some GUI harnesses prepend system paths after shell activation. Keep the
+    # repository-pinned binaries first even in that inherited environment.
+    "$mise_bin" exec -- env PATH="${bin_paths}:${PATH}" "$@"
+  else
+    "$mise_bin" exec -- "$@"
+  fi
+}
+
 run_in_project_environment() {
+  local mise_bin=""
+  mise_bin="$(project_mise_bin)" || true
+
   if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
-    direnv exec . "$@"
+    if [ -n "$mise_bin" ]; then
+      direnv exec . "${WERKSFEER_SCRIPT_DIR}/werksfeer" --mise-exec "$mise_bin" "$@"
+    else
+      direnv exec . "$@"
+    fi
+  elif [ -n "$mise_bin" ]; then
+    run_with_mise "$mise_bin" "$@"
   else
     "$@"
   fi
 }
 
 run_shell_in_project_environment() {
-  local command="$1"
-
-  if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
-    direnv exec . /bin/bash -c "$command"
-  else
-    /bin/bash -c "$command"
-  fi
+  run_in_project_environment /bin/bash -c "$1"
 }
 
 install_node_dependencies() {
@@ -1386,7 +1428,7 @@ Usage:
   werksfeer --hook ...       Called from post-checkout git hook
   werksfeer services COMMAND Manage configured worktree services
   werksfeer postgres COMMAND Manage the PostgreSQL service directly
-  werksfeer exec COMMAND...  Run a command through the worktree's direnv environment
+  werksfeer exec COMMAND...  Run a command through the worktree's project environment
   werksfeer --cleanup [PATH] Stop services and clean a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
@@ -1497,6 +1539,10 @@ exec_mode() {
 
 main() {
   case "${1:-}" in
+    --mise-exec)
+      shift
+      run_with_mise "$@"
+      ;;
     --hook)
       shift
       hook_mode "$@"
