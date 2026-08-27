@@ -99,11 +99,12 @@ teardown() {
 
   cat > "$fake_initdb" <<'EOF_INITDB'
 #!/usr/bin/env bash
+printf 'LC_ALL=%s\n' "$LC_ALL" > "$COMMAND_ENV_LOG"
 printf '%s\n' "$@" > "$COMMAND_LOG"
 EOF_INITDB
   chmod +x "$fake_initdb"
 
-  run env COMMAND_LOG="$command_log" bash -c '
+  run env COMMAND_LOG="$command_log" COMMAND_ENV_LOG="${TEST_ROOT}/initdb-environment.log" LC_ALL=C bash -c '
     toml_get() { printf "%s\n" "$3"; }
     log_info() { :; }
     source "$1"
@@ -114,6 +115,20 @@ EOF_INITDB
   [ "$status" -eq 0 ]
   grep -Fqx -- '--encoding=UTF8' "$command_log"
   grep -Fqx -- '--locale=en_US.UTF-8' "$command_log"
+  grep -Fqx -- 'LC_ALL=en_US.UTF-8' "${TEST_ROOT}/initdb-environment.log"
+}
+
+@test "starts PostgreSQL with the configured cluster locale" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+
+  run env LC_ALL=C bash -c '
+    toml_get() { printf "%s\n" "$3"; }
+    source "$1"
+    postgres_run_with_locale sh -c '\''printf "%s\n" "$LC_ALL"'\''
+  ' _ "$provider"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "en_US.UTF-8" ]
 }
 
 @test "accepts equivalent PostgreSQL locale spellings" {
