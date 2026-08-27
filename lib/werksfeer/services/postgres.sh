@@ -137,6 +137,14 @@ postgres_locale() {
   toml_get "postgres" "locale" "en_US.UTF-8"
 }
 
+postgres_run_with_locale() {
+  # PostgreSQL's macOS postmaster can become multithreaded and abort during
+  # startup when it inherits an unsuitable locale, even when initdb was given
+  # an explicit cluster locale. Keep the tool and server process aligned with
+  # the locale used to initialize and validate the cluster.
+  LC_ALL="$(postgres_locale)" "$@"
+}
+
 postgres_normalize_locale() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '_.-'
 }
@@ -695,7 +703,7 @@ postgres_initialize_cluster() {
   fi
 
   log_info "Initializing PostgreSQL in $data_directory"
-  "$POSTGRES_INITDB" \
+  postgres_run_with_locale "$POSTGRES_INITDB" \
     --pgdata="$data_directory" \
     --username="$(postgres_user)" \
     --encoding="$(postgres_encoding)" \
@@ -804,7 +812,7 @@ werksfeer_service_postgres_start() {
   fi
 
   log_info "Starting PostgreSQL at $socket_dir"
-  "$POSTGRES_PG_CTL" start \
+  postgres_run_with_locale "$POSTGRES_PG_CTL" start \
     --pgdata="$data_directory" \
     --log="${data_directory}/postgres.log" \
     --wait \

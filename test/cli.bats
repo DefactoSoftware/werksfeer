@@ -49,14 +49,14 @@ teardown() {
   run "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.1" ]
+  [ "$output" = "werksfeer 0.2.2" ]
 }
 
 @test "runs with the system Bash used by macOS" {
   run env PATH="/usr/bin:/bin" "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.1" ]
+  [ "$output" = "werksfeer 0.2.2" ]
 }
 
 @test "derives a stable short socket path for each worktree" {
@@ -99,11 +99,12 @@ teardown() {
 
   cat > "$fake_initdb" <<'EOF_INITDB'
 #!/usr/bin/env bash
+printf 'LC_ALL=%s\n' "$LC_ALL" > "$COMMAND_ENV_LOG"
 printf '%s\n' "$@" > "$COMMAND_LOG"
 EOF_INITDB
   chmod +x "$fake_initdb"
 
-  run env COMMAND_LOG="$command_log" bash -c '
+  run env COMMAND_LOG="$command_log" COMMAND_ENV_LOG="${TEST_ROOT}/initdb-environment.log" LC_ALL=C bash -c '
     toml_get() { printf "%s\n" "$3"; }
     log_info() { :; }
     source "$1"
@@ -114,6 +115,20 @@ EOF_INITDB
   [ "$status" -eq 0 ]
   grep -Fqx -- '--encoding=UTF8' "$command_log"
   grep -Fqx -- '--locale=en_US.UTF-8' "$command_log"
+  grep -Fqx -- 'LC_ALL=en_US.UTF-8' "${TEST_ROOT}/initdb-environment.log"
+}
+
+@test "starts PostgreSQL with the configured cluster locale" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+
+  run env LC_ALL=C bash -c '
+    toml_get() { printf "%s\n" "$3"; }
+    source "$1"
+    postgres_run_with_locale sh -c '\''printf "%s\n" "$LC_ALL"'\''
+  ' _ "$provider"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "en_US.UTF-8" ]
 }
 
 @test "accepts equivalent PostgreSQL locale spellings" {
@@ -221,6 +236,80 @@ EOF_LOCAL_CONFIG
   [[ "$output" == *"WERKSFEER_POSTGRES must be true, false, 1, or 0"* ]]
 }
 
+@test "exec composes direnv with the repository Mise toolchain" {
+  fake_bin="${TEST_ROOT}/project-environment-bin"
+  command_log="${TEST_ROOT}/mise-arguments.log"
+  mkdir -p "$fake_bin"
+  printf 'elixir 1.20.0-otp-29\n' > "${WORKTREE_ONE}/.tool-versions"
+  printf '# managed environment\n' > "${WORKTREE_ONE}/.envrc"
+
+  cat > "${fake_bin}/direnv" <<'EOF_DIRENV'
+#!/usr/bin/env bash
+[ "$1" = "exec" ] && [ "$2" = "." ] || exit 2
+shift 2
+exec "$@"
+EOF_DIRENV
+  cat > "${fake_bin}/mise" <<'EOF_MISE'
+#!/usr/bin/env bash
+if [ "$1" = "bin-paths" ]; then
+  dirname "$0"
+  exit 0
+fi
+printf '%s\n' "$@" > "$COMMAND_LOG"
+[ "$1" = "exec" ] && [ "$2" = "--" ] || exit 2
+shift 2
+export TEST_MISE_ACTIVE=1
+exec "$@"
+EOF_MISE
+  cat > "${fake_bin}/print-toolchain" <<'EOF_TOOLCHAIN'
+#!/usr/bin/env bash
+printf 'mise=%s\n' "$TEST_MISE_ACTIVE"
+EOF_TOOLCHAIN
+  chmod +x "${fake_bin}/direnv" "${fake_bin}/mise" "${fake_bin}/print-toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\" exec print-toolchain"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "mise=1" ]
+  [ "$(sed -n '1p' "$command_log")" = "exec" ]
+  [ "$(sed -n '2p' "$command_log")" = "--" ]
+  [ "$(sed -n '3p' "$command_log")" = "env" ]
+  grep -Fq "PATH=${fake_bin}:" "$command_log"
+  [ "$(tail -n 1 "$command_log")" = "print-toolchain" ]
+}
+
+@test "exec falls back to asdf for .tool-versions repositories" {
+  fake_bin="${TEST_ROOT}/asdf-environment-bin"
+  asdf_data_dir="${TEST_ROOT}/asdf-data"
+  mkdir -p "$fake_bin" "${asdf_data_dir}/shims"
+  printf 'elixir 1.20.0-otp-29\n' > "${WORKTREE_ONE}/.tool-versions"
+  printf '# managed environment\n' > "${WORKTREE_ONE}/.envrc"
+
+  cat > "${fake_bin}/direnv" <<'EOF_DIRENV'
+#!/usr/bin/env bash
+[ "$1" = "exec" ] && [ "$2" = "." ] || exit 2
+shift 2
+exec "$@"
+EOF_DIRENV
+  cat > "${fake_bin}/asdf" <<'EOF_ASDF'
+#!/usr/bin/env bash
+exit 2
+EOF_ASDF
+  cat > "${asdf_data_dir}/shims/print-toolchain" <<'EOF_TOOLCHAIN'
+#!/usr/bin/env bash
+printf 'asdf=1\n'
+EOF_TOOLCHAIN
+  chmod +x \
+    "${fake_bin}/direnv" \
+    "${fake_bin}/asdf" \
+    "${asdf_data_dir}/shims/print-toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" ASDF_DATA_DIR=\"$asdf_data_dir\" WERKSFEER_POSTGRES=false \"$WERKSFEER\" exec print-toolchain"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = "asdf=1" ]
+}
+
 @test "PostgreSQL template fingerprints only committed seed inputs" {
   provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
 
@@ -293,7 +382,7 @@ EOF_LOCAL_CONFIG
   [ "$(cat "${MAIN_REPO}/deps/native/artifact")" = "dependency" ]
 }
 
-@test "different revisions do not reuse worktree caches" {
+@test "clean descendant revisions reuse isolated caches but not shared directories" {
   mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps" "${MAIN_REPO}/node_modules/example"
   printf 'build\n' > "${MAIN_REPO}/_build/value"
   printf 'dependency\n' > "${MAIN_REPO}/deps/value"
@@ -306,13 +395,196 @@ EOF_LOCAL_CONFIG
   run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
   [[ "$output" == *"Skip shared directories"* ]]
-  [[ "$output" == *"Skip build cache"* ]]
-  [ ! -e "${WORKTREE_ONE}/_build" ]
-  [ ! -e "${WORKTREE_ONE}/deps" ]
+  [[ "$output" != *"Skip build cache"* ]]
+  [ -f "${WORKTREE_ONE}/_build/value" ]
+  [ -f "${WORKTREE_ONE}/deps/value" ]
   [ ! -e "${WORKTREE_ONE}/node_modules" ]
 }
 
-@test "exact precompiled Elixir caches skip dependency fetching" {
+@test "ancestor cache reuse preserves mtimes only for unchanged tracked files" {
+  printf 'unchanged\n' > "${MAIN_REPO}/unchanged.ex"
+  printf 'main version\n' > "${MAIN_REPO}/changed.ex"
+  git -C "$MAIN_REPO" add unchanged.ex changed.ex
+  git -C "$MAIN_REPO" commit -qm "add source files"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  touch -t 202001010101.01 "${MAIN_REPO}/unchanged.ex" "${MAIN_REPO}/changed.ex"
+  printf 'branch version\n' > "${WORKTREE_ONE}/changed.ex"
+  git -C "$WORKTREE_ONE" add changed.ex
+  git -C "$WORKTREE_ONE" commit -qm "change source file"
+  touch -t 202101010101.01 "${WORKTREE_ONE}/changed.ex"
+
+  mkdir -p "${MAIN_REPO}/_build"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  worktree_changed_mtime_before="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/changed.ex")"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+
+  main_unchanged_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${MAIN_REPO}/unchanged.ex")"
+  worktree_unchanged_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/unchanged.ex")"
+  main_changed_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${MAIN_REPO}/changed.ex")"
+  worktree_changed_mtime="$(elixir -e 'IO.write(File.stat!(hd(System.argv()), time: :posix).mtime)' "${WORKTREE_ONE}/changed.ex")"
+
+  [ "$worktree_unchanged_mtime" = "$main_unchanged_mtime" ]
+  [ "$worktree_changed_mtime" != "$main_changed_mtime" ]
+  [ "$worktree_changed_mtime" = "$worktree_changed_mtime_before" ]
+}
+
+@test "Mix safely incrementally compiles a cache from a diverged revision" {
+  mkdir -p "${MAIN_REPO}/lib"
+  cat > "${MAIN_REPO}/mix.exs" <<'EOF_MIX_PROJECT'
+defmodule Example.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :example,
+      version: "0.1.0",
+      elixirc_options: [check_cwd: false]
+    ]
+  end
+end
+EOF_MIX_PROJECT
+  cat > "${MAIN_REPO}/lib/unchanged.ex" <<'EOF_UNCHANGED'
+defmodule Example.Unchanged do
+  def value, do: :unchanged
+end
+EOF_UNCHANGED
+  cat > "${MAIN_REPO}/lib/changed.ex" <<'EOF_CHANGED'
+defmodule Example.Changed do
+  def value, do: :base
+end
+EOF_CHANGED
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[setup]
+command = "mix compile"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add mix.exs lib .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "add compilable project"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  cat > "${MAIN_REPO}/lib/main_only.ex" <<'EOF_MAIN_ONLY'
+defmodule Example.MainOnly do
+  def value, do: :main
+end
+EOF_MAIN_ONLY
+  git -C "$MAIN_REPO" add lib/main_only.ex
+  git -C "$MAIN_REPO" commit -qm "add main-only module"
+
+  run bash -c "cd \"$MAIN_REPO\" && mix compile"
+  [ "$status" -eq 0 ]
+  [ -f "${MAIN_REPO}/_build/dev/lib/example/ebin/Elixir.Example.MainOnly.beam" ]
+
+  cat > "${WORKTREE_ONE}/lib/changed.ex" <<'EOF_BRANCH_CHANGED'
+defmodule Example.Changed do
+  def value, do: :branch
+end
+EOF_BRANCH_CHANGED
+  cat > "${WORKTREE_ONE}/lib/branch_only.ex" <<'EOF_BRANCH_ONLY'
+defmodule Example.BranchOnly do
+  def value, do: :branch
+end
+EOF_BRANCH_ONLY
+  git -C "$WORKTREE_ONE" add lib
+  git -C "$WORKTREE_ONE" commit -qm "change branch modules"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Compiling 2 files (.ex)"* ]]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.Unchanged.beam" ]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.Changed.beam" ]
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.BranchOnly.beam" ]
+  [ ! -e "${WORKTREE_ONE}/_build/dev/lib/example/ebin/Elixir.Example.MainOnly.beam" ]
+
+  run bash -c "cd \"$WORKTREE_ONE\" && mix compile"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "clean diverged revisions reuse isolated worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+
+  printf 'main revision\n' > "${MAIN_REPO}/main-revision"
+  git -C "$MAIN_REPO" add main-revision
+  git -C "$MAIN_REPO" commit -qm "main revision"
+  printf 'worktree revision\n' > "${WORKTREE_ONE}/worktree-revision"
+  git -C "$WORKTREE_ONE" add worktree-revision
+  git -C "$WORKTREE_ONE" commit -qm "worktree revision"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Skip build cache"* ]]
+  [ -f "${WORKTREE_ONE}/_build/value" ]
+  [ -f "${WORKTREE_ONE}/deps/value" ]
+}
+
+@test "unrelated histories do not reuse worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+
+  git -C "$WORKTREE_ONE" checkout -q --orphan unrelated-history
+  git -C "$WORKTREE_ONE" rm -qrf .
+  printf 'defmodule Example.MixProject do\nend\n' > "${WORKTREE_ONE}/mix.exs"
+  cat > "${WORKTREE_ONE}/.gitignore" <<'EOF_GITIGNORE'
+/_build
+/deps
+/node_modules
+/priv/static
+.worktree.local.toml
+.envrc
+EOF_GITIGNORE
+  cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_CONFIG'
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$WORKTREE_ONE" add mix.exs .gitignore .worktree.toml
+  git -C "$WORKTREE_ONE" commit -qm "unrelated history"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "dirty cache sources do not reuse worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+  printf 'dirty\n' > "${MAIN_REPO}/untracked-file"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "toolchain changes make ancestor build caches ineligible" {
+  printf '20.0.0\n' > "${MAIN_REPO}/.nvmrc"
+  git -C "$MAIN_REPO" add .nvmrc
+  git -C "$MAIN_REPO" commit -qm "pin toolchain"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+  printf '22.0.0\n' > "${WORKTREE_ONE}/.nvmrc"
+  git -C "$WORKTREE_ONE" add .nvmrc
+  git -C "$WORKTREE_ONE" commit -qm "upgrade toolchain"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+}
+
+@test "compatible ancestor Elixir caches skip dependency fetching" {
   fake_bin="${TEST_ROOT}/elixir-cache-bin"
   command_log="${TEST_ROOT}/elixir-cache-commands.log"
   mkdir -p "$fake_bin" "${MAIN_REPO}/_build/dev" "${MAIN_REPO}/deps/example"
@@ -324,6 +596,9 @@ EOF_CONFIG
   git -C "$MAIN_REPO" add .worktree.toml
   git -C "$MAIN_REPO" commit -qm "use automatic setup"
   git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+  printf 'branch revision\n' > "${WORKTREE_ONE}/revision"
+  git -C "$WORKTREE_ONE" add revision
+  git -C "$WORKTREE_ONE" commit -qm "branch revision"
 
   cat > "${fake_bin}/mix" <<'EOF_MIX'
 #!/usr/bin/env bash
