@@ -21,12 +21,16 @@ managed_cache_repository_key() {
   printf '%s' "$main_path" | werksfeer_sha256
 }
 
+managed_cache_parent() {
+  printf '%s/werksfeer/build-caches\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
+}
+
 managed_cache_root() {
   local main_path="$1"
   local repository_key
   repository_key="$(managed_cache_repository_key "$main_path")" || return 1
-  printf '%s/werksfeer/build-caches/%s\n' \
-    "${XDG_CACHE_HOME:-$HOME/.cache}" \
+  printf '%s/%s\n' \
+    "$(managed_cache_parent)" \
     "${repository_key:0:16}"
 }
 
@@ -68,7 +72,7 @@ managed_cache_ref() {
 
 managed_cache_auto_warm_enabled() {
   local value
-  value="${WERKSFEER_CACHE_AUTO_WARM:-$(toml_get "cache" "auto_warm" "false")}"
+  value="${WERKSFEER_CACHE_AUTO_WARM:-$(toml_get "cache" "auto_warm" "true")}"
   case "$value" in
     true|1) return 0 ;;
     false|0|'') return 1 ;;
@@ -76,6 +80,18 @@ managed_cache_auto_warm_enabled() {
       log_error "cache.auto_warm must be true, false, 1, or 0: $value"
       return 2
       ;;
+  esac
+}
+
+managed_cache_retention_days() {
+  local value
+  value="${WERKSFEER_CACHE_RETENTION_DAYS:-$(toml_get "cache" "retention_days" "30")}"
+  case "$value" in
+    ''|*[!0-9]*)
+      log_error "cache.retention_days must be a non-negative integer: $value"
+      return 2
+      ;;
+    *) printf '%s\n' "$value" ;;
   esac
 }
 
@@ -187,6 +203,19 @@ managed_cache_release_lock() {
     rmdir "$WERKSFEER_CACHE_LOCK_DIR" 2>/dev/null || true
     WERKSFEER_CACHE_LOCK_DIR=""
   fi
+}
+
+managed_cache_lock_owner() {
+  local cache_root="$1"
+  [ -f "${cache_root}/.warm.lock/pid" ] || return 0
+  cat "${cache_root}/.warm.lock/pid"
+}
+
+managed_cache_lock_is_active() {
+  local cache_root="$1"
+  local owner_pid
+  owner_pid="$(managed_cache_lock_owner "$cache_root")"
+  [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null
 }
 
 managed_cache_acquire_lock() {
@@ -335,6 +364,7 @@ managed_cache_write_manifest() {
     printf 'warmed_at=%s\n' "$(date +%s)"
   } > "$temporary"
   mv "$temporary" "$manifest"
+  touch "$(managed_cache_root "$main_path")/LAST_USED"
 }
 
 managed_cache_warm_locked() {
@@ -362,6 +392,7 @@ managed_cache_warm_locked() {
   if [ "$ready_commit" = "$target_commit" ] &&
       [ "$ready_configuration_inputs" = "$configuration_inputs" ] &&
       git_checkout_is_clean "$checkout"; then
+    touch "$(managed_cache_root "$main_path")/LAST_USED"
     log_info "Managed build cache is already warm for $cache_ref at ${target_commit:0:12}"
     return 0
   fi
@@ -398,12 +429,15 @@ managed_cache_warm_locked() {
 
 managed_cache_warm() (
   local project_root="$1"
-  local main_path cache_ref cache_root lock_dir warm_status=0
+  local main_path cache_ref cache_root lock_dir retention_days warm_status=0
   main_path="$(cd "$project_root" && get_main_worktree_path)"
   toml_reset
   load_project_configuration "$main_path"
   cache_ref="$(managed_cache_ref "$main_path")"
   cache_root="$(managed_cache_root "$main_path")" || return 1
+  retention_days="$(managed_cache_retention_days)" || return 1
+
+  managed_cache_prune_stale "$cache_root" "$retention_days"
 
   managed_cache_validate_root "$main_path" "$cache_root"
   lock_dir="${cache_root}/.warm.lock"
@@ -440,6 +474,7 @@ managed_cache_source() {
   checkout_commit="$(git -C "$checkout" rev-parse HEAD 2>/dev/null)" || return 1
   [ -n "$ready_commit" ] && [ "$ready_commit" = "$checkout_commit" ] || return 1
   reusable_build_cache "$checkout" "$worktree_path" || return 1
+  touch "$(managed_cache_root "$main_path")/LAST_USED"
   printf '%s\n' "$checkout"
 }
 
@@ -514,12 +549,11 @@ managed_cache_status() (
   printf 'current=%s\n' "$([ -n "$ready_commit" ] && [ "$ready_commit" = "$current_ref_commit" ] && printf true || printf false)"
 )
 
-managed_cache_clean() (
-  local project_root="$1"
-  local main_path cache_root cache_parent owner_file owner_pid=""
-  main_path="$(cd "$project_root" && get_main_worktree_path)"
-  cache_root="$(managed_cache_root "$main_path")" || return 1
-  cache_parent="${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/build-caches"
+managed_cache_remove_root() {
+  local cache_root="$1"
+  local expected_owner="$2"
+  local cache_parent owner_file
+  cache_parent="$(managed_cache_parent)"
   owner_file="${cache_root}/OWNER"
 
   case "$cache_root" in
@@ -531,21 +565,65 @@ managed_cache_clean() (
   esac
 
   if [ ! -e "$cache_root" ]; then
-    log_info "No managed build cache exists for this repository"
     return 0
   fi
-  if [ ! -f "$owner_file" ] || [ "$(cat "$owner_file")" != "$main_path" ]; then
+  if [ ! -f "$owner_file" ] || [ "$(cat "$owner_file")" != "$expected_owner" ]; then
     log_error "Refusing to clean an unowned build cache directory: $cache_root"
     return 1
   fi
-  if [ -f "${cache_root}/.warm.lock/pid" ]; then
-    owner_pid="$(cat "${cache_root}/.warm.lock/pid")"
-  fi
-  if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
+  if managed_cache_lock_is_active "$cache_root"; then
     log_error "Cannot clean the managed build cache while it is warming"
     return 1
   fi
 
-  log_step "Removing managed build cache: $cache_root"
   find "$cache_root" -depth -delete
+}
+
+managed_cache_prune_stale() {
+  local current_cache_root="$1"
+  local retention_days="$2"
+  local cache_parent cache_root owner marker
+
+  [ "$retention_days" -gt 0 ] || return 0
+  cache_parent="$(managed_cache_parent)"
+  [ -d "$cache_parent" ] || return 0
+
+  while IFS= read -r cache_root; do
+    [ -n "$cache_root" ] || continue
+    [ "$cache_root" != "$current_cache_root" ] || continue
+    [ -f "${cache_root}/OWNER" ] || continue
+    owner="$(cat "${cache_root}/OWNER")"
+    [ -n "$owner" ] || continue
+    managed_cache_lock_is_active "$cache_root" && continue
+
+    if [ -f "${cache_root}/LAST_USED" ]; then
+      marker="${cache_root}/LAST_USED"
+    elif [ -f "${cache_root}/READY" ]; then
+      marker="${cache_root}/READY"
+    else
+      marker="${cache_root}/OWNER"
+    fi
+
+    if [ -n "$(find "$marker" -mtime +"$retention_days" -print -quit)" ]; then
+      log_info "Pruning managed build cache unused for more than ${retention_days} days: $owner"
+      if ! managed_cache_remove_root "$cache_root" "$owner"; then
+        log_warn "Could not prune managed build cache: $cache_root"
+      fi
+    fi
+  done < <(find "$cache_parent" -mindepth 1 -maxdepth 1 -type d -print)
+}
+
+managed_cache_clean() (
+  local project_root="$1"
+  local main_path cache_root
+  main_path="$(cd "$project_root" && get_main_worktree_path)"
+  cache_root="$(managed_cache_root "$main_path")" || return 1
+
+  if [ ! -e "$cache_root" ]; then
+    log_info "No managed build cache exists for this repository"
+    return 0
+  fi
+
+  log_step "Removing managed build cache: $cache_root"
+  managed_cache_remove_root "$cache_root" "$main_path"
 )

@@ -78,7 +78,8 @@ checks.
 ### Managed dependency and build cache
 
 The visible main checkout does not need to stay compiled or even remain on its
-default branch. Werksfeer can maintain an independent cache clone under
+default branch. Werksfeer automatically maintains an independent cache clone
+under
 `${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/build-caches`. The clone follows the
 remote default ref, uses the repository-pinned Mise/asdf toolchain, and keeps
 ignored dependencies and build outputs between refreshes. It is a separate Git
@@ -100,25 +101,30 @@ copy-on-write when the filesystem supports it. `node_modules` is never
 symlinked to the managed cache, so installs in a feature branch cannot corrupt
 the source used by later worktrees.
 
-To refresh before every worktree setup, opt in per repository:
+Every worktree setup refreshes the cache before restoring its artifacts. The
+first setup may therefore spend several minutes preparing the cache; later
+setups normally only fetch and verify it. To disable automatic warming for a
+repository or in an ignored local override:
 
 ```toml
 [cache]
-auto_warm = true
+auto_warm = false
 ```
 
-Automatic warming is disabled by default because it may fetch and compile for
-several minutes the first time. A refresh failure only emits a warning during
-worktree setup; Werksfeer falls back to a compatible main-checkout cache or the
-framework's normal setup. Successful refreshes are incremental: unchanged
+Automatic warming is enabled by default. A refresh failure only emits a warning
+during worktree setup; Werksfeer falls back to a compatible main-checkout cache
+or the framework's normal setup. Successful refreshes are incremental: unchanged
 Node dependency inputs retain `node_modules`, while Mix, Bundler, and other
 package managers validate their own artifacts. Databases are deliberately not
 started, migrated, or included in this cache; private PostgreSQL uses its
 separate seeded-template cache.
 
 The cache may use several gigabytes for applications with multiple build
-environments. `werksfeer cache clean` safely removes only the cache owned by
-the current repository; the next warm recreates it from scratch.
+environments. Each repository has one cache that updates in place, rather than
+one copy per commit. Werksfeer automatically removes caches that have not been
+warmed or restored for 30 days. Set `cache.retention_days = 0` to disable this
+housekeeping or choose another number of days. `werksfeer cache clean` safely
+removes only the current repository's cache; the next warm recreates it.
 
 The defaults warm Rails dependencies, Python dependencies, Node dependencies,
 and both dev and test Elixir dependencies/builds. The configured
@@ -128,7 +134,6 @@ cache-specific command that does not provision a database:
 
 ```toml
 [cache]
-auto_warm = true
 # Auto-detected from origin/HEAD, then origin/main or origin/master.
 # ref = "origin/main"
 command = "make warm-cache"
@@ -446,8 +451,10 @@ template_retention = 3
 
 [cache]
 # Keep a private dependency/build cache at the remote default ref.
-# A ready cache is reused even when automatic refreshing is disabled.
-auto_warm = false
+# Warming and compatible-cache reuse are automatic by default.
+auto_warm = true
+# Automatically remove caches unused for this many days; 0 disables pruning.
+retention_days = 30
 # ref = "origin/main"
 # Optional full override; it should prepare dependencies/builds without a DB.
 # command = "make warm-cache"

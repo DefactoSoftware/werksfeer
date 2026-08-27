@@ -1572,6 +1572,7 @@ Environment:
   WERKSFEER_DEBUG=1         Enable debug logging
   WERKSFEER_POSTGRES=false Disable private PostgreSQL for this shell
   WERKSFEER_CACHE_AUTO_WARM=true|false Override automatic cache warming
+  WERKSFEER_CACHE_RETENTION_DAYS=N Override unused-cache retention (0 disables)
   WERKSFEER_LIB_DIR=PATH    Override the service module directory
 
 Werksfeer reads .worktree.toml, then overlays ignored .worktree.local.toml

@@ -4,6 +4,7 @@ setup() {
   export TEST_ROOT
   TEST_ROOT="$(mktemp -d "${BATS_TMPDIR}/werksfeer.XXXXXX")"
   export XDG_DATA_HOME="${TEST_ROOT}/xdg"
+  export XDG_CACHE_HOME="${TEST_ROOT}/cache"
   export WERKSFEER_LIB_DIR="${BATS_TEST_DIRNAME}/../lib/werksfeer"
   WERKSFEER="${BATS_TEST_DIRNAME}/../werksfeer"
 
@@ -31,6 +32,11 @@ enabled = ["postgres"]
 
 [database]
 base_name = "example"
+
+[cache]
+# Most tests exercise the legacy main-checkout path in isolation. Tests for
+# managed caches replace this fixture and verify the default-on behavior.
+auto_warm = false
 
 [setup]
 command = "true"
@@ -504,13 +510,13 @@ EOF_LOCAL_CONFIG
   [ "$(cat "${cache_root}/checkout/node_modules/example/value")" = "cache package" ]
 }
 
-@test "opt-in automatic warming prepares the cache during worktree setup" {
+@test "worktree setup warms automatically and prunes abandoned caches" {
   fake_bin="${TEST_ROOT}/automatic-cache-bin"
   mkdir -p "$fake_bin"
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
 [cache]
 ref = "HEAD"
-auto_warm = true
+retention_days = 1
 command = "mkdir -p _build/dev && printf 'automatic cache' > _build/dev/value"
 
 [setup]
@@ -519,6 +525,11 @@ EOF_CONFIG
   git -C "$MAIN_REPO" add .worktree.toml
   git -C "$MAIN_REPO" commit -qm "enable automatic cache warming"
   git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  stale_cache="${XDG_CACHE_HOME}/werksfeer/build-caches/abandoned-cache"
+  mkdir -p "$stale_cache"
+  printf '%s\n' "${TEST_ROOT}/missing-repository" > "${stale_cache}/OWNER"
+  touch -t 202001010000 "${stale_cache}/OWNER"
 
   cat > "${fake_bin}/elixir" <<'EOF_ELIXIR'
 #!/usr/bin/env bash
@@ -529,9 +540,34 @@ EOF_ELIXIR
   run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
   [[ "$output" == *"Warming elixir build cache"* ]]
+  [[ "$output" == *"Pruning managed build cache unused for more than 1 days"* ]]
   [[ "$output" == *"Using managed build cache"* ]]
   [ "$(cat "${WORKTREE_ONE}/_build/dev/value")" = "automatic cache" ]
+  [ ! -e "$stale_cache" ]
   [ -z "$(git -C "$MAIN_REPO" status --porcelain --untracked-files=all)" ]
+}
+
+@test "repositories can opt out of automatic cache warming" {
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+auto_warm = false
+command = "mkdir -p _build/dev && printf 'should not exist' > _build/dev/value"
+
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "disable automatic cache warming"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Warming elixir build cache"* ]]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ready=false"* ]]
 }
 
 @test "managed cache follows the latest remote default ref without updating main" {
@@ -748,6 +784,9 @@ defmodule Example.Changed do
 end
 EOF_CHANGED
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+auto_warm = false
+
 [setup]
 command = "mix compile"
 EOF_CONFIG
@@ -882,7 +921,8 @@ EOF_CONFIG
   printf 'build\n' > "${MAIN_REPO}/_build/dev/value"
   printf 'dependency\n' > "${MAIN_REPO}/deps/example/value"
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
-# Use framework defaults without a custom setup command.
+[cache]
+auto_warm = false
 EOF_CONFIG
   git -C "$MAIN_REPO" add .worktree.toml
   git -C "$MAIN_REPO" commit -qm "use automatic setup"
@@ -943,6 +983,9 @@ printf 'npm:%s\n' "$*" >> "$COMMAND_LOG"
 EOF_NPM
   chmod +x "${fake_bin}/mix" "${fake_bin}/npm"
   cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+auto_warm = false
+
 [setup]
 node_install = "npm install"
 
@@ -992,6 +1035,9 @@ enabled = ["postgres"]
 
 [database]
 base_name = "rails_example"
+
+[cache]
+auto_warm = false
 EOF_CONFIG
   git -C "$rails_main" add Gemfile bin/rails config/database.yml .worktree.toml
   git -C "$rails_main" commit -qm initial
