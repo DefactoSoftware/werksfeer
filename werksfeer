@@ -285,17 +285,35 @@ detect_project_type() {
 }
 
 load_project_configuration() {
-  local project_root="$1"
-  local main_path
+  local project_root main_path project_config main_local_config worktree_local_config
+  project_root="$(cd "$1" && pwd -P)"
   main_path="$(cd "$project_root" && get_main_worktree_path)"
 
   if [ -f "$project_root/.worktree.toml" ]; then
-    toml_parse "$project_root/.worktree.toml"
+    project_config="$project_root/.worktree.toml"
   elif [ -f "$main_path/.worktree.toml" ]; then
-    toml_parse "$main_path/.worktree.toml"
+    project_config="$main_path/.worktree.toml"
   else
     log_error "No .worktree.toml found for $project_root"
     return 1
+  fi
+
+  toml_parse "$project_config"
+
+  # Personal settings in the main checkout apply to all of its linked
+  # worktrees. A worktree-local file can override those settings one last time.
+  # Repositories should ignore this file so credentials and preferences remain
+  # local and do not make an otherwise reusable cache source appear dirty.
+  main_local_config="$main_path/.worktree.local.toml"
+  if [ -f "$main_local_config" ]; then
+    toml_parse "$main_local_config"
+    log_debug "Loaded local configuration from $main_local_config"
+  fi
+
+  worktree_local_config="$project_root/.worktree.local.toml"
+  if [ "$worktree_local_config" != "$main_local_config" ] && [ -f "$worktree_local_config" ]; then
+    toml_parse "$worktree_local_config"
+    log_debug "Loaded worktree-local configuration from $worktree_local_config"
   fi
 }
 
@@ -1373,7 +1391,8 @@ Environment:
   WERKSFEER_POSTGRES=false Disable private PostgreSQL for this shell
   WERKSFEER_LIB_DIR=PATH    Override the service module directory
 
-Werksfeer reads .worktree.toml from the project root for configuration.
+Werksfeer reads .worktree.toml, then overlays ignored .worktree.local.toml
+files from the main checkout and current worktree when present.
 See https://github.com/DefactoSoftware/werksfeer for details.
 EOF_USAGE
 }

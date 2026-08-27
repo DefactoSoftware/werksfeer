@@ -300,8 +300,24 @@ werksfeer postgres template-status
 ```
 
 `werksfeer --cleanup` stops configured services before releasing allocations.
-Set `WERKSFEER_POSTGRES=false` to opt one worktree out, or `true` to run the
+Set `WERKSFEER_POSTGRES=false` to opt out for one process, or `true` to run the
 configured service from a main checkout.
+
+For a persistent per-developer preference, ignore `.worktree.local.toml` and
+create it in the main checkout:
+
+```toml
+[postgres]
+enabled = false
+```
+
+The main checkout's local file applies to every linked worktree on that
+machine. An optional `.worktree.local.toml` inside one worktree overrides the
+main preference for that worktree. An explicit `WERKSFEER_POSTGRES` environment
+variable has the highest precedence. When disabled, Werksfeer neither starts a
+private cluster nor emits socket variables, so the application retains its
+normal TCP database configuration. Disabled services also skip their tooling
+and extension checks during `services doctor`.
 
 ## Port and Redis allocation
 
@@ -343,6 +359,8 @@ test_suffix = "_test"
 enabled = ["postgres"]
 
 [postgres]
+# Personal overrides can set this in ignored .worktree.local.toml.
+# enabled = false
 # Worktree-relative durable cluster path (default: .pg_data)
 data_dir = ".pg_data"
 # Short parent for Unix sockets (default: /tmp)

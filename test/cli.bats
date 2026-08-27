@@ -22,6 +22,7 @@ setup() {
 /deps
 /node_modules
 /priv/static
+.worktree.local.toml
 .envrc
 EOF_GITIGNORE
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
@@ -89,6 +90,51 @@ teardown() {
 
   [ "$status" -eq 0 ]
   [ -z "$output" ]
+}
+
+@test "main checkout local config opts all worktrees out of private PostgreSQL" {
+  cat > "${MAIN_REPO}/.worktree.local.toml" <<'EOF_LOCAL_CONFIG'
+[postgres]
+enabled = false
+EOF_LOCAL_CONFIG
+
+  run bash -c "cd \"$WORKTREE_ONE\" && \"$WERKSFEER\" services env"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=/usr/bin:/bin \"$WERKSFEER\" services doctor"
+  [ "$status" -eq 0 ]
+  [ "$output" = "enabled=false" ]
+}
+
+@test "worktree local config and environment can override the main preference" {
+  cat > "${MAIN_REPO}/.worktree.local.toml" <<'EOF_MAIN_CONFIG'
+[postgres]
+enabled = false
+EOF_MAIN_CONFIG
+  cat > "${WORKTREE_ONE}/.worktree.local.toml" <<'EOF_WORKTREE_CONFIG'
+[postgres]
+enabled = true
+EOF_WORKTREE_CONFIG
+
+  run bash -c "cd \"$WORKTREE_ONE\" && \"$WERKSFEER\" services env"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"DATABASE_SOCKET_DIR=/tmp/werksfeer-pg-"* ]]
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\" services env"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "invalid local PostgreSQL preferences fail clearly" {
+  cat > "${MAIN_REPO}/.worktree.local.toml" <<'EOF_LOCAL_CONFIG'
+[postgres]
+enabled = maybe
+EOF_LOCAL_CONFIG
+
+  run bash -c "cd \"$WORKTREE_ONE\" && \"$WERKSFEER\" services start"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"postgres.enabled must be true, false, 1, or 0"* ]]
 }
 
 @test "invalid PostgreSQL opt-out values fail clearly" {

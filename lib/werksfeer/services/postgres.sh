@@ -6,9 +6,10 @@
 
 postgres_setting_enabled() {
   local project_root="$1"
+  local configured
 
   case "${WERKSFEER_POSTGRES:-}" in
-    "") [ -f "${project_root}/.git" ] ;;
+    "") configured="$(toml_get "postgres" "enabled" "")" ;;
     1|true) return 0 ;;
     0|false) return 1 ;;
     *)
@@ -16,17 +17,29 @@ postgres_setting_enabled() {
       return 2
       ;;
   esac
+
+  case "$configured" in
+    "") [ -f "${project_root}/.git" ] ;;
+    1|true) return 0 ;;
+    0|false) return 1 ;;
+    *)
+      log_error "postgres.enabled must be true, false, 1, or 0"
+      return 2
+      ;;
+  esac
 }
 
 postgres_enabled_value() {
   local project_root="$1"
+  local status
 
   if postgres_setting_enabled "$project_root"; then
     printf 'true\n'
     return 0
+  else
+    status=$?
   fi
 
-  local status=$?
   [ "$status" -eq 1 ] || return "$status"
   printf 'false\n'
 }
@@ -864,6 +877,11 @@ werksfeer_service_postgres_doctor() {
   local project_root="$1"
   local enabled
   enabled="$(postgres_enabled_value "$project_root")" || return $?
+
+  if [ "$enabled" = "false" ]; then
+    printf 'enabled=false\n'
+    return 0
+  fi
 
   postgres_load_tools
   postgres_check_required_extensions

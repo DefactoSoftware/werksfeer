@@ -96,6 +96,20 @@ If your project symlinks `node_modules`, update `.gitignore` to match symlinks t
 
 A trailing `/` only matches directories, not symlinks.
 
+Also ignore `.worktree.local.toml`. Werksfeer loads this personal file from the
+main checkout after the committed `.worktree.toml`, then loads a current
+worktree copy if one exists. This provides machine-wide and one-worktree
+overrides without changing team configuration. For example, a developer using
+an existing PostgreSQL server over TCP can set:
+
+```toml
+[postgres]
+enabled = false
+```
+
+`WERKSFEER_POSTGRES=true` or `false` remains the highest-precedence temporary
+override.
+
 ## Elixir / Phoenix
 
 ### 1. Port
