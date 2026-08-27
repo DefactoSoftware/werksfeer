@@ -360,8 +360,12 @@ skip = ["tmp"]
 [setup]
 # Override setup command
 command = "make setup"
+# Override only the detected Node package-manager install command
+node_install = "npm install"
 
 [hooks]
+# Run after framework dependencies are installed/compiled, before DB setup
+post_dependencies = "npm run-script build"
 # Run after setup completes
 post_setup = "echo done"
 ```

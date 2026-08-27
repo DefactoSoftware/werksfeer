@@ -822,30 +822,71 @@ install_node_dependencies() {
   fi
 
   local pm_cmd
-  pm_cmd="$(detect_node_pm "$(pwd)")"
+  pm_cmd="$(toml_get "setup" "node_install" "")"
+  [ -z "$pm_cmd" ] && pm_cmd="$(detect_node_pm "$(pwd)")"
   log_step "Running $pm_cmd"
   run_shell_in_project_environment "$pm_cmd"
 }
 
-run_setup_command() {
+run_post_dependencies_hook() {
+  local hook
+  hook="$(toml_get "hooks" "post_dependencies" "")"
+  [ -z "$hook" ] && return 0
+
+  log_step "Running post-dependencies hook"
+  run_shell_in_project_environment "$hook"
+}
+
+run_dependency_setup() {
   local project_type="$1"
-  local worktree_root="$2"
-
-  # Check for TOML override
-  local custom_cmd
-  custom_cmd="$(toml_get "setup" "command" "")"
-
-  if [ -n "$custom_cmd" ]; then
-    log_step "Running custom setup: $custom_cmd"
-    run_shell_in_project_environment "$custom_cmd"
-    return
-  fi
 
   case "$project_type" in
     rails)
       log_step "Running bundle install"
       run_in_project_environment bundle install
       install_node_dependencies
+      ;;
+    elixir)
+      log_step "Running mix deps.get"
+      run_in_project_environment mix deps.get
+      log_step "Running mix deps.get for test"
+      run_in_project_environment env MIX_ENV=test mix deps.get
+      # Compile dependencies as their own phase before Ecto implicitly compiles
+      # and loads the application. This is particularly important for native
+      # dependencies backed by Make/CMake and Git submodules.
+      log_step "Running mix deps.compile"
+      run_in_project_environment mix deps.compile
+      log_step "Running mix compile"
+      run_in_project_environment mix compile
+      install_node_dependencies
+      ;;
+    python)
+      if [ -f "pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
+        log_step "Running uv sync"
+        run_in_project_environment uv sync
+      elif [ -f "Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
+        log_step "Running pipenv install"
+        run_in_project_environment pipenv install
+      elif [ -f "requirements.txt" ]; then
+        log_step "Running pip install -r requirements.txt"
+        run_in_project_environment pip install -r requirements.txt
+      fi
+      ;;
+    node)
+      install_node_dependencies
+      ;;
+    *)
+      log_info "Unknown project type, no dependency setup to run"
+      ;;
+  esac
+}
+
+run_database_setup() {
+  local project_type="$1"
+  local worktree_root="$2"
+
+  case "$project_type" in
+    rails)
       if [ -x "bin/rails" ]; then
         log_step "Running bin/rails db:prepare"
         run_in_project_environment bin/rails db:prepare
@@ -854,11 +895,6 @@ run_setup_command() {
       fi
       ;;
     elixir)
-      log_step "Running mix deps.get"
-      run_in_project_environment mix deps.get
-      log_step "Running mix deps.get for test"
-      run_in_project_environment env MIX_ENV=test mix deps.get
-      install_node_dependencies
 
       # Private clusters start empty and migrations remain application-owned.
       # Shared clones already contain the source database's schema and data.
@@ -886,25 +922,26 @@ run_setup_command() {
         log_info "Databases already cloned, skipping mix ecto.setup"
       fi
       ;;
-    python)
-      if [ -f "pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
-        log_step "Running uv sync"
-        run_in_project_environment uv sync
-      elif [ -f "Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
-        log_step "Running pipenv install"
-        run_in_project_environment pipenv install
-      elif [ -f "requirements.txt" ]; then
-        log_step "Running pip install -r requirements.txt"
-        run_in_project_environment pip install -r requirements.txt
-      fi
-      ;;
-    node)
-      install_node_dependencies
-      ;;
-    *)
-      log_info "Unknown project type, no setup command to run"
-      ;;
   esac
+}
+
+run_setup_command() {
+  local project_type="$1"
+  local worktree_root="$2"
+
+  # A custom command retains its historical full-override behavior.
+  local custom_cmd
+  custom_cmd="$(toml_get "setup" "command" "")"
+
+  if [ -n "$custom_cmd" ]; then
+    log_step "Running custom setup: $custom_cmd"
+    run_shell_in_project_environment "$custom_cmd"
+    return
+  fi
+
+  run_dependency_setup "$project_type"
+  run_post_dependencies_hook
+  run_database_setup "$project_type" "$worktree_root"
 }
 
 # ---------------------------------------------------------------------------

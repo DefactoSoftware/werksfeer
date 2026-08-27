@@ -158,6 +158,44 @@ teardown() {
   grep -q 'werksfeer services start' "${WORKTREE_ONE}/.envrc"
 }
 
+@test "Elixir setup compiles dependencies before app, assets, and database" {
+  fake_bin="${TEST_ROOT}/elixir-bin"
+  command_log="${TEST_ROOT}/elixir-commands.log"
+  mkdir -p "$fake_bin"
+  cat > "${fake_bin}/mix" <<'EOF_MIX'
+#!/usr/bin/env bash
+printf 'mix:%s:%s\n' "${MIX_ENV:-dev}" "$*" >> "$COMMAND_LOG"
+EOF_MIX
+  cat > "${fake_bin}/npm" <<'EOF_NPM'
+#!/usr/bin/env bash
+printf 'npm:%s\n' "$*" >> "$COMMAND_LOG"
+EOF_NPM
+  chmod +x "${fake_bin}/mix" "${fake_bin}/npm"
+  cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_CONFIG'
+[setup]
+node_install = "npm install"
+
+[hooks]
+post_dependencies = "npm run-script build"
+EOF_CONFIG
+  printf '{"scripts":{"build":"true"}}\n' > "${WORKTREE_ONE}/package.json"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+
+  expected="${TEST_ROOT}/expected-elixir-commands.log"
+  cat > "$expected" <<'EOF_EXPECTED'
+mix:dev:deps.get
+mix:test:deps.get
+mix:dev:deps.compile
+mix:dev:compile
+npm:install
+npm:run-script build
+mix:dev:ecto.setup
+EOF_EXPECTED
+  diff -u "$expected" "$command_log"
+}
+
 @test "Rails setup writes development and test dotenv files" {
   rails_main="${TEST_ROOT}/rails-app"
   rails_worktree="${TEST_ROOT}/worktrees/rails"
