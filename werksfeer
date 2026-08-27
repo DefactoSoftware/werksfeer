@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2001 # sed expressions below use regular expressions intentionally.
 # werksfeer - Universal git worktree setup tool
 # https://github.com/DefactoSoftware/werksfeer
 #
 # Compatible with bash 3.2+ (macOS default), bash 5.x, and called from zsh/fish.
-# Requires: git, optionally psql for database cloning.
+# Requires: git, optionally PostgreSQL tools for database cloning/services.
 
 set -euo pipefail
 
-WERKSFEER_VERSION="0.1.0"
+WERKSFEER_VERSION="0.2.0"
+
+WERKSFEER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -18,6 +21,29 @@ log_warn()  { echo "[werksfeer] WARNING: $*" >&2; }
 log_error() { echo "[werksfeer] ERROR: $*" >&2; }
 log_debug() { [ "${WERKSFEER_DEBUG:-0}" = "1" ] && echo "[werksfeer] DEBUG: $*" >&2 || true; }
 log_step()  { echo "[werksfeer] ==> $*" >&2; }
+
+load_werksfeer_modules() {
+  local lib_dir="${WERKSFEER_LIB_DIR:-}"
+
+  if [ -z "$lib_dir" ] && [ -f "${WERKSFEER_SCRIPT_DIR}/lib/werksfeer/services.sh" ]; then
+    lib_dir="${WERKSFEER_SCRIPT_DIR}/lib/werksfeer"
+  fi
+
+  if [ -z "$lib_dir" ]; then
+    lib_dir="${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/lib"
+  fi
+
+  if [ ! -f "${lib_dir}/services.sh" ] || [ ! -f "${lib_dir}/services/postgres.sh" ]; then
+    log_error "Werksfeer service modules were not found in $lib_dir"
+    log_info "Reinstall werksfeer with install.sh or set WERKSFEER_LIB_DIR"
+    return 1
+  fi
+
+  # shellcheck source=/dev/null
+  source "${lib_dir}/services.sh"
+  # shellcheck source=/dev/null
+  source "${lib_dir}/services/postgres.sh"
+}
 
 # ---------------------------------------------------------------------------
 # Minimal TOML parser
@@ -258,6 +284,43 @@ detect_project_type() {
   echo "unknown"
 }
 
+load_project_configuration() {
+  local project_root main_path project_config main_local_config worktree_local_config
+  project_root="$(cd "$1" && pwd -P)"
+  main_path="$(cd "$project_root" && get_main_worktree_path)"
+
+  if [ -f "$project_root/.worktree.toml" ]; then
+    project_config="$project_root/.worktree.toml"
+  elif [ -f "$main_path/.worktree.toml" ]; then
+    project_config="$main_path/.worktree.toml"
+  else
+    log_error "No .worktree.toml found for $project_root"
+    return 1
+  fi
+
+  toml_parse "$project_config"
+
+  # Personal settings in the main checkout apply to all of its linked
+  # worktrees. A worktree-local file can override those settings one last time.
+  # Repositories should ignore this file so credentials and preferences remain
+  # local and do not make an otherwise reusable cache source appear dirty.
+  main_local_config="$main_path/.worktree.local.toml"
+  if [ -f "$main_local_config" ]; then
+    toml_parse "$main_local_config"
+    log_debug "Loaded local configuration from $main_local_config"
+  fi
+
+  worktree_local_config="$project_root/.worktree.local.toml"
+  if [ "$worktree_local_config" != "$main_local_config" ] && [ -f "$worktree_local_config" ]; then
+    toml_parse "$worktree_local_config"
+    log_debug "Loaded worktree-local configuration from $worktree_local_config"
+  fi
+}
+
+current_project_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Default directories to symlink per project type (large, identical across worktrees)
 # ---------------------------------------------------------------------------
@@ -282,7 +345,7 @@ default_copy_dirs() {
       printf '%s\n' .bundle tmp/cache
       ;;
     elixir)
-      printf '%s\n' _build deps
+      printf '%s\n' _build deps priv/static
       ;;
     python)
       printf '%s\n' .venv __pycache__ .mypy_cache .pytest_cache .ruff_cache
@@ -361,6 +424,11 @@ sync_symlink_dirs() {
   [ -z "$symlink_dirs" ] && symlink_dirs="$(default_symlink_dirs "$project_type")"
   [ -z "$symlink_dirs" ] && return 0
 
+  if ! reusable_worktree_cache "$main_path" "$worktree_path"; then
+    log_info "Skip shared directories (main checkout is not an exact, clean cache source)"
+    return 0
+  fi
+
   local skip_dirs
   skip_dirs="$(toml_get_array "sync" "skip")"
 
@@ -398,6 +466,108 @@ sync_symlink_dirs() {
   done
 }
 
+git_checkout_is_clean() {
+  [ -z "$(git -C "$1" status --porcelain --untracked-files=all 2>/dev/null)" ]
+}
+
+reusable_worktree_cache() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local main_revision worktree_revision
+
+  main_revision="$(git -C "$main_path" rev-parse HEAD 2>/dev/null)" || return 1
+  worktree_revision="$(git -C "$worktree_path" rev-parse HEAD 2>/dev/null)" || return 1
+
+  [ "$main_revision" = "$worktree_revision" ] || return 1
+  git_checkout_is_clean "$main_path" || return 1
+  git_checkout_is_clean "$worktree_path" || return 1
+}
+
+copy_tree() {
+  local source="$1"
+  local destination="$2"
+
+  [ -d "$source" ] || return 1
+  [ ! -e "$destination" ] || {
+    log_error "Refusing to overwrite cache copy destination: $destination"
+    return 1
+  }
+
+  mkdir -p "$(dirname "$destination")"
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # clonefile-backed copies are copy-on-write on APFS.
+    if cp -cR "$source" "$destination" 2>/dev/null; then
+      return 0
+    fi
+  elif cp --reflink=auto -a "$source" "$destination" 2>/dev/null; then
+    return 0
+  fi
+
+  [ ! -e "$destination" ] || {
+    log_error "Copy-on-write cache copy left a partial destination: $destination"
+    return 1
+  }
+
+  cp -Rp "$source" "$destination"
+}
+
+remove_relocated_cmake_state() {
+  local deps_path="$1"
+  [ -d "$deps_path" ] || return 0
+
+  # CMakeCache.txt contains absolute paths from the source checkout. Keeping it
+  # makes a later native dependency rebuild fail after the tree is relocated.
+  find "$deps_path" -type f -name CMakeCache.txt -delete
+
+  find "$deps_path" -type d -name CMakeFiles -prune | while IFS= read -r cmake_dir; do
+    [ -z "$cmake_dir" ] && continue
+    find "$cmake_dir" -depth -delete
+  done
+}
+
+sync_tracked_file_times() {
+  local main_path="$1"
+  local worktree_path="$2"
+
+  # Mix compiler manifests record source mtimes. An exact Git checkout has the
+  # same contents but newly-created file times, which otherwise makes every
+  # module stale. Mirror only tracked regular files from the validated source.
+  # Use one Elixir VM instead of spawning `touch` once per source file; large
+  # Phoenix applications can contain thousands of tracked files.
+  git -C "$main_path" ls-files -z |
+    WERKSFEER_MTIME_SOURCE="$main_path" WERKSFEER_MTIME_TARGET="$worktree_path" \
+      elixir -e '
+        source = System.fetch_env!("WERKSFEER_MTIME_SOURCE")
+        target = System.fetch_env!("WERKSFEER_MTIME_TARGET")
+
+        IO.binread(:stdio, :eof)
+        |> :binary.split(<<0>>, [:global])
+        |> Enum.each(fn
+          "" ->
+            :ok
+
+          relative_path ->
+            source_file = Path.join(source, relative_path)
+            target_file = Path.join(target, relative_path)
+
+            with {:ok, stat} <- File.stat(source_file, time: :posix),
+                 true <- File.regular?(target_file) do
+              File.touch!(target_file, stat.mtime)
+            end
+        end)
+      '
+}
+
+refresh_relocated_elixir_cache() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local deps_path="$worktree_path/deps"
+
+  remove_relocated_cmake_state "$deps_path"
+  sync_tracked_file_times "$main_path" "$worktree_path"
+}
+
 copy_build_dirs() {
   local main_path="$1"
   local worktree_path="$2"
@@ -408,10 +578,16 @@ copy_build_dirs() {
   [ -z "$copy_dirs" ] && copy_dirs="$(default_copy_dirs "$project_type")"
   [ -z "$copy_dirs" ] && return 0
 
+  if ! reusable_worktree_cache "$main_path" "$worktree_path"; then
+    log_info "Skip build cache (main checkout is not the exact, clean worktree revision)"
+    return 0
+  fi
+
   local skip_dirs
   skip_dirs="$(toml_get_array "sync" "skip")"
+  local copied_elixir_build=false
 
-  echo "$copy_dirs" | while IFS= read -r dir; do
+  while IFS= read -r dir; do
     [ -z "$dir" ] && continue
 
     # Check skip list
@@ -436,9 +612,19 @@ copy_build_dirs() {
     parent="$(dirname "$dst")"
     [ ! -d "$parent" ] && mkdir -p "$parent"
 
-    cp -R "$src" "$dst"
+    copy_tree "$src" "$dst"
     log_info "Copied $dir"
-  done
+    if [ "$project_type" = "elixir" ] && [ "$dir" = "_build" ]; then
+      copied_elixir_build=true
+    fi
+  done <<EOF_COPY_DIRS
+$copy_dirs
+EOF_COPY_DIRS
+
+  if [ "$copied_elixir_build" = true ]; then
+    refresh_relocated_elixir_cache "$main_path" "$worktree_path"
+    WERKSFEER_REUSED_ELIXIR_BUILD=1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -535,6 +721,33 @@ clone_databases() {
 
 }
 
+use_private_postgres_cluster() {
+  service_enabled "postgres"
+}
+
+set_private_cluster_database_names() {
+  local project_type="$1"
+  local db_names
+
+  db_names="$(get_base_db_names "$project_type")" || return 0
+  NEW_DEV_DB="$(echo "$db_names" | awk '{print $1}')"
+  NEW_TEST_DB="$(echo "$db_names" | awk '{print $2}')"
+}
+
+setup_databases() {
+  local project_type="$1"
+  local project_root="$2"
+
+  if use_private_postgres_cluster; then
+    set_private_cluster_database_names "$project_type"
+    run_service_action "postgres" "template_hydrate" "$project_root" "$project_type"
+    run_services_action "prepare" "$project_root"
+    export WERKSFEER_SERVICES_READY=1
+  else
+    clone_databases "$project_type"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Environment overrides (DB names, ports, Redis)
 # ---------------------------------------------------------------------------
@@ -556,20 +769,77 @@ default_redis_url() {
   esac
 }
 
+format_env_assignments() {
+  local prefix="$1"
+  local assignments="$2"
+  local key value
+
+  while IFS='=' read -r key value; do
+    [ -z "$key" ] && continue
+    printf '%s%s="%s"\n' "$prefix" "$key" "$value"
+  done <<EOF_ASSIGNMENTS
+$assignments
+EOF_ASSIGNMENTS
+}
+
+write_managed_env_block() {
+  local envfile="$1"
+  local contents="$2"
+  local start_marker="# >>> werksfeer managed environment >>>"
+  local end_marker="# <<< werksfeer managed environment <<<"
+  local tmp="${envfile}.werksfeer.$$"
+
+  (umask 077 && : > "$tmp")
+
+  if [ -f "$envfile" ]; then
+    awk -v start="$start_marker" -v finish="$end_marker" '
+      $0 == start { managed = 1; next }
+      $0 == finish { managed = 0; next }
+      !managed { print }
+    ' "$envfile" > "$tmp"
+
+    local mode
+    if mode="$(stat -f '%Lp' "$envfile" 2>/dev/null)"; then
+      chmod "$mode" "$tmp"
+    elif mode="$(stat -c '%a' "$envfile" 2>/dev/null)"; then
+      chmod "$mode" "$tmp"
+    fi
+  fi
+
+  {
+    printf '\n%s\n' "$start_marker"
+    printf '%s\n' "$contents"
+    printf '%s\n' "$end_marker"
+  } >> "$tmp"
+
+  mv "$tmp" "$envfile"
+  log_info "Wrote managed environment to $envfile"
+}
+
+managed_shell_environment() {
+  local assignments="$1"
+
+  format_env_assignments "export " "$assignments"
+
+  if [ -n "$(service_names)" ]; then
+    cat <<'EOF_SERVICE_START'
+
+# Keep worktree services available when a new interactive shell enters here.
+if [ "${WERKSFEER_SERVICES_READY:-0}" != "1" ] && command -v werksfeer >/dev/null 2>&1; then
+  werksfeer services start
+  export WERKSFEER_SERVICES_READY=1
+fi
+EOF_SERVICE_START
+  fi
+}
+
 write_env_overrides() {
   local project_type="$1"
-  local wt_name
+  local worktree_root="$2"
+  local wt_name project_root existing base_redis
   wt_name="$(get_worktree_name)"
-  local project_root
   project_root="$(get_main_worktree_path)"
-
-  local marker="# Worktree overrides (added by werksfeer)"
-
-  # Check for existing allocation (idempotent)
-  local existing
   existing="$(lookup_allocation "$project_root" "$wt_name")"
-
-  local base_redis
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
 
   local wt_port redis_db redis_port=""
@@ -585,7 +855,6 @@ write_env_overrides() {
     redis_db="$(allocate_redis_db "$project_root")"
   fi
 
-  # Allocate Redis port if not yet assigned (new worktree or old-format allocation)
   if [ -n "$base_redis" ] && [ -z "$redis_port" ]; then
     local base_redis_port
     base_redis_port="$(echo "$base_redis" | grep -oE ':[0-9]+' | tail -1 | tr -d ':')"
@@ -597,7 +866,6 @@ write_env_overrides() {
     register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
   fi
 
-  # Build Redis URL (if applicable)
   local wt_redis=""
   if [ -n "$base_redis" ]; then
     local base_stripped
@@ -609,74 +877,44 @@ write_env_overrides() {
     fi
   fi
 
-  # DB names (set by clone_databases)
   local dev_db="${NEW_DEV_DB:-}"
   local test_db="${NEW_TEST_DB:-}"
+  local service_env
+  service_env="$(services_environment "$worktree_root")"
+
+  local common_assignments="PORT=${wt_port}"
+  [ -n "$wt_redis" ] && common_assignments="${common_assignments}
+REDIS_URL=${wt_redis}"
+  [ -n "$redis_port" ] && common_assignments="${common_assignments}
+REDIS_PORT=${redis_port}"
+  [ -n "$dev_db" ] && common_assignments="${common_assignments}
+DATABASE_NAME=${dev_db}"
+  [ -n "$test_db" ] && common_assignments="${common_assignments}
+TEST_DATABASE_NAME=${test_db}"
+  [ -n "$service_env" ] && common_assignments="${common_assignments}
+${service_env}"
 
   case "$project_type" in
     rails)
-      # .env.local is loaded by dotenv-rails in development but NOT in test.
-      # .env.test.local IS loaded in test. Write to both.
-      local envfile=".env.local"
-      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
-        log_info "$envfile already has overrides, skipping"
-      else
-        {
-          echo ""
-          echo "$marker"
-          echo "PORT=\"${wt_port}\""
-          [ -n "$wt_redis" ] && echo "REDIS_URL=\"${wt_redis}\""
-          [ -n "$redis_port" ] && echo "REDIS_PORT=\"${redis_port}\""
-          [ -n "$dev_db" ] && echo "DATABASE_NAME=\"${dev_db}\""
-          [ -n "$test_db" ] && echo "TEST_DATABASE_NAME=\"${test_db}\""
-        } >> "$envfile"
-        log_info "Wrote overrides to $envfile"
-      fi
+      write_managed_env_block ".env.local" "$(format_env_assignments "" "$common_assignments")"
 
-      local testenvfile=".env.test.local"
-      if [ -f "$testenvfile" ] && grep -qF "$marker" "$testenvfile"; then
-        log_info "$testenvfile already has overrides, skipping"
-      else
-        {
-          echo ""
-          echo "$marker"
-          [ -n "$test_db" ] && echo "TEST_DATABASE_NAME=\"${test_db}\""
-        } >> "$testenvfile"
-        log_info "Wrote overrides to $testenvfile"
-      fi
-      ;;
-    elixir)
-      local envfile=".envrc"
-      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
-        log_info "$envfile already has overrides, skipping"
-      else
-        {
-          echo ""
-          echo "$marker"
-          echo "export PORT=\"${wt_port}\""
-          [ -n "$dev_db" ] && echo "export DATABASE_NAME=\"${dev_db}\""
-          [ -n "$test_db" ] && echo "export TEST_DATABASE_NAME=\"${test_db}\""
-        } >> "$envfile"
-        if command -v direnv >/dev/null 2>&1; then
-          direnv allow . 2>/dev/null || true
-        fi
-        log_info "Wrote overrides to $envfile"
-      fi
+      local test_assignments=""
+      [ -n "$test_db" ] && test_assignments="TEST_DATABASE_NAME=${test_db}"
+      [ -n "$service_env" ] && test_assignments="${test_assignments}
+${service_env}"
+      write_managed_env_block ".env.test.local" "$(format_env_assignments "" "$test_assignments")"
       ;;
     python|node)
-      local envfile=".env"
-      if [ -f "$envfile" ] && grep -qF "$marker" "$envfile"; then
-        log_info "$envfile already has overrides, skipping"
-      else
-        {
-          echo ""
-          echo "$marker"
-          echo "PORT=\"${wt_port}\""
-        } >> "$envfile"
-        log_info "Wrote overrides to $envfile"
-      fi
+      write_managed_env_block ".env" "$(format_env_assignments "" "$common_assignments")"
       ;;
   esac
+
+  # Every framework gets the same shell contract. Framework-specific dotenv
+  # files above remain available for processes that load them themselves.
+  write_managed_env_block ".envrc" "$(managed_shell_environment "$common_assignments")"
+  if command -v direnv >/dev/null 2>&1; then
+    direnv allow . 2>/dev/null || true
+  fi
 
   log_info "Port: ${wt_port}"
   if [ -n "$wt_redis" ]; then
@@ -693,66 +931,159 @@ detect_node_pm() {
   if [ -f "$root/bun.lockb" ] || [ -f "$root/bun.lock" ]; then echo "bun install --frozen-lockfile"
   elif [ -f "$root/pnpm-lock.yaml" ]; then echo "pnpm install --frozen-lockfile"
   elif [ -f "$root/yarn.lock" ]; then echo "yarn install --frozen-lockfile"
-  else echo "npm ci"
+  elif [ -f "$root/package-lock.json" ] || [ -f "$root/npm-shrinkwrap.json" ]; then echo "npm ci"
+  else echo "npm install"
   fi
+}
+
+run_in_project_environment() {
+  if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
+    direnv exec . "$@"
+  else
+    "$@"
+  fi
+}
+
+run_shell_in_project_environment() {
+  local command="$1"
+
+  if command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; then
+    direnv exec . /bin/bash -c "$command"
+  else
+    /bin/bash -c "$command"
+  fi
+}
+
+install_node_dependencies() {
+  [ -f "package.json" ] || return 0
+
+  if [ -L "node_modules" ]; then
+    log_info "Shared node_modules is already linked, skipping package installation"
+    return 0
+  fi
+
+  local pm_cmd
+  pm_cmd="$(toml_get "setup" "node_install" "")"
+  [ -z "$pm_cmd" ] && pm_cmd="$(detect_node_pm "$(pwd)")"
+  log_step "Running $pm_cmd"
+  run_shell_in_project_environment "$pm_cmd"
+}
+
+run_post_dependencies_hook() {
+  local hook
+  hook="$(toml_get "hooks" "post_dependencies" "")"
+  [ -z "$hook" ] && return 0
+
+  log_step "Running post-dependencies hook"
+  run_shell_in_project_environment "$hook"
+}
+
+run_dependency_setup() {
+  local project_type="$1"
+
+  case "$project_type" in
+    rails)
+      log_step "Running bundle install"
+      run_in_project_environment bundle install
+      install_node_dependencies
+      ;;
+    elixir)
+      if [ "${WERKSFEER_REUSED_ELIXIR_BUILD:-0}" = "1" ] &&
+          run_in_project_environment mix deps.loadpaths --no-compile >/dev/null 2>&1 &&
+          run_in_project_environment env MIX_ENV=test mix deps.loadpaths --no-compile >/dev/null 2>&1; then
+        log_info "Exact-revision Elixir dependencies are ready, skipping mix deps.get"
+      else
+        log_step "Running mix deps.get"
+        run_in_project_environment mix deps.get
+        log_step "Running mix deps.get for test"
+        run_in_project_environment env MIX_ENV=test mix deps.get
+      fi
+      log_step "Running mix compile"
+      run_in_project_environment mix compile
+      install_node_dependencies
+      ;;
+    python)
+      if [ -f "pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
+        log_step "Running uv sync"
+        run_in_project_environment uv sync
+      elif [ -f "Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
+        log_step "Running pipenv install"
+        run_in_project_environment pipenv install
+      elif [ -f "requirements.txt" ]; then
+        log_step "Running pip install -r requirements.txt"
+        run_in_project_environment pip install -r requirements.txt
+      fi
+      ;;
+    node)
+      install_node_dependencies
+      ;;
+    *)
+      log_info "Unknown project type, no dependency setup to run"
+      ;;
+  esac
+}
+
+run_database_setup() {
+  local project_type="$1"
+  local worktree_root="$2"
+
+  case "$project_type" in
+    rails)
+      if [ -x "bin/rails" ]; then
+        log_step "Running bin/rails db:prepare"
+        run_in_project_environment bin/rails db:prepare
+        log_step "Running bin/rails db:prepare for test"
+        run_in_project_environment env RAILS_ENV=test bin/rails db:prepare
+      fi
+      ;;
+    elixir)
+
+      # Private clusters start empty and migrations remain application-owned.
+      # Shared clones already contain the source database's schema and data.
+      if use_private_postgres_cluster; then
+        if postgres_setting_enabled "$worktree_root" &&
+            run_service_action "postgres" "database_exists" "$worktree_root" "$NEW_DEV_DB"; then
+          log_step "Migrating the private development database"
+          run_in_project_environment mix ecto.migrate
+        elif postgres_setting_enabled "$worktree_root"; then
+          log_step "Creating, migrating, and seeding the private development database"
+          run_in_project_environment mix ecto.setup
+        else
+          log_step "Creating and migrating the configured development database"
+          run_in_project_environment mix ecto.create --quiet
+          run_in_project_environment mix ecto.migrate
+        fi
+
+        log_step "Creating and migrating the private test database"
+        run_in_project_environment env MIX_ENV=test mix ecto.create --quiet
+        run_in_project_environment env MIX_ENV=test mix ecto.migrate --quiet
+      elif [ -z "${NEW_DEV_DB:-}" ]; then
+        log_step "Running mix ecto.setup"
+        run_in_project_environment mix ecto.setup
+      else
+        log_info "Databases already cloned, skipping mix ecto.setup"
+      fi
+      ;;
+  esac
 }
 
 run_setup_command() {
   local project_type="$1"
-  local main_path="$2"
+  local worktree_root="$2"
 
-  # Check for TOML override
+  # A custom command retains its historical full-override behavior.
   local custom_cmd
   custom_cmd="$(toml_get "setup" "command" "")"
 
   if [ -n "$custom_cmd" ]; then
     log_step "Running custom setup: $custom_cmd"
-    eval "$custom_cmd"
+    run_shell_in_project_environment "$custom_cmd"
     return
   fi
 
-  case "$project_type" in
-    rails)
-      log_step "Running bundle install"
-      bundle install
-      if [ -x "bin/rails" ]; then
-        log_step "Running bin/rails db:prepare"
-        bin/rails db:prepare
-      fi
-      ;;
-    elixir)
-      log_step "Running mix deps.get"
-      mix deps.get
-      # If we already cloned databases, skip ecto.setup
-      if [ -z "${NEW_DEV_DB:-}" ]; then
-        log_step "Running mix ecto.setup"
-        mix ecto.setup
-      else
-        log_info "Databases already cloned, skipping mix ecto.setup"
-      fi
-      ;;
-    python)
-      if [ -f "pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
-        log_step "Running uv sync"
-        uv sync
-      elif [ -f "Pipfile" ] && command -v pipenv >/dev/null 2>&1; then
-        log_step "Running pipenv install"
-        pipenv install
-      elif [ -f "requirements.txt" ]; then
-        log_step "Running pip install -r requirements.txt"
-        pip install -r requirements.txt
-      fi
-      ;;
-    node)
-      local pm_cmd
-      pm_cmd="$(detect_node_pm "$(pwd)")"
-      log_step "Running $pm_cmd"
-      eval "$pm_cmd"
-      ;;
-    *)
-      log_info "Unknown project type, no setup command to run"
-      ;;
-  esac
+  run_dependency_setup "$project_type"
+  run_post_dependencies_hook
+  run_database_setup "$project_type" "$worktree_root"
 }
 
 # ---------------------------------------------------------------------------
@@ -786,9 +1117,28 @@ cleanup_worktree() {
 
   log_step "Cleaning up worktree: $wt_name"
 
+  local project_root=""
+  local main_path=""
+  local private_postgres=false
+  if [ -d "$worktree_path" ] && (cd "$worktree_path" && is_git_repo); then
+    project_root="$(cd "$worktree_path" && current_project_root)"
+    main_path="$(cd "$project_root" && get_main_worktree_path)"
+
+    if load_project_configuration "$project_root"; then
+      if use_private_postgres_cluster; then
+        private_postgres=true
+      fi
+      run_services_action "cleanup" "$project_root"
+    fi
+  fi
+
   # Deregister port/redis allocation
-  deregister_allocation "$wt_name"
+  deregister_allocation "$wt_name" "$main_path"
   log_info "Released port/redis allocation"
+
+  if [ "$private_postgres" = true ]; then
+    return 0
+  fi
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
@@ -962,12 +1312,7 @@ run_setup() {
   log_info "Main:     $main_path"
   log_info "Worktree: $worktree_path"
 
-  # Parse .worktree.toml (check worktree first, then main)
-  if [ -f "$worktree_path/.worktree.toml" ]; then
-    toml_parse "$worktree_path/.worktree.toml"
-  elif [ -f "$main_path/.worktree.toml" ]; then
-    toml_parse "$main_path/.worktree.toml"
-  fi
+  load_project_configuration "$worktree_path"
 
   # Detect project type
   local project_type
@@ -989,24 +1334,33 @@ run_setup() {
   log_step "Copying build directories"
   copy_build_dirs "$main_path" "$worktree_path" "$project_type"
 
-  # Step 4: Clone databases
+  # Step 4: Provision databases/services
   log_step "Setting up databases"
-  clone_databases "$project_type"
+  setup_databases "$project_type" "$worktree_path"
 
   # Step 5: Write environment overrides (DB names, ports, Redis)
   log_step "Writing environment overrides"
-  write_env_overrides "$project_type"
+  write_env_overrides "$project_type" "$worktree_path"
 
   # Step 6: Run setup command
   log_step "Running setup"
-  run_setup_command "$project_type" "$main_path"
+  run_setup_command "$project_type" "$worktree_path"
+
+  # Publish only a cleanly stopped, fully prepared database whose HEAD exactly
+  # matches the configured remote template ref. Feature-branch state is never
+  # shared with unrelated worktrees.
+  if use_private_postgres_cluster; then
+    if ! run_service_action "postgres" "template_publish" "$worktree_path" "$project_type"; then
+      log_warn "PostgreSQL template publication failed; the worktree database remains usable"
+    fi
+  fi
 
   # Step 7: Post-setup hook from config
   local post_hook
   post_hook="$(toml_get "hooks" "post_setup" "")"
   if [ -n "$post_hook" ]; then
     log_step "Running post-setup hook"
-    eval "$post_hook"
+    run_shell_in_project_environment "$post_hook"
   fi
 
   log_step "Worktree setup complete!"
@@ -1023,16 +1377,22 @@ werksfeer - Universal git worktree setup
 Usage:
   werksfeer                  Setup the current worktree (run from inside a worktree)
   werksfeer --hook ...       Called from post-checkout git hook
-  werksfeer --cleanup [PATH]  Drop databases for a worktree (defaults to current directory)
+  werksfeer services COMMAND Manage configured worktree services
+  werksfeer postgres COMMAND Manage the PostgreSQL service directly
+  werksfeer exec COMMAND...  Run a command through the worktree's direnv environment
+  werksfeer --cleanup [PATH] Stop services and clean a worktree (defaults to current directory)
   werksfeer --prune          Drop orphaned worktree databases for current project
   werksfeer --prune-all      Drop orphaned worktree databases for all registered projects
   werksfeer --version        Print version
   werksfeer --help           Print this help
 
 Environment:
-  WERKSFEER_DEBUG=1      Enable debug logging
+  WERKSFEER_DEBUG=1         Enable debug logging
+  WERKSFEER_POSTGRES=false Disable private PostgreSQL for this shell
+  WERKSFEER_LIB_DIR=PATH    Override the service module directory
 
-Werksfeer reads .worktree.toml from the project root for configuration.
+Werksfeer reads .worktree.toml, then overlays ignored .worktree.local.toml
+files from the main checkout and current worktree when present.
 See https://github.com/DefactoSoftware/werksfeer for details.
 EOF_USAGE
 }
@@ -1085,6 +1445,49 @@ direct_mode() {
   run_setup
 }
 
+service_mode() {
+  local command="$1"
+  shift
+  local action="${1:-}"
+  [ "$#" -gt 0 ] && shift
+
+  if ! is_git_repo; then
+    log_error "Not inside a git repository"
+    return 1
+  fi
+
+  local project_root
+  project_root="$(current_project_root)"
+  load_project_configuration "$project_root"
+
+  if [ "$command" = "services" ]; then
+    services_cli "$action" "$project_root"
+  else
+    service_provider_cli "$command" "$action" "$project_root" "$@"
+  fi
+}
+
+exec_mode() {
+  shift
+  if [ "$#" -eq 0 ]; then
+    log_error "exec requires a command"
+    return 1
+  fi
+
+  if ! is_git_repo; then
+    log_error "Not inside a git repository"
+    return 1
+  fi
+
+  local project_root
+  project_root="$(current_project_root)"
+  load_project_configuration "$project_root"
+  run_services_action "start" "$project_root"
+  export WERKSFEER_SERVICES_READY=1
+
+  run_in_project_environment "$@"
+}
+
 main() {
   case "${1:-}" in
     --hook)
@@ -1101,6 +1504,15 @@ main() {
     --prune-all)
       prune_all
       ;;
+    services)
+      service_mode "$@"
+      ;;
+    postgres)
+      service_mode "$@"
+      ;;
+    exec)
+      exec_mode "$@"
+      ;;
     --version|-V)
       echo "werksfeer $WERKSFEER_VERSION"
       ;;
@@ -1113,4 +1525,5 @@ main() {
   esac
 }
 
+load_werksfeer_modules
 main "$@"

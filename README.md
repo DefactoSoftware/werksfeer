@@ -1,6 +1,6 @@
 # werksfeer
 
-Universal git worktree setup tool. Automatically provisions isolated development environments when creating git worktrees — copies env files, symlinks build directories, clones databases, and runs setup commands.
+Universal git worktree setup tool. Automatically provisions isolated development environments when creating git worktrees — copies env files, syncs build directories, manages per-worktree services, provisions databases, and runs setup commands.
 
 Designed to run unattended for AI coding agents, but works great for humans too.
 
@@ -10,12 +10,18 @@ Designed to run unattended for AI coding agents, but works great for humans too.
 curl -fsSL https://raw.githubusercontent.com/DefactoSoftware/werksfeer/main/install.sh | sh
 ```
 
-Or manually:
+For a local checkout under development:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DefactoSoftware/werksfeer/main/werksfeer -o ~/.local/bin/werksfeer
-chmod +x ~/.local/bin/werksfeer
+git clone https://github.com/DefactoSoftware/werksfeer.git
+./werksfeer/install.sh
 ```
+
+When executed from a checkout, `install.sh` installs that local version. When
+piped from the published URL, it downloads the matching files from `main`.
+
+The installer keeps the executable on `PATH` and installs its service modules
+under `${XDG_DATA_HOME:-~/.local/share}/werksfeer`.
 
 ## Quick start
 
@@ -46,14 +52,35 @@ wt switch -c my-feature
 When a new worktree is created, werksfeer:
 
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
-2. **Symlinks shared directories** (`node_modules`) to avoid redundant installs
-3. **Copies build directories** (`_build`, `deps`, `.bundle`, etc.) from the main worktree
-4. **Clones PostgreSQL databases** using `CREATE DATABASE ... WITH TEMPLATE` for instant isolation
+2. **Symlinks shared directories** (`node_modules`) when the main checkout is an exact, clean revision match
+3. **Copy-on-write clones build caches** (`_build`, `deps`, `priv/static`, etc.) from that same validated checkout
+4. **Provisions PostgreSQL** by cloning databases on a shared server or starting a private cluster on a Unix socket
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
-6. **Writes overrides** (DB names, port, Redis URL) to `.env.local` (Rails) or `.envrc` (Elixir)
-7. **Runs setup commands** (`bin/setup`, `mix deps.get`, `pip install`, etc.)
+6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
+7. **Runs framework setup** (dependencies, database preparation, migrations, and first-time seeds)
 
-Everything is idempotent — safe to re-run.
+Everything is idempotent — safe to re-run. Private services are opt-in, so
+existing repositories retain the shared-server cloning behavior.
+
+Build and dependency caches are deliberately stricter than environment-file
+copying. Werksfeer only reuses them when both checkouts are clean and point at
+the same commit. This prevents a stale local main checkout from making a newer
+worktree appear compiled. For Elixir projects, tracked source mtimes are copied
+from that validated checkout and relocation-sensitive CMake metadata is
+discarded. If the copied dev and test dependencies pass Mix's read-only check,
+Werksfeer skips `mix deps.get`; the normal compiler still performs its own
+dependency and staleness checks.
+
+Mix normally recompiles Elixir modules when a project moves to another absolute
+path. Applications that intentionally reuse an exact-revision `_build` cache
+between worktrees should opt out of that path check for dev/test in `mix.exs`:
+
+```elixir
+elixirc_options: [check_cwd: Mix.env() == :prod]
+```
+
+Production keeps the default check in this example. Without this project
+setting, the cache copy remains safe but does not avoid the relocation rebuild.
 
 ## Setup
 
@@ -186,16 +213,111 @@ werksfeer --prune-all
 
 ## Supported project types
 
-| Type | Detected by | Symlinked | Copied | Setup command | DB pattern |
+| Type | Detected by | Symlinked | Copied | Setup command | Shared DB pattern |
 |------|------------|-----------|--------|---------------|------------|
-| Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bin/setup` | `{name}_development` / `{name}_test` |
-| Elixir | `mix.exs` | `node_modules` | `_build`, `deps` | `mix deps.get` | `{name}_dev` / `{name}_test` |
+| Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bundle install`, `db:prepare` | `{name}_development` / `{name}_test` |
+| Elixir | `mix.exs` | `node_modules` | `_build`, `deps`, `priv/static` | dependency validation/fetch, `mix compile`, Node install, Ecto setup/migrate | `{name}_dev` / `{name}_test` |
 | Python | `pyproject.toml` / `requirements.txt` | — | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
 | Node | `package.json` | `node_modules` | `.next`, `.nuxt`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
 
 ## Project setup
 
 Your project needs to read the environment variables werksfeer sets (`PORT`, `DATABASE_NAME`, `TEST_DATABASE_NAME`, `REDIS_URL`, `REDIS_PORT`). See **[docs/project-setup.md](docs/project-setup.md)** for a step-by-step guide with examples for Rails and Elixir/Phoenix.
+
+## Private PostgreSQL per worktree
+
+Werksfeer can run one PostgreSQL server per linked worktree, with durable data
+inside the checkout and no TCP listener. Enable the built-in provider:
+
+```toml
+[services]
+enabled = ["postgres"]
+
+[postgres]
+required_extensions = ["citext", "pg_trgm", "pgcrypto", "vector"]
+
+[database]
+base_name = "myapp"
+```
+
+The provider uses a short, deterministic `/tmp/werksfeer-pg-...` Unix socket
+because agent-managed worktree paths can exceed Unix socket path limits. Its
+directory is owned by the current user with mode `0700`; PostgreSQL TCP
+listening is disabled.
+
+Application frameworks still own database creation, schema, migrations, and
+seeds. Werksfeer invokes their normal commands: `bin/rails db:prepare` for
+Rails and Ecto tasks for Phoenix. It manages the server process and writes
+connection variables:
+
+- libpq: `PGHOST`, `PGPORT`, `PGUSER`;
+- framework-neutral: `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_USER`;
+- Postgrex-specific convenience: `DATABASE_SOCKET_DIR`.
+
+Lifecycle commands are shared across frameworks and agent harnesses:
+
+```sh
+werksfeer services start
+werksfeer services stop
+werksfeer services status
+werksfeer services doctor
+werksfeer services env
+werksfeer postgres socket-dir
+werksfeer postgres database-exists myapp_development
+werksfeer postgres template-status
+werksfeer exec bin/rails db:prepare
+```
+
+The generated `.envrc` starts configured services when a direnv-enabled shell
+enters the worktree. `werksfeer exec COMMAND` does the same for non-interactive
+agent and harness commands before loading the worktree environment.
+
+### Seeded template cache
+
+Private PostgreSQL setup maintains a cold, content-addressed template cache
+under `${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/postgres-templates`. A new
+worktree clones the newest cached ancestor with identical committed seed inputs,
+using copy-on-write on APFS and supported Linux filesystems, and then runs the
+application's pending migrations.
+
+The cache refresh is demand-driven rather than clock-driven:
+
+1. the first worktree at the current remote default ref is prepared normally;
+2. after setup succeeds, werksfeer stops its new cluster, snapshots it, and
+   restarts it;
+3. subsequent worktrees clone that immutable snapshot;
+4. new migrations reuse and advance an older compatible snapshot;
+5. changed seed inputs force one fresh seed before publishing a new snapshot.
+
+Only a database newly created during unattended setup can be published, and
+only when `HEAD` exactly matches the configured remote ref and the worktree is
+clean. Existing developer databases, uncommitted changes, and feature-branch
+commits are never cached. Three templates are kept by default. Inspect the
+current selection with:
+
+```sh
+werksfeer postgres template-status
+```
+
+`werksfeer --cleanup` stops configured services before releasing allocations.
+Set `WERKSFEER_POSTGRES=false` to opt out for one process, or `true` to run the
+configured service from a main checkout.
+
+For a persistent per-developer preference, ignore `.worktree.local.toml` and
+create it in the main checkout:
+
+```toml
+[postgres]
+enabled = false
+```
+
+The main checkout's local file applies to every linked worktree on that
+machine. An optional `.worktree.local.toml` inside one worktree overrides the
+main preference for that worktree. An explicit `WERKSFEER_POSTGRES` environment
+variable has the highest precedence. When disabled, Werksfeer neither starts a
+private cluster nor emits socket variables, so the application retains its
+normal TCP database configuration. Disabled services also skip their tooling
+and extension checks during `services doctor`.
 
 ## Port and Redis allocation
 
@@ -232,6 +354,27 @@ base_name = "myapp"
 dev_suffix = "_development"
 test_suffix = "_test"
 
+[services]
+# Built-in lifecycle providers. Omit this section to keep shared DB cloning.
+enabled = ["postgres"]
+
+[postgres]
+# Personal overrides can set this in ignored .worktree.local.toml.
+# enabled = false
+# Worktree-relative durable cluster path (default: .pg_data)
+data_dir = ".pg_data"
+# Short parent for Unix sockets (default: /tmp)
+socket_root = "/tmp"
+port = 5432
+user = "postgres"
+# Validate extension control files before initializing or starting the cluster
+required_extensions = ["citext", "pg_trgm", "vector"]
+# Seeded cold-cluster cache (defaults shown)
+template_cache = true
+# Auto-detected from origin/HEAD, then origin/main or origin/master
+# template_ref = "origin/main"
+template_retention = 3
+
 [port]
 # Base port for the web server (default: 3000 for Rails/Node, 4000 for Elixir, 8000 for Python)
 # Worktrees are allocated ports starting from base+1.
@@ -245,8 +388,8 @@ url = "redis://localhost:6379"
 [sync]
 # Override directories to symlink (default: node_modules)
 symlink = ["node_modules"]
-# Override directories to copy (default: build dirs per project type)
-copy_dirs = ["_build", "deps"]
+# Override directories to copy (Elixir defaults shown)
+copy_dirs = ["_build", "deps", "priv/static"]
 # Override files to copy
 copy = [".env", ".envrc"]
 # Directories to skip
@@ -255,8 +398,12 @@ skip = ["tmp"]
 [setup]
 # Override setup command
 command = "make setup"
+# Override only the detected Node package-manager install command
+node_install = "npm install"
 
 [hooks]
+# Run after framework dependencies are installed/compiled, before DB setup
+post_dependencies = "npm run-script build"
 # Run after setup completes
 post_setup = "echo done"
 ```
@@ -275,6 +422,13 @@ werksfeer --prune-all
 
 Smart pruning compares `worktree_*` databases against active worktrees — only orphaned databases are dropped and only stale allocations are released.
 
+Private PostgreSQL processes must be stopped before their checkout is removed,
+because their control files live in that checkout. Configure
+`werksfeer --cleanup` as the harness teardown/archive command. Paseo,
+Conductor, and other harnesses with lifecycle hooks can all use the same command.
+`--prune` remains the recovery path for shared-server clones and stale
+port/Redis allocations.
+
 ## How the git hook works
 
 The `post-checkout` hook fires on every `git checkout` and worktree creation (via `wt switch -c` or `git worktree add`). Werksfeer only activates when all three conditions are met:
@@ -289,8 +443,22 @@ If `.worktree.toml` doesn't exist in the repo, the hook exits silently.
 
 - **bash** 3.2+ (ships with macOS, Linux, WSL)
 - **git** 2.5+ (worktree support) — [WorkTrunk](https://github.com/max-sixty/worktrunk) (`wt`) recommended for worktree management
-- **psql** (optional — only needed for database cloning)
+- **PostgreSQL client tools** (optional — needed for database cloning)
+- **PostgreSQL server tools** (optional — needed for the private provider;
+  `pg_config` must resolve the matching `initdb`, `pg_ctl`, and `postgres`)
+- **direnv** (recommended — automatically loads each worktree environment and
+  starts its configured services in interactive shells)
 - **curl** (only for installation)
+
+## Development
+
+The CLI and service-provider tests use Bats; shell sources are checked with
+ShellCheck:
+
+```sh
+test/run
+shellcheck -x werksfeer install.sh hooks/post-checkout lib/werksfeer/*.sh lib/werksfeer/services/*.sh
+```
 
 ## Debug
 

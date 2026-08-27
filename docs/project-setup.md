@@ -6,11 +6,13 @@ Werksfeer writes the following env vars per worktree:
 
 | Variable | Written to | Description |
 |----------|-----------|-------------|
-| `PORT` | `.env.local` / `.envrc` | Unique web server port |
-| `DATABASE_NAME` | `.env.local` / `.envrc` | Dev database name |
-| `TEST_DATABASE_NAME` | `.env.local` / `.env.test.local` / `.envrc` | Test database name |
-| `REDIS_URL` | `.env.local` | Redis URL with unique port and DB number (Rails) |
-| `REDIS_PORT` | `.env.local` | Unique Redis server port (Rails) |
+| `PORT` | `.envrc` plus framework dotenv files | Unique web server port |
+| `DATABASE_NAME` | `.envrc` plus framework dotenv files | Dev database name |
+| `TEST_DATABASE_NAME` | `.envrc` plus framework dotenv files | Test database name |
+| `REDIS_URL` | `.envrc` plus framework dotenv files | Redis URL with unique port and DB number (Rails) |
+| `REDIS_PORT` | `.envrc` plus framework dotenv files | Unique Redis server port (Rails) |
+| `DATABASE_SOCKET_DIR` | `.envrc` plus framework dotenv files | Private PostgreSQL Unix socket directory |
+| `PGHOST`, `PGPORT`, `PGUSER` | `.envrc` plus framework dotenv files | Standard libpq connection settings |
 
 ## Ruby on Rails
 
@@ -35,12 +37,23 @@ Your `database.yml` should reference these:
 ```yaml
 development:
   database: <%= ENV.fetch("DATABASE_NAME", "myapp_development") %>
+  host: <%= ENV.fetch("DATABASE_HOST", "localhost") %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+  username: <%= ENV.fetch("DATABASE_USER", "postgres") %>
 
 test:
   database: <%= ENV.fetch("TEST_DATABASE_NAME", "myapp_test") %>
+  host: <%= ENV.fetch("DATABASE_HOST", "localhost") %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+  username: <%= ENV.fetch("DATABASE_USER", "postgres") %>
 ```
 
 > **Note:** `dotenv-rails` does NOT load `.env.local` in the test environment, which is why werksfeer also writes `TEST_DATABASE_NAME` to `.env.test.local`.
+
+Werksfeer runs `bin/rails db:prepare` for development and test during worktree
+setup. In an interactive direnv shell, the generated `.envrc` starts configured
+services automatically. Use `werksfeer exec bin/rails COMMAND` from an agent or
+other non-interactive process; no werksfeer code is needed in `bin/rails`.
 
 ### 3. Session cookie
 
@@ -83,11 +96,41 @@ If your project symlinks `node_modules`, update `.gitignore` to match symlinks t
 
 A trailing `/` only matches directories, not symlinks.
 
+Also ignore `.worktree.local.toml`. Werksfeer loads this personal file from the
+main checkout after the committed `.worktree.toml`, then loads a current
+worktree copy if one exists. This provides machine-wide and one-worktree
+overrides without changing team configuration. For example, a developer using
+an existing PostgreSQL server over TCP can set:
+
+```toml
+[postgres]
+enabled = false
+```
+
+`WERKSFEER_POSTGRES=true` or `false` remains the highest-precedence temporary
+override.
+
 ## Elixir / Phoenix
 
 ### 1. Port
 
-Read `PORT` in `config/runtime.exs` so it's picked up at startup — not baked in at compile time. This is important because werksfeer copies `_build` between worktrees, and compile-time env vars would be stale.
+Read `PORT` in `config/runtime.exs` so it is picked up at startup rather than
+baked in at compile time. Werksfeer reuses `_build` only from an exact, clean
+revision match, but runtime-only values such as each worktree's allocated port
+must still remain outside that shared compilation cache.
+
+Mix also checks the project's absolute working directory by default. To make an
+exact-revision dev/test cache reusable after moving it into a worktree, keep the
+production check and disable it for local environments:
+
+```elixir
+# mix.exs
+elixirc_options: [check_cwd: Mix.env() == :prod]
+```
+
+Werksfeer preserves tracked source mtimes and still runs `mix compile`, so Mix
+continues to detect content and dependency changes. Projects without this option
+remain correct; they simply pay for Mix's relocation rebuild.
 
 **`config/runtime.exs`:**
 ```elixir
@@ -130,6 +173,22 @@ config :myapp, MyApp.Repo,
     )
 ```
 
+When the private PostgreSQL provider is enabled, add its socket option:
+
+```elixir
+repo_config =
+  case System.get_env("DATABASE_SOCKET_DIR") do
+    nil -> repo_config
+    socket_dir -> Keyword.put(repo_config, :socket_dir, socket_dir)
+  end
+```
+
+Werksfeer runs the normal Ecto setup/migration tasks while provisioning the
+worktree. In an interactive direnv shell, the generated `.envrc` starts services
+automatically. Use `werksfeer exec mix COMMAND` from an agent or another
+non-interactive process. The Mix project and runtime configuration do not need
+to execute werksfeer themselves.
+
 If you use plain `System.get_env` instead of a custom `Env` module:
 
 ```elixir
@@ -140,7 +199,24 @@ database:
   )
 ```
 
-Werksfeer writes these env vars to `.envrc` and runs `direnv allow`.
+Werksfeer writes these env vars to `.envrc`, adds the generic service-start
+hook, and runs `direnv allow`.
+
+### Seed/template behavior
+
+For a new private cluster, werksfeer first looks for a cached template whose
+commit is an ancestor of the new worktree and whose committed seed inputs are
+identical. When found, it clones that stopped cluster and Ecto only applies
+pending migrations. When seed inputs changed, the first worktree performs the
+normal `ecto.setup`; werksfeer then publishes its clean result for later
+worktrees at the same remote base. Publication also requires a clean Git
+worktree, so delayed setup cannot share uncommitted migrations or seeds.
+
+The same rule applies to Rails, using `db/seeds.rb`/`db/seeds` as seed inputs
+and `db:prepare` as the framework setup command. Custom `[setup] command`
+configurations disable template publication by default because their database
+semantics are unknown; explicitly set `postgres.template_cache = true` only
+when that setup remains safe to snapshot.
 
 ### 3. Session cookie
 
@@ -192,3 +268,5 @@ Document the new env vars so other developers know they exist:
 - [ ] Session cookie key includes port in development
 - [ ] `.gitignore` matches `node_modules` symlinks (no trailing `/`)
 - [ ] `.worktree.toml` exists in project root (can be empty)
+- [ ] Agent and harness commands use `werksfeer exec`, or explicitly load `.envrc` with direnv
+- [ ] `.pg_data/` is ignored when the private PostgreSQL provider is enabled
