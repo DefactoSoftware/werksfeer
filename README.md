@@ -52,8 +52,8 @@ wt switch -c my-feature
 When a new worktree is created, werksfeer:
 
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
-2. **Symlinks shared directories** (`node_modules`) to avoid redundant installs
-3. **Copies build directories** (`_build`, `deps`, `.bundle`, etc.) from the main worktree
+2. **Symlinks shared directories** (`node_modules`) when the main checkout is an exact, clean revision match
+3. **Copy-on-write clones build caches** (`_build`, `deps`, `priv/static`, etc.) from that same validated checkout
 4. **Provisions PostgreSQL** by cloning databases on a shared server or starting a private cluster on a Unix socket
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
 6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
@@ -61,6 +61,26 @@ When a new worktree is created, werksfeer:
 
 Everything is idempotent — safe to re-run. Private services are opt-in, so
 existing repositories retain the shared-server cloning behavior.
+
+Build and dependency caches are deliberately stricter than environment-file
+copying. Werksfeer only reuses them when both checkouts are clean and point at
+the same commit. This prevents a stale local main checkout from making a newer
+worktree appear compiled. For Elixir projects, tracked source mtimes are copied
+from that validated checkout and relocation-sensitive CMake metadata is
+discarded. If the copied dev and test dependencies pass Mix's read-only check,
+Werksfeer skips `mix deps.get`; the normal compiler still performs its own
+dependency and staleness checks.
+
+Mix normally recompiles Elixir modules when a project moves to another absolute
+path. Applications that intentionally reuse an exact-revision `_build` cache
+between worktrees should opt out of that path check for dev/test in `mix.exs`:
+
+```elixir
+elixirc_options: [check_cwd: Mix.env() == :prod]
+```
+
+Production keeps the default check in this example. Without this project
+setting, the cache copy remains safe but does not avoid the relocation rebuild.
 
 ## Setup
 
@@ -196,7 +216,7 @@ werksfeer --prune-all
 | Type | Detected by | Symlinked | Copied | Setup command | Shared DB pattern |
 |------|------------|-----------|--------|---------------|------------|
 | Rails | `Gemfile` + `config/database.yml` | `node_modules` | `.bundle`, `tmp/cache` | `bundle install`, `db:prepare` | `{name}_development` / `{name}_test` |
-| Elixir | `mix.exs` | `node_modules` | `_build`, `deps` | deps, assets, Ecto setup/migrate | `{name}_dev` / `{name}_test` |
+| Elixir | `mix.exs` | `node_modules` | `_build`, `deps`, `priv/static` | dependency validation/fetch, `mix compile`, Node install, Ecto setup/migrate | `{name}_dev` / `{name}_test` |
 | Python | `pyproject.toml` / `requirements.txt` | — | `.venv`, `__pycache__` | `uv sync` / `pip install` | — |
 | Node | `package.json` | `node_modules` | `.next`, `.nuxt`, etc. | `npm ci` / `yarn` / `pnpm` / `bun` | — |
 
@@ -350,8 +370,8 @@ url = "redis://localhost:6379"
 [sync]
 # Override directories to symlink (default: node_modules)
 symlink = ["node_modules"]
-# Override directories to copy (default: build dirs per project type)
-copy_dirs = ["_build", "deps"]
+# Override directories to copy (Elixir defaults shown)
+copy_dirs = ["_build", "deps", "priv/static"]
 # Override files to copy
 copy = [".env", ".envrc"]
 # Directories to skip

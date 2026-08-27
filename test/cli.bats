@@ -17,6 +17,13 @@ setup() {
   git -C "$MAIN_REPO" config user.name "Werksfeer Test"
 
   printf 'defmodule Example.MixProject do\nend\n' > "${MAIN_REPO}/mix.exs"
+  cat > "${MAIN_REPO}/.gitignore" <<'EOF_GITIGNORE'
+/_build
+/deps
+/node_modules
+/priv/static
+.envrc
+EOF_GITIGNORE
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
 [services]
 enabled = ["postgres"]
@@ -27,7 +34,7 @@ base_name = "example"
 [setup]
 command = "true"
 EOF_CONFIG
-  git -C "$MAIN_REPO" add mix.exs .worktree.toml
+  git -C "$MAIN_REPO" add mix.exs .gitignore .worktree.toml
   git -C "$MAIN_REPO" commit -qm initial
   git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$WORKTREE_ONE" HEAD
   git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$WORKTREE_TWO" HEAD
@@ -143,6 +150,88 @@ teardown() {
   [ "$(cat "${source_dir}/base/value")" = "template" ]
 }
 
+@test "exact clean revisions reuse isolated worktree caches" {
+  mkdir -p \
+    "${MAIN_REPO}/_build/dev/lib/example/.mix" \
+    "${MAIN_REPO}/deps/native/CMakeFiles" \
+    "${MAIN_REPO}/node_modules/example" \
+    "${MAIN_REPO}/priv/static"
+  printf 'build\n' > "${MAIN_REPO}/_build/dev/lib/example/.mix/compile.elixir"
+  printf 'absolute source path\n' > "${MAIN_REPO}/deps/native/CMakeCache.txt"
+  printf 'generated\n' > "${MAIN_REPO}/deps/native/CMakeFiles/generated"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/native/artifact"
+  printf 'package\n' > "${MAIN_REPO}/node_modules/example/value"
+  printf 'asset\n' > "${MAIN_REPO}/priv/static/app.js"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+
+  [ -f "${WORKTREE_ONE}/_build/dev/lib/example/.mix/compile.elixir" ]
+  [ -f "${WORKTREE_ONE}/deps/native/artifact" ]
+  [ ! -e "${WORKTREE_ONE}/deps/native/CMakeCache.txt" ]
+  [ ! -e "${WORKTREE_ONE}/deps/native/CMakeFiles" ]
+  [ -L "${WORKTREE_ONE}/node_modules" ]
+  [ -f "${WORKTREE_ONE}/priv/static/app.js" ]
+
+  printf 'worktree\n' > "${WORKTREE_ONE}/deps/native/artifact"
+  [ "$(cat "${MAIN_REPO}/deps/native/artifact")" = "dependency" ]
+}
+
+@test "different revisions do not reuse worktree caches" {
+  mkdir -p "${MAIN_REPO}/_build" "${MAIN_REPO}/deps" "${MAIN_REPO}/node_modules/example"
+  printf 'build\n' > "${MAIN_REPO}/_build/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/value"
+  printf 'package\n' > "${MAIN_REPO}/node_modules/example/value"
+
+  printf 'new revision\n' > "${WORKTREE_ONE}/revision"
+  git -C "$WORKTREE_ONE" add revision
+  git -C "$WORKTREE_ONE" commit -qm "new revision"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skip shared directories"* ]]
+  [[ "$output" == *"Skip build cache"* ]]
+  [ ! -e "${WORKTREE_ONE}/_build" ]
+  [ ! -e "${WORKTREE_ONE}/deps" ]
+  [ ! -e "${WORKTREE_ONE}/node_modules" ]
+}
+
+@test "exact precompiled Elixir caches skip dependency fetching" {
+  fake_bin="${TEST_ROOT}/elixir-cache-bin"
+  command_log="${TEST_ROOT}/elixir-cache-commands.log"
+  mkdir -p "$fake_bin" "${MAIN_REPO}/_build/dev" "${MAIN_REPO}/deps/example"
+  printf 'build\n' > "${MAIN_REPO}/_build/dev/value"
+  printf 'dependency\n' > "${MAIN_REPO}/deps/example/value"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+# Use framework defaults without a custom setup command.
+EOF_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "use automatic setup"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  cat > "${fake_bin}/mix" <<'EOF_MIX'
+#!/usr/bin/env bash
+printf 'mix:%s:%s\n' "${MIX_ENV:-dev}" "$*" >> "$COMMAND_LOG"
+EOF_MIX
+  cat > "${fake_bin}/elixir" <<'EOF_ELIXIR'
+#!/usr/bin/env bash
+exit 0
+EOF_ELIXIR
+  chmod +x "${fake_bin}/mix" "${fake_bin}/elixir"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+
+  expected="${TEST_ROOT}/expected-elixir-cache-commands.log"
+  cat > "$expected" <<'EOF_EXPECTED'
+mix:dev:deps.loadpaths --no-compile
+mix:test:deps.loadpaths --no-compile
+mix:dev:compile
+mix:dev:ecto.setup
+EOF_EXPECTED
+  diff -u "$expected" "$command_log"
+}
+
 @test "setup writes one replaceable managed environment block" {
   run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
@@ -158,7 +247,7 @@ teardown() {
   grep -q 'werksfeer services start' "${WORKTREE_ONE}/.envrc"
 }
 
-@test "Elixir setup compiles dependencies before app, assets, and database" {
+@test "Elixir setup compiles the app before assets and database" {
   fake_bin="${TEST_ROOT}/elixir-bin"
   command_log="${TEST_ROOT}/elixir-commands.log"
   mkdir -p "$fake_bin"
@@ -187,7 +276,6 @@ EOF_CONFIG
   cat > "$expected" <<'EOF_EXPECTED'
 mix:dev:deps.get
 mix:test:deps.get
-mix:dev:deps.compile
 mix:dev:compile
 npm:install
 npm:run-script build

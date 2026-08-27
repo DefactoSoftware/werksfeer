@@ -327,7 +327,7 @@ default_copy_dirs() {
       printf '%s\n' .bundle tmp/cache
       ;;
     elixir)
-      printf '%s\n' _build deps
+      printf '%s\n' _build deps priv/static
       ;;
     python)
       printf '%s\n' .venv __pycache__ .mypy_cache .pytest_cache .ruff_cache
@@ -406,6 +406,11 @@ sync_symlink_dirs() {
   [ -z "$symlink_dirs" ] && symlink_dirs="$(default_symlink_dirs "$project_type")"
   [ -z "$symlink_dirs" ] && return 0
 
+  if ! reusable_worktree_cache "$main_path" "$worktree_path"; then
+    log_info "Skip shared directories (main checkout is not an exact, clean cache source)"
+    return 0
+  fi
+
   local skip_dirs
   skip_dirs="$(toml_get_array "sync" "skip")"
 
@@ -443,6 +448,108 @@ sync_symlink_dirs() {
   done
 }
 
+git_checkout_is_clean() {
+  [ -z "$(git -C "$1" status --porcelain --untracked-files=all 2>/dev/null)" ]
+}
+
+reusable_worktree_cache() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local main_revision worktree_revision
+
+  main_revision="$(git -C "$main_path" rev-parse HEAD 2>/dev/null)" || return 1
+  worktree_revision="$(git -C "$worktree_path" rev-parse HEAD 2>/dev/null)" || return 1
+
+  [ "$main_revision" = "$worktree_revision" ] || return 1
+  git_checkout_is_clean "$main_path" || return 1
+  git_checkout_is_clean "$worktree_path" || return 1
+}
+
+copy_tree() {
+  local source="$1"
+  local destination="$2"
+
+  [ -d "$source" ] || return 1
+  [ ! -e "$destination" ] || {
+    log_error "Refusing to overwrite cache copy destination: $destination"
+    return 1
+  }
+
+  mkdir -p "$(dirname "$destination")"
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # clonefile-backed copies are copy-on-write on APFS.
+    if cp -cR "$source" "$destination" 2>/dev/null; then
+      return 0
+    fi
+  elif cp --reflink=auto -a "$source" "$destination" 2>/dev/null; then
+    return 0
+  fi
+
+  [ ! -e "$destination" ] || {
+    log_error "Copy-on-write cache copy left a partial destination: $destination"
+    return 1
+  }
+
+  cp -Rp "$source" "$destination"
+}
+
+remove_relocated_cmake_state() {
+  local deps_path="$1"
+  [ -d "$deps_path" ] || return 0
+
+  # CMakeCache.txt contains absolute paths from the source checkout. Keeping it
+  # makes a later native dependency rebuild fail after the tree is relocated.
+  find "$deps_path" -type f -name CMakeCache.txt -delete
+
+  find "$deps_path" -type d -name CMakeFiles -prune | while IFS= read -r cmake_dir; do
+    [ -z "$cmake_dir" ] && continue
+    find "$cmake_dir" -depth -delete
+  done
+}
+
+sync_tracked_file_times() {
+  local main_path="$1"
+  local worktree_path="$2"
+
+  # Mix compiler manifests record source mtimes. An exact Git checkout has the
+  # same contents but newly-created file times, which otherwise makes every
+  # module stale. Mirror only tracked regular files from the validated source.
+  # Use one Elixir VM instead of spawning `touch` once per source file; large
+  # Phoenix applications can contain thousands of tracked files.
+  git -C "$main_path" ls-files -z |
+    WERKSFEER_MTIME_SOURCE="$main_path" WERKSFEER_MTIME_TARGET="$worktree_path" \
+      elixir -e '
+        source = System.fetch_env!("WERKSFEER_MTIME_SOURCE")
+        target = System.fetch_env!("WERKSFEER_MTIME_TARGET")
+
+        IO.binread(:stdio, :eof)
+        |> :binary.split(<<0>>, [:global])
+        |> Enum.each(fn
+          "" ->
+            :ok
+
+          relative_path ->
+            source_file = Path.join(source, relative_path)
+            target_file = Path.join(target, relative_path)
+
+            with {:ok, stat} <- File.stat(source_file, time: :posix),
+                 true <- File.regular?(target_file) do
+              File.touch!(target_file, stat.mtime)
+            end
+        end)
+      '
+}
+
+refresh_relocated_elixir_cache() {
+  local main_path="$1"
+  local worktree_path="$2"
+  local deps_path="$worktree_path/deps"
+
+  remove_relocated_cmake_state "$deps_path"
+  sync_tracked_file_times "$main_path" "$worktree_path"
+}
+
 copy_build_dirs() {
   local main_path="$1"
   local worktree_path="$2"
@@ -453,10 +560,16 @@ copy_build_dirs() {
   [ -z "$copy_dirs" ] && copy_dirs="$(default_copy_dirs "$project_type")"
   [ -z "$copy_dirs" ] && return 0
 
+  if ! reusable_worktree_cache "$main_path" "$worktree_path"; then
+    log_info "Skip build cache (main checkout is not the exact, clean worktree revision)"
+    return 0
+  fi
+
   local skip_dirs
   skip_dirs="$(toml_get_array "sync" "skip")"
+  local copied_elixir_build=false
 
-  echo "$copy_dirs" | while IFS= read -r dir; do
+  while IFS= read -r dir; do
     [ -z "$dir" ] && continue
 
     # Check skip list
@@ -481,9 +594,19 @@ copy_build_dirs() {
     parent="$(dirname "$dst")"
     [ ! -d "$parent" ] && mkdir -p "$parent"
 
-    cp -R "$src" "$dst"
+    copy_tree "$src" "$dst"
     log_info "Copied $dir"
-  done
+    if [ "$project_type" = "elixir" ] && [ "$dir" = "_build" ]; then
+      copied_elixir_build=true
+    fi
+  done <<EOF_COPY_DIRS
+$copy_dirs
+EOF_COPY_DIRS
+
+  if [ "$copied_elixir_build" = true ]; then
+    refresh_relocated_elixir_cache "$main_path" "$worktree_path"
+    WERKSFEER_REUSED_ELIXIR_BUILD=1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -847,15 +970,16 @@ run_dependency_setup() {
       install_node_dependencies
       ;;
     elixir)
-      log_step "Running mix deps.get"
-      run_in_project_environment mix deps.get
-      log_step "Running mix deps.get for test"
-      run_in_project_environment env MIX_ENV=test mix deps.get
-      # Compile dependencies as their own phase before Ecto implicitly compiles
-      # and loads the application. This is particularly important for native
-      # dependencies backed by Make/CMake and Git submodules.
-      log_step "Running mix deps.compile"
-      run_in_project_environment mix deps.compile
+      if [ "${WERKSFEER_REUSED_ELIXIR_BUILD:-0}" = "1" ] &&
+          run_in_project_environment mix deps.loadpaths --no-compile >/dev/null 2>&1 &&
+          run_in_project_environment env MIX_ENV=test mix deps.loadpaths --no-compile >/dev/null 2>&1; then
+        log_info "Exact-revision Elixir dependencies are ready, skipping mix deps.get"
+      else
+        log_step "Running mix deps.get"
+        run_in_project_environment mix deps.get
+        log_step "Running mix deps.get for test"
+        run_in_project_environment env MIX_ENV=test mix deps.get
+      fi
       log_step "Running mix compile"
       run_in_project_environment mix compile
       install_node_dependencies

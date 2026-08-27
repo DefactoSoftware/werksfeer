@@ -100,7 +100,23 @@ A trailing `/` only matches directories, not symlinks.
 
 ### 1. Port
 
-Read `PORT` in `config/runtime.exs` so it's picked up at startup — not baked in at compile time. This is important because werksfeer copies `_build` between worktrees, and compile-time env vars would be stale.
+Read `PORT` in `config/runtime.exs` so it is picked up at startup rather than
+baked in at compile time. Werksfeer reuses `_build` only from an exact, clean
+revision match, but runtime-only values such as each worktree's allocated port
+must still remain outside that shared compilation cache.
+
+Mix also checks the project's absolute working directory by default. To make an
+exact-revision dev/test cache reusable after moving it into a worktree, keep the
+production check and disable it for local environments:
+
+```elixir
+# mix.exs
+elixirc_options: [check_cwd: Mix.env() == :prod]
+```
+
+Werksfeer preserves tracked source mtimes and still runs `mix compile`, so Mix
+continues to detect content and dependency changes. Projects without this option
+remain correct; they simply pay for Mix's relocation rebuild.
 
 **`config/runtime.exs`:**
 ```elixir
