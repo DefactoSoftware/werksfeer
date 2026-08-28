@@ -52,7 +52,7 @@ wt switch -c my-feature
 When a new worktree is created, werksfeer:
 
 1. **Copies env files** (`.env`, `.envrc`, `.tool-versions`) from the main worktree
-2. **Symlinks shared directories** (`node_modules`) when the main checkout is an exact, clean revision match
+2. **Restores shared directories** (`node_modules`) from an exact clean revision, copying managed caches so worktrees cannot mutate them
 3. **Copy-on-write clones build caches** (`_build`, `deps`, `priv/static`, etc.) from a clean, toolchain-compatible related revision
 4. **Provisions PostgreSQL** by cloning databases on a shared server or starting a private cluster on a Unix socket
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
@@ -74,6 +74,70 @@ Relocation-sensitive CMake metadata is discarded. If the copied dev and test
 dependencies pass Mix's read-only check, Werksfeer skips `mix deps.get`; the
 normal compiler still performs its own lockfile, dependency, and staleness
 checks.
+
+### Managed dependency and build cache
+
+The visible main checkout does not need to stay compiled or even remain on its
+default branch. Werksfeer automatically maintains an independent cache clone
+under
+`${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/build-caches`. The clone follows the
+remote default ref, uses the repository-pinned Mise/asdf toolchain, and keeps
+ignored dependencies and build outputs between refreshes. It is a separate Git
+repository, so it does not appear in `git worktree list` and warming it never
+switches, fast-forwards, or writes generated files into the developer's main
+checkout.
+
+Warm or inspect it explicitly from the main checkout or any linked worktree:
+
+```sh
+werksfeer cache warm
+werksfeer cache status
+werksfeer cache clean
+```
+
+When a ready managed cache is compatible with a new worktree, Werksfeer prefers
+it automatically. `_build`, `deps`, assets, and `node_modules` are copied using
+copy-on-write when the filesystem supports it. `node_modules` is never
+symlinked to the managed cache, so installs in a feature branch cannot corrupt
+the source used by later worktrees.
+
+Every worktree setup refreshes the cache before restoring its artifacts. The
+first setup may therefore spend several minutes preparing the cache; later
+setups normally only fetch and verify it. To disable automatic warming for a
+repository or in an ignored local override:
+
+```toml
+[cache]
+auto_warm = false
+```
+
+Automatic warming is enabled by default. A refresh failure only emits a warning
+during worktree setup; Werksfeer falls back to a compatible main-checkout cache
+or the framework's normal setup. Successful refreshes are incremental: unchanged
+Node dependency inputs retain `node_modules`, while Mix, Bundler, and other
+package managers validate their own artifacts. Databases are deliberately not
+started, migrated, or included in this cache; private PostgreSQL uses its
+separate seeded-template cache.
+
+The cache may use several gigabytes for applications with multiple build
+environments. Each repository has one cache that updates in place, rather than
+one copy per commit. Werksfeer automatically removes caches that have not been
+warmed or restored for 30 days. Set `cache.retention_days = 0` to disable this
+housekeeping or choose another number of days. `werksfeer cache clean` safely
+removes only the current repository's cache; the next warm recreates it.
+
+The defaults warm Rails dependencies, Python dependencies, Node dependencies,
+and both dev and test Elixir dependencies/builds. The configured
+`hooks.post_dependencies` command also runs, which is the appropriate place for
+asset builds. Repositories with different requirements can define a
+cache-specific command that does not provision a database:
+
+```toml
+[cache]
+# Auto-detected from origin/HEAD, then origin/main or origin/master.
+# ref = "origin/main"
+command = "make warm-cache"
+```
 
 Mix normally recompiles Elixir modules when a project moves to another absolute
 path. Applications that intentionally reuse an `_build` cache between
@@ -384,6 +448,16 @@ template_cache = true
 # Auto-detected from origin/HEAD, then origin/main or origin/master
 # template_ref = "origin/main"
 template_retention = 3
+
+[cache]
+# Keep a private dependency/build cache at the remote default ref.
+# Warming and compatible-cache reuse are automatic by default.
+auto_warm = true
+# Automatically remove caches unused for this many days; 0 disables pruning.
+retention_days = 30
+# ref = "origin/main"
+# Optional full override; it should prepare dependencies/builds without a DB.
+# command = "make warm-cache"
 
 [port]
 # Base port for the web server (default: 3000 for Rails/Node, 4000 for Elixir, 8000 for Python)

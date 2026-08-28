@@ -4,6 +4,7 @@ setup() {
   export TEST_ROOT
   TEST_ROOT="$(mktemp -d "${BATS_TMPDIR}/werksfeer.XXXXXX")"
   export XDG_DATA_HOME="${TEST_ROOT}/xdg"
+  export XDG_CACHE_HOME="${TEST_ROOT}/cache"
   export WERKSFEER_LIB_DIR="${BATS_TEST_DIRNAME}/../lib/werksfeer"
   WERKSFEER="${BATS_TEST_DIRNAME}/../werksfeer"
 
@@ -32,6 +33,11 @@ enabled = ["postgres"]
 [database]
 base_name = "example"
 
+[cache]
+# Most tests exercise the legacy main-checkout path in isolation. Tests for
+# managed caches replace this fixture and verify the default-on behavior.
+auto_warm = false
+
 [setup]
 command = "true"
 EOF_CONFIG
@@ -49,14 +55,14 @@ teardown() {
   run "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.2" ]
+  [ "$output" = "werksfeer 0.3.0" ]
 }
 
 @test "runs with the system Bash used by macOS" {
   run env PATH="/usr/bin:/bin" "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.2.2" ]
+  [ "$output" = "werksfeer 0.3.0" ]
 }
 
 @test "derives a stable short socket path for each worktree" {
@@ -310,6 +316,327 @@ EOF_TOOLCHAIN
   [ "$output" = "asdf=1" ]
 }
 
+@test "warms an isolated managed Elixir cache without changing the main checkout" {
+  fake_bin="${TEST_ROOT}/cache-bin"
+  command_log="${TEST_ROOT}/cache-commands.log"
+  mkdir -p "$fake_bin"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+
+[setup]
+node_install = "npm install"
+
+[hooks]
+post_dependencies = "npm run-script build"
+EOF_CONFIG
+  printf '{"scripts":{"build":"true"}}\n' > "${MAIN_REPO}/package.json"
+  git -C "$MAIN_REPO" add .worktree.toml package.json
+  git -C "$MAIN_REPO" commit -qm "configure managed cache"
+  main_head="$(git -C "$MAIN_REPO" rev-parse HEAD)"
+  worktree_count="$(git -C "$MAIN_REPO" worktree list --porcelain | grep -c '^worktree ')"
+
+  cat > "${fake_bin}/mix" <<'EOF_MIX'
+#!/usr/bin/env bash
+printf 'mix:%s:%s\n' "${MIX_ENV:-dev}" "$*" >> "$COMMAND_LOG"
+mkdir -p "_build/${MIX_ENV:-dev}" deps/example
+printf 'build\n' > "_build/${MIX_ENV:-dev}/value"
+printf 'dependency\n' > deps/example/value
+EOF_MIX
+  cat > "${fake_bin}/npm" <<'EOF_NPM'
+#!/usr/bin/env bash
+printf 'npm:%s\n' "$*" >> "$COMMAND_LOG"
+if [ "$1" = "install" ]; then
+  mkdir -p node_modules/example
+  printf 'package\n' > node_modules/example/value
+elif [ "$1" = "run-script" ]; then
+  mkdir -p priv/static
+  printf 'asset\n' > priv/static/app.js
+fi
+EOF_NPM
+  chmod +x "${fake_bin}/mix" "${fake_bin}/npm"
+
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Managed build cache is ready"* ]]
+
+  expected="${TEST_ROOT}/expected-cache-commands.log"
+  cat > "$expected" <<'EOF_EXPECTED'
+mix:dev:deps.get
+mix:test:deps.get
+mix:dev:deps.compile
+mix:test:deps.compile
+mix:dev:compile
+mix:test:compile
+npm:install
+npm:run-script build
+EOF_EXPECTED
+  diff -u "$expected" "$command_log"
+
+  cp "$command_log" "${command_log}.before-noop"
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Managed build cache is already warm"* ]]
+  diff -u "${command_log}.before-noop" "$command_log"
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cache_commit=${main_head}"* ]]
+  [[ "$output" == *"ready=true"* ]]
+  [[ "$output" == *"current=true"* ]]
+  cache_root="$(printf '%s\n' "$output" | sed -n 's/^cache_root=//p')"
+
+  mkdir "${cache_root}/.warm.lock"
+  printf '2147483647\n' > "${cache_root}/.warm.lock/pid"
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Removing stale managed build cache lock"* ]]
+  [[ "$output" == *"Managed build cache is already warm"* ]]
+  [ ! -e "${cache_root}/.warm.lock" ]
+
+  [ -f "${cache_root}/checkout/_build/dev/value" ]
+  [ -f "${cache_root}/checkout/_build/test/value" ]
+  [ -f "${cache_root}/checkout/deps/example/value" ]
+  [ -f "${cache_root}/checkout/node_modules/example/value" ]
+  [ -f "${cache_root}/checkout/priv/static/app.js" ]
+  [ "$(git -C "$MAIN_REPO" rev-parse HEAD)" = "$main_head" ]
+  [ -z "$(git -C "$MAIN_REPO" status --porcelain --untracked-files=all)" ]
+  [ "$(git -C "$MAIN_REPO" worktree list --porcelain | grep -c '^worktree ')" = "$worktree_count" ]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache clean"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Removing managed build cache"* ]]
+  [ ! -e "$cache_root" ]
+}
+
+@test "managed cache updates incrementally when dependency inputs are unchanged" {
+  fake_bin="${TEST_ROOT}/incremental-cache-bin"
+  command_log="${TEST_ROOT}/incremental-cache-commands.log"
+  mkdir -p "$fake_bin"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+
+[setup]
+node_install = "npm install"
+EOF_CONFIG
+  printf '{"name":"example"}\n' > "${MAIN_REPO}/package.json"
+  git -C "$MAIN_REPO" add .worktree.toml package.json
+  git -C "$MAIN_REPO" commit -qm "configure managed cache"
+
+  cat > "${fake_bin}/mix" <<'EOF_MIX'
+#!/usr/bin/env bash
+printf 'mix:%s:%s\n' "${MIX_ENV:-dev}" "$*" >> "$COMMAND_LOG"
+mkdir -p "_build/${MIX_ENV:-dev}" deps/example
+EOF_MIX
+  cat > "${fake_bin}/npm" <<'EOF_NPM'
+#!/usr/bin/env bash
+printf 'npm:%s\n' "$*" >> "$COMMAND_LOG"
+mkdir -p node_modules/example
+EOF_NPM
+  chmod +x "${fake_bin}/mix" "${fake_bin}/npm"
+
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  grep -Fqx 'npm:install' "$command_log"
+
+  printf 'application change\n' > "${MAIN_REPO}/feature.ex"
+  git -C "$MAIN_REPO" add feature.ex
+  git -C "$MAIN_REPO" commit -qm "change application source"
+  : > "$command_log"
+
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Node dependency inputs are unchanged"* ]]
+  ! grep -q '^npm:' "$command_log"
+  grep -Fqx 'mix:dev:compile' "$command_log"
+  grep -Fqx 'mix:test:compile' "$command_log"
+}
+
+@test "worktree setup copies exact managed caches without sharing mutable files" {
+  fake_bin="${TEST_ROOT}/restore-cache-bin"
+  command_log="${TEST_ROOT}/restore-cache-commands.log"
+  mkdir -p "$fake_bin"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+
+[setup]
+node_install = "npm install"
+EOF_CONFIG
+  printf '{"name":"example"}\n' > "${MAIN_REPO}/package.json"
+  git -C "$MAIN_REPO" add .worktree.toml package.json
+  git -C "$MAIN_REPO" commit -qm "configure managed cache"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  cat > "${fake_bin}/mix" <<'EOF_MIX'
+#!/usr/bin/env bash
+mkdir -p "_build/${MIX_ENV:-dev}" deps/example
+printf 'build\n' > "_build/${MIX_ENV:-dev}/value"
+printf 'dependency\n' > deps/example/value
+EOF_MIX
+  cat > "${fake_bin}/npm" <<'EOF_NPM'
+#!/usr/bin/env bash
+mkdir -p node_modules/example
+printf 'cache package\n' > node_modules/example/value
+EOF_NPM
+  cat > "${fake_bin}/elixir" <<'EOF_ELIXIR'
+#!/usr/bin/env bash
+exit 0
+EOF_ELIXIR
+  chmod +x "${fake_bin}/mix" "${fake_bin}/npm" "${fake_bin}/elixir"
+
+  run bash -c "cd \"$MAIN_REPO\" && PATH=\"$fake_bin:/usr/bin:/bin\" COMMAND_LOG=\"$command_log\" \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  cache_root="$(printf '%s\n' "$output" | sed -n 's/^cache_root=//p')"
+
+  cat > "${WORKTREE_ONE}/.worktree.local.toml" <<'EOF_LOCAL_CONFIG'
+[setup]
+command = "true"
+EOF_LOCAL_CONFIG
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Using managed build cache"* ]]
+  [[ "$output" == *"Copied node_modules from managed cache"* ]]
+  [ -d "${WORKTREE_ONE}/node_modules" ]
+  [ ! -L "${WORKTREE_ONE}/node_modules" ]
+  [ -f "${WORKTREE_ONE}/_build/dev/value" ]
+  [ -f "${WORKTREE_ONE}/_build/test/value" ]
+  [ -f "${WORKTREE_ONE}/deps/example/value" ]
+
+  printf 'worktree package\n' > "${WORKTREE_ONE}/node_modules/example/value"
+  [ "$(cat "${cache_root}/checkout/node_modules/example/value")" = "cache package" ]
+}
+
+@test "worktree setup warms automatically and prunes abandoned caches" {
+  fake_bin="${TEST_ROOT}/automatic-cache-bin"
+  mkdir -p "$fake_bin"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+retention_days = 1
+command = "mkdir -p _build/dev && printf 'automatic cache' > _build/dev/value"
+
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "enable automatic cache warming"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  stale_cache="${XDG_CACHE_HOME}/werksfeer/build-caches/abandoned-cache"
+  mkdir -p "$stale_cache"
+  printf '%s\n' "${TEST_ROOT}/missing-repository" > "${stale_cache}/OWNER"
+  touch -t 202001010000 "${stale_cache}/OWNER"
+
+  cat > "${fake_bin}/elixir" <<'EOF_ELIXIR'
+#!/usr/bin/env bash
+exit 0
+EOF_ELIXIR
+  chmod +x "${fake_bin}/elixir"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && PATH=\"$fake_bin:/usr/bin:/bin\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Warming elixir build cache"* ]]
+  [[ "$output" == *"Pruning managed build cache unused for more than 1 days"* ]]
+  [[ "$output" == *"Using managed build cache"* ]]
+  [ "$(cat "${WORKTREE_ONE}/_build/dev/value")" = "automatic cache" ]
+  [ ! -e "$stale_cache" ]
+  [ -z "$(git -C "$MAIN_REPO" status --porcelain --untracked-files=all)" ]
+}
+
+@test "repositories can opt out of automatic cache warming" {
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+ref = "HEAD"
+auto_warm = false
+command = "mkdir -p _build/dev && printf 'should not exist' > _build/dev/value"
+
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "disable automatic cache warming"
+  git -C "$WORKTREE_ONE" reset -q --hard "$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Warming elixir build cache"* ]]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ready=false"* ]]
+}
+
+@test "managed cache follows the latest remote default ref without updating main" {
+  remote_repo="${TEST_ROOT}/remote.git"
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+command = "mkdir -p _build/dev && printf 'remote cache' > _build/dev/value"
+EOF_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "configure remote cache"
+  git -C "$MAIN_REPO" branch -M main
+  main_head="$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  git clone -q --bare "$MAIN_REPO" "$remote_repo"
+  git -C "$remote_repo" symbolic-ref HEAD refs/heads/main
+  git -C "$MAIN_REPO" remote add origin "$remote_repo"
+  git -C "$MAIN_REPO" fetch -q origin
+  git -C "$MAIN_REPO" remote set-head origin -a >/dev/null
+
+  git -C "$WORKTREE_TWO" reset -q --hard "$main_head"
+  printf 'remote-only revision\n' > "${WORKTREE_TWO}/remote-revision"
+  git -C "$WORKTREE_TWO" add remote-revision
+  git -C "$WORKTREE_TWO" commit -qm "advance remote default"
+  remote_head="$(git -C "$WORKTREE_TWO" rev-parse HEAD)"
+  git -C "$WORKTREE_TWO" push -q origin HEAD:main
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Fetching origin"* ]]
+  [[ "$output" == *"at ${remote_head:0:12}"* ]]
+  [ "$(git -C "$MAIN_REPO" rev-parse HEAD)" = "$main_head" ]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ref=origin/main"* ]]
+  [[ "$output" == *"ref_commit=${remote_head}"* ]]
+  [[ "$output" == *"cache_commit=${remote_head}"* ]]
+  [[ "$output" == *"current=true"* ]]
+}
+
+@test "managed cache uses target configuration instead of feature configuration" {
+  cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_MAIN_CONFIG'
+[cache]
+ref = "HEAD"
+command = "mkdir -p _build/dev && printf 'main cache' > _build/dev/value"
+EOF_MAIN_CONFIG
+  git -C "$MAIN_REPO" add .worktree.toml
+  git -C "$MAIN_REPO" commit -qm "configure main cache"
+  main_head="$(git -C "$MAIN_REPO" rev-parse HEAD)"
+
+  git -C "$WORKTREE_ONE" reset -q --hard "$main_head"
+  cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_FEATURE_CONFIG'
+[cache]
+ref = "HEAD"
+command = "mkdir -p _build/dev && printf 'feature cache' > _build/dev/value"
+EOF_FEATURE_CONFIG
+  git -C "$WORKTREE_ONE" add .worktree.toml
+  git -C "$WORKTREE_ONE" commit -qm "change cache on feature"
+
+  run bash -c "cd \"$WORKTREE_ONE\" && \"$WERKSFEER\" cache warm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"at ${main_head:0:12}"* ]]
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" cache status"
+  [ "$status" -eq 0 ]
+  cache_root="$(printf '%s\n' "$output" | sed -n 's/^cache_root=//p')"
+  [ "$(cat "${cache_root}/checkout/_build/dev/value")" = "main cache" ]
+}
+
 @test "PostgreSQL template fingerprints only committed seed inputs" {
   provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
 
@@ -457,6 +784,9 @@ defmodule Example.Changed do
 end
 EOF_CHANGED
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+auto_warm = false
+
 [setup]
 command = "mix compile"
 EOF_CONFIG
@@ -591,7 +921,8 @@ EOF_CONFIG
   printf 'build\n' > "${MAIN_REPO}/_build/dev/value"
   printf 'dependency\n' > "${MAIN_REPO}/deps/example/value"
   cat > "${MAIN_REPO}/.worktree.toml" <<'EOF_CONFIG'
-# Use framework defaults without a custom setup command.
+[cache]
+auto_warm = false
 EOF_CONFIG
   git -C "$MAIN_REPO" add .worktree.toml
   git -C "$MAIN_REPO" commit -qm "use automatic setup"
@@ -652,6 +983,9 @@ printf 'npm:%s\n' "$*" >> "$COMMAND_LOG"
 EOF_NPM
   chmod +x "${fake_bin}/mix" "${fake_bin}/npm"
   cat > "${WORKTREE_ONE}/.worktree.toml" <<'EOF_CONFIG'
+[cache]
+auto_warm = false
+
 [setup]
 node_install = "npm install"
 
@@ -701,6 +1035,9 @@ enabled = ["postgres"]
 
 [database]
 base_name = "rails_example"
+
+[cache]
+auto_warm = false
 EOF_CONFIG
   git -C "$rails_main" add Gemfile bin/rails config/database.yml .worktree.toml
   git -C "$rails_main" commit -qm initial
