@@ -103,6 +103,16 @@ teardown() {
   spaced_worktree="${TEST_ROOT}/worktrees/space name"
   git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced_worktree" HEAD
   spaced="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$spaced_worktree")"
+  moved_old="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_TWO")"
+  moved_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_TWO")"
+  cat > "${WORKTREE_TWO}/.envrc" <<EOF_ENVRC
+# >>> werksfeer managed environment >>>
+export DATABASE_NAME="${moved_old}"
+export TEST_DATABASE_NAME="${moved_old}_test"
+# <<< werksfeer managed environment <<<
+EOF_ENVRC
+  mkdir -p "${TEST_ROOT}/moved"
+  git -C "$MAIN_REPO" worktree move "$WORKTREE_TWO" "${TEST_ROOT}/moved/two"
   orphan_path="${TEST_ROOT}/worktrees/removed"
   orphan="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$orphan_path")"
   foreign_project="${TEST_ROOT}/other/example"
@@ -115,12 +125,13 @@ teardown() {
   foreign_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$foreign_project" "$orphan_path")"
   printf '%s\t%s\n' "$active" "$active_owner" > "$db_state"
   printf '%s\t%s\n' "$spaced" "$spaced_owner" >> "$db_state"
+  printf '%s\t%s\n' "$moved_old" "$moved_owner" >> "$db_state"
+  printf '%s\t%s\n' "${moved_old}_test" "$moved_owner" >> "$db_state"
   printf '%s\t%s\n' "$orphan" "$orphan_owner" >> "$db_state"
   printf '%s\t%s\n' "${orphan}_test" "$orphan_owner" >> "$db_state"
   printf '%s\t%s\n' "$foreign" "$foreign_owner" >> "$db_state"
   printf '%s\t%s\n' 'worktree_oldbranch_removed' '' >> "$db_state"
   printf '%s\t%s\n' "${active}_test" 'werksfeer:someone-else:worktree' >> "$db_state"
-  bash -c 'source "$1"; register_worktree_path "$2" "$3"; register_worktree_path "$2" "$4"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE" "$orphan_path"
 
   cat > "${fake_bin}/psql" <<'EOF_PSQL'
 #!/usr/bin/env bash
@@ -147,8 +158,25 @@ EOF_DROPDB
   grep -qxF "$orphan" "$drops"
   grep -qxF "${orphan}_test" "$drops"
   [ "$(wc -l < "$drops")" -eq 2 ]
-  grep -qF "$WORKTREE_ONE" "${XDG_DATA_HOME}/werksfeer/worktrees"
-  ! grep -qF "$orphan_path" "${XDG_DATA_HOME}/werksfeer/worktrees"
+}
+
+@test "prune-all continues to other projects when PostgreSQL is unavailable" {
+  second_repo="${TEST_ROOT}/other/example"
+  fake_bin="${TEST_ROOT}/bin"
+  mkdir -p "$second_repo" "$fake_bin" "${XDG_DATA_HOME}/werksfeer"
+  git -C "$second_repo" init -q
+  printf '%s\n%s\n' "$MAIN_REPO" "$second_repo" > "${XDG_DATA_HOME}/werksfeer/projects"
+  cat > "${fake_bin}/psql" <<'EOF_PSQL'
+#!/usr/bin/env bash
+exit 1
+EOF_PSQL
+  chmod +x "${fake_bin}/psql"
+
+  run env PATH="${fake_bin}:$PATH" "$WERKSFEER" --prune-all
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Pruning databases for: example"* ]]
+  [ "$(printf '%s\n' "$output" | grep -c 'Cannot list PostgreSQL databases')" -eq 2 ]
 }
 
 @test "cleanup finds its databases after a worktree and its branch are removed" {
@@ -209,13 +237,12 @@ EOF_DROPDB
 @test "cleanup of a deleted worktree releases only its own allocation without PostgreSQL" {
   functions="${TEST_ROOT}/functions.sh"
   sed '$d' "$WERKSFEER" > "$functions"
-  bash -c 'source "$1"; register_worktree_path "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE"
   git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
   other_repo="${TEST_ROOT}/unrelated"
-  mkdir -p "$other_repo"
+  mkdir -p "$other_repo" "${XDG_DATA_HOME}/werksfeer"
   git -C "$other_repo" init -q
   printf '%s\tone\t4001\t1\t\n' "$MAIN_REPO" > "${XDG_DATA_HOME}/werksfeer/allocations"
-  printf '%s\tone\t4002\t2\t\n' "$other_repo" >> "${XDG_DATA_HOME}/werksfeer/allocations"
+  printf '%s\ttwo\t4002\t2\t\n' "$other_repo" >> "${XDG_DATA_HOME}/werksfeer/allocations"
 
   run bash -c '
     source "$1"
@@ -256,7 +283,78 @@ EOF_ENVRC
   [[ "$output" != *"source:example_dev"* ]]
 }
 
-@test "rerunning setup stops when its recorded legacy database is missing" {
+@test "moving a worktree keeps its owned database on setup" {
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+  old_stem="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  old_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  cat > "${WORKTREE_ONE}/.envrc" <<EOF_ENVRC
+# >>> werksfeer managed environment >>>
+export DATABASE_NAME="${old_stem}"
+export TEST_DATABASE_NAME="${old_stem}_test"
+# <<< werksfeer managed environment <<<
+EOF_ENVRC
+  mkdir -p "${TEST_ROOT}/moved"
+  moved_path="${TEST_ROOT}/moved/one"
+  git -C "$MAIN_REPO" worktree move "$WORKTREE_ONE" "$moved_path"
+  export old_stem old_owner
+
+  run bash -c '
+    source "$1"
+    cd "$2"
+    has_psql() { return 0; }
+    db_exists() { [ "$1" = "$old_stem" ] || [ "$1" = "${old_stem}_test" ]; }
+    database_owner() { printf "%s\n" "$old_owner"; }
+    clone_database() { printf "destination:%s owner:%s\n" "$2" "$3"; }
+    clone_databases elixir
+    [ "$NEW_DEV_DB" = "$old_stem" ]
+    load_project_configuration() { return 0; }
+    use_private_postgres_cluster() { return 1; }
+    run_services_action() { :; }
+    dropdb() { printf "dropped:%s\n" "$2"; }
+    cleanup_worktree "$2"
+  ' _ "$functions" "$moved_path"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"destination:${old_stem} owner:${old_owner}"* ]]
+  [[ "$output" == *"destination:${old_stem}_test owner:${old_owner}"* ]]
+  [[ "$output" == *"dropped:${old_stem}"* ]]
+  [[ "$output" == *"dropped:${old_stem}_test"* ]]
+}
+
+@test "moving the main checkout keeps an existing worktree's owned database" {
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+  old_stem="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  old_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  cat > "${WORKTREE_ONE}/.envrc" <<EOF_ENVRC
+# >>> werksfeer managed environment >>>
+export DATABASE_NAME="${old_stem}"
+export TEST_DATABASE_NAME="${old_stem}_test"
+# <<< werksfeer managed environment <<<
+EOF_ENVRC
+  new_main="${TEST_ROOT}/relocated"
+  mv "$MAIN_REPO" "$new_main"
+  git -C "$new_main" worktree repair "$WORKTREE_ONE" "$WORKTREE_TWO" >/dev/null
+  export old_stem old_owner
+
+  run bash -c '
+    source "$1"
+    cd "$2"
+    has_psql() { return 0; }
+    db_exists() { [ "$1" = "$old_stem" ] || [ "$1" = "${old_stem}_test" ]; }
+    database_owner() { printf "%s\n" "$old_owner"; }
+    clone_database() { printf "destination:%s owner:%s\n" "$2" "$3"; }
+    clone_databases elixir
+    [ "$NEW_DEV_DB" = "$old_stem" ]
+  ' _ "$functions" "$WORKTREE_ONE"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"destination:${old_stem} owner:${old_owner}"* ]]
+  [[ "$output" == *"destination:${old_stem}_test owner:${old_owner}"* ]]
+}
+
+@test "rerunning setup uses the template when a recorded legacy database was never created" {
   functions="${TEST_ROOT}/functions.sh"
   sed '$d' "$WERKSFEER" > "$functions"
   cat > "${WORKTREE_ONE}/.envrc" <<'EOF_ENVRC'
@@ -270,13 +368,13 @@ EOF_ENVRC
     cd "$2"
     has_psql() { return 0; }
     db_exists() { return 1; }
-    clone_database() { printf "unexpected clone\n"; }
+    clone_database() { printf "source:%s destination:%s\n" "$1" "$2"; }
     clone_databases elixir
   ' _ "$functions" "$WORKTREE_ONE"
 
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"Previously configured database worktree_placeholder_one is missing"* ]]
-  [[ "$output" != *"unexpected clone"* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Previously configured database worktree_placeholder_one is absent"* ]]
+  [[ "$output" == *"source:example_dev"* ]]
 }
 
 @test "a failed ownership comment removes its new clone" {

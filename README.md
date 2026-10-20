@@ -273,9 +273,13 @@ existing worktree, it copies the databases recorded in that worktree's
 werksfeer-managed environment block into the new namespace, preserving their
 data. The old clones remain untouched as a backup; remove them manually after
 checking which project owns them. If a recorded database is missing or already
-has an ownership comment, setup stops for review instead of silently replacing
-its data. `--prune` only drops orphaned clones in the current project's
-namespace. Private PostgreSQL clusters are unaffected.
+has an ownership comment from another worktree, setup stops for review instead
+of silently replacing its data. If the recorded database is missing, setup
+clones from the project template. A moved worktree keeps using its recorded,
+owned databases. `--prune` only drops orphaned clones in the current project's
+namespace. Older clones without an ownership comment are left for manual
+cleanup because werksfeer cannot establish which project owns them. Private
+PostgreSQL clusters are unaffected.
 
 Fresh worktrees still clone from the project's development and test templates.
 Only an existing shared-PostgreSQL worktree whose setup runs again after the
