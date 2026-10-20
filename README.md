@@ -277,9 +277,12 @@ has an ownership comment, setup stops for review instead of silently replacing
 its data. `--prune` only drops orphaned clones in the current project's
 namespace. Private PostgreSQL clusters are unaffected.
 
-The first copy needs disk space for the new databases and may interrupt active
-connections to the old databases while PostgreSQL clones them. A clone or
-ownership error stops setup before werksfeer rewrites the worktree's environment.
+Fresh worktrees still clone from the project's development and test templates.
+Only an existing shared-PostgreSQL worktree whose setup runs again after the
+upgrade copies its previously configured databases. That one-time copy needs
+disk space and may briefly interrupt local clients connected to its old
+databases. A clone or ownership error stops setup before werksfeer rewrites the
+worktree's environment.
 
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)
