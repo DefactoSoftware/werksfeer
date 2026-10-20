@@ -869,7 +869,7 @@ legacy_database_source() {
 # stop instead of replacing a live database with a fresh template clone.
 moved_database_owner() {
   local candidate="$1" expected_owner="$2" project_root="$3" worktree_path="$4"
-  local actual old_worktree old_project
+  local actual old_worktree old_project old_stem
   actual="$(database_owner "$candidate")" || return 1
   [ -n "$actual" ] || return 1
   if [ "$actual" = "$expected_owner" ]; then
@@ -886,10 +886,11 @@ moved_database_owner() {
   old_project="${old_project%:}"
   if [ -d "$old_project" ]; then
     [ "$(cd "$old_project" && pwd -P)" = "$(cd "$project_root" && pwd -P)" ] || return 1
+    old_stem="$(worktree_database_stem "$old_project" "$old_worktree")" || return 1
+    [ "$candidate" = "$old_stem" ] || [ "$candidate" = "${old_stem}_test" ] || return 1
   fi
   if [ "$old_worktree" != "$(canonical_worktree_path "$worktree_path")" ]; then
     [ -d "$old_project" ] || return 1
-    [ "$(basename "$old_worktree")" = "$(basename "$worktree_path")" ] || return 1
     [ ! -e "$old_worktree" ] || return 1
   else
     [ ! -e "$old_project" ] || return 1

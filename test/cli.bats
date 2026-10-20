@@ -112,7 +112,7 @@ export TEST_DATABASE_NAME="${moved_old}_test"
 # <<< werksfeer managed environment <<<
 EOF_ENVRC
   mkdir -p "${TEST_ROOT}/moved"
-  git -C "$MAIN_REPO" worktree move "$WORKTREE_TWO" "${TEST_ROOT}/moved/two"
+  git -C "$MAIN_REPO" worktree move "$WORKTREE_TWO" "${TEST_ROOT}/moved/renamed-two"
   orphan_path="${TEST_ROOT}/worktrees/removed"
   orphan="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$orphan_path")"
   foreign_project="${TEST_ROOT}/other/example"
@@ -295,7 +295,7 @@ export TEST_DATABASE_NAME="${old_stem}_test"
 # <<< werksfeer managed environment <<<
 EOF_ENVRC
   mkdir -p "${TEST_ROOT}/moved"
-  moved_path="${TEST_ROOT}/moved/one"
+  moved_path="${TEST_ROOT}/moved/renamed-one"
   git -C "$MAIN_REPO" worktree move "$WORKTREE_ONE" "$moved_path"
   export old_stem old_owner
 
