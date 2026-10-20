@@ -268,11 +268,18 @@ Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or
 For shared PostgreSQL, clone names now include hashes of the project and
 worktree paths. A branch rename does not change the name. Werksfeer records the
 owning paths in each database's PostgreSQL comment and refuses to reuse or
-delete a database whose ownership does not match. Older `worktree_*` clones
-without this ownership record are left in place during the change; remove them
-manually after checking which project owns them. `--prune` only drops orphaned
-clones in the current project's namespace. Private PostgreSQL clusters are
-unaffected.
+delete a database whose ownership does not match. On the next setup of an
+existing worktree, it copies the databases recorded in that worktree's
+werksfeer-managed environment block into the new namespace, preserving their
+data. The old clones remain untouched as a backup; remove them manually after
+checking which project owns them. If a recorded database is missing or already
+has an ownership comment, setup stops for review instead of silently replacing
+its data. `--prune` only drops orphaned clones in the current project's
+namespace. Private PostgreSQL clusters are unaffected.
+
+The first copy needs disk space for the new databases and may interrupt active
+connections to the old databases while PostgreSQL clones them. A clone or
+ownership error stops setup before werksfeer rewrites the worktree's environment.
 
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)

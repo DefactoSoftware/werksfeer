@@ -708,7 +708,7 @@ has_psql() {
 }
 
 db_exists() {
-  psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  psql -X -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
 # Shared PostgreSQL databases are tied to paths, not branches: Conductor can
@@ -746,11 +746,17 @@ worktree_database_stem() {
   printf '%s%s_%s\n' "$prefix" "${wt_name:0:10}" "${wt_hash:0:12}"
 }
 
-database_owner_marker() {
-  local project_root="$1" worktree_path="$2"
+database_owner_prefix() {
+  local project_root="$1"
   project_root="$(cd "$project_root" && pwd -P)" || return 1
+  printf 'werksfeer:%s:' "$project_root"
+}
+
+database_owner_marker() {
+  local project_root="$1" worktree_path="$2" prefix
+  prefix="$(database_owner_prefix "$project_root")" || return 1
   worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
-  printf 'werksfeer:%s:%s' "$project_root" "$worktree_path"
+  printf '%s%s' "$prefix" "$worktree_path"
 }
 
 sql_literal() {
@@ -764,7 +770,7 @@ sql_identifier() {
 database_owner() {
   local name
   name="$(sql_literal "$1")"
-  psql -At -c "SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = '$name';" 2>/dev/null
+  psql -X -At -c "SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = '$name';" 2>/dev/null
 }
 
 database_owned_by() {
@@ -794,16 +800,67 @@ clone_database() {
     quoted_source="$(sql_literal "$source")"
     quoted_owner="$(sql_literal "$owner")"
     source_identifier="$(sql_identifier "$source")"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$quoted_source' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${destination}\" WITH TEMPLATE \"${source_identifier}\";"; then
+    psql -X -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$quoted_source' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! psql -X -q -c "CREATE DATABASE \"${destination}\" WITH TEMPLATE \"${source_identifier}\";"; then
       log_error "Failed to clone $source -> $destination"
       return 1
     fi
-    if ! psql -q -c "COMMENT ON DATABASE \"${destination}\" IS '${quoted_owner}';"; then
-      log_error "Failed to record ownership of $destination; leaving it in place"
+    if ! psql -X -q -c "COMMENT ON DATABASE \"${destination}\" IS '${quoted_owner}';"; then
+      log_error "Failed to record ownership of $destination; removing the new clone"
+      dropdb --if-exists "$destination" 2>/dev/null || log_warn "Could not remove untagged clone $destination"
       return 1
     fi
   fi
+}
+
+# Read only values that a previous werksfeer run wrote. Never source .envrc:
+# it may contain arbitrary project code. The old name can survive a branch
+# rename because it is recorded in the managed block.
+managed_database_name() {
+  local key="$1" file value
+  for file in .envrc .env.local; do
+    [ -f "$file" ] || continue
+    value="$(awk -v key="$key" '
+      $0 == "# >>> werksfeer managed environment >>>" { managed = 1; next }
+      $0 == "# <<< werksfeer managed environment <<<" { managed = 0; next }
+      managed {
+        line = $0
+        sub(/^export /, "", line)
+        if (index(line, key "=\"") == 1) {
+          sub("^" key "=\"", "", line)
+          sub(/"$/, "", line)
+          if (line ~ /^[a-z0-9_]+$/) { print line; exit }
+        }
+      }
+    ' "$file")"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+}
+
+legacy_database_source() {
+  local key="$1" wt_name="$2" new_name="$3" candidate actual
+  candidate="$(managed_database_name "$key")"
+  [ -n "$candidate" ] || return 0
+  [ "$candidate" != "$new_name" ] || return 0
+
+  case "$key:$candidate" in
+    DATABASE_NAME:worktree_*_"$wt_name"|TEST_DATABASE_NAME:worktree_*_"${wt_name}_test") ;;
+    *) return 0 ;;
+  esac
+
+  if ! db_exists "$candidate"; then
+    log_error "Previously configured database $candidate is missing; refusing to replace its data with a template"
+    return 1
+  fi
+  actual="$(database_owner "$candidate")" || return 1
+  if [ -n "$actual" ]; then
+    log_error "Previously configured database $candidate has an ownership comment; refusing automatic migration"
+    return 1
+  fi
+  printf '%s\n' "$candidate"
 }
 
 get_base_db_names() {
@@ -853,11 +910,28 @@ clone_databases() {
   base_dev="$(echo "$db_names" | awk '{print $1}')"
   base_test="$(echo "$db_names" | awk '{print $2}')"
 
-  local stem owner
-  stem="$(worktree_database_stem "$(get_main_worktree_path)" "$(pwd)")" || return 1
-  owner="$(database_owner_marker "$(get_main_worktree_path)" "$(pwd)")" || return 1
+  local stem owner main_path wt_name legacy_dev legacy_test
+  main_path="$(get_main_worktree_path)"
+  wt_name="$(sanitize_name "$(get_worktree_name)")"
+  stem="$(worktree_database_stem "$main_path" "$(pwd)")" || return 1
+  owner="$(database_owner_marker "$main_path" "$(pwd)")" || return 1
   NEW_DEV_DB="$stem"
   NEW_TEST_DB="${stem}_test"
+
+  if ! db_exists "$NEW_DEV_DB"; then
+    legacy_dev="$(legacy_database_source DATABASE_NAME "$wt_name" "$NEW_DEV_DB")" || return 1
+    if [ -n "$legacy_dev" ]; then
+      log_info "Preserving existing development data from $legacy_dev in a project-scoped clone"
+      base_dev="$legacy_dev"
+    fi
+  fi
+  if ! db_exists "$NEW_TEST_DB"; then
+    legacy_test="$(legacy_database_source TEST_DATABASE_NAME "$wt_name" "$NEW_TEST_DB")" || return 1
+    if [ -n "$legacy_test" ]; then
+      log_info "Preserving existing test data from $legacy_test in a project-scoped clone"
+      base_test="$legacy_test"
+    fi
+  fi
 
   clone_database "$base_dev" "$NEW_DEV_DB" "$owner" || return 1
   clone_database "$base_test" "$NEW_TEST_DB" "$owner"
@@ -1314,6 +1388,31 @@ registry_file() {
   echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/projects"
 }
 
+worktree_registry_file() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/worktrees"
+}
+
+register_worktree_path() {
+  local project_root="$1" worktree_path="$2" reg entry
+  reg="$(worktree_registry_file)"
+  worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
+  entry="$(printf '%s\t%s' "$project_root" "$worktree_path")"
+  mkdir -p "$(dirname "$reg")"
+  if ! grep -qxF "$entry" "$reg" 2>/dev/null; then
+    printf '%s\n' "$entry" >> "$reg"
+  fi
+}
+
+deregister_worktree_path() {
+  local project_root="$1" worktree_path="$2" reg tmp
+  reg="$(worktree_registry_file)"
+  [ -f "$reg" ] || return 0
+  worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
+  tmp="${reg}.tmp"
+  awk -F '\t' -v p="$project_root" -v w="$worktree_path" '!($1 == p && $2 == w)' "$reg" > "$tmp"
+  mv "$tmp" "$reg"
+}
+
 register_project() {
   local reg
   reg="$(registry_file)"
@@ -1329,6 +1428,48 @@ register_project() {
 # ---------------------------------------------------------------------------
 # Cleanup (drop databases for a specific worktree)
 # ---------------------------------------------------------------------------
+
+resolve_deleted_worktree_project() {
+  local worktree_path="$1" reg candidate stem owner db match="" saved_path
+  worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
+  reg="$(worktree_registry_file)"
+  if [ -f "$reg" ]; then
+    while IFS="$(printf '\t')" read -r candidate saved_path; do
+      [ "$saved_path" = "$worktree_path" ] || continue
+      [ -d "$candidate" ] && (cd "$candidate" && is_git_repo) || continue
+      if [ -n "$match" ] && [ "$match" != "$candidate" ]; then
+        log_warn "More than one registered project claims $worktree_path"
+        return 1
+      fi
+      match="$candidate"
+    done < "$reg"
+    if [ -n "$match" ]; then
+      printf '%s\n' "$match"
+      return 0
+    fi
+  fi
+
+  has_psql || return 1
+  reg="$(registry_file)"
+  [ -f "$reg" ] || return 1
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && [ -d "$candidate" ] || continue
+    (cd "$candidate" && is_git_repo) || continue
+    stem="$(worktree_database_stem "$candidate" "$worktree_path")" || continue
+    owner="$(database_owner_marker "$candidate" "$worktree_path")" || continue
+    for db in "$stem" "${stem}_test"; do
+      if db_exists "$db" && database_owned_by "$db" "$owner"; then
+        if [ -n "$match" ] && [ "$match" != "$candidate" ]; then
+          log_warn "More than one registered project claims $worktree_path"
+          return 1
+        fi
+        match="$candidate"
+      fi
+    done
+  done < "$reg"
+  [ -n "$match" ] || return 1
+  printf '%s\n' "$match"
+}
 
 cleanup_worktree() {
   local worktree_path="$1"
@@ -1350,14 +1491,17 @@ cleanup_worktree() {
       fi
       run_services_action "cleanup" "$project_root"
     fi
-  elif is_git_repo; then
-    project_root="$(get_main_worktree_path)"
-    main_path="$project_root"
+  else
+    main_path="$(resolve_deleted_worktree_project "$worktree_path")" || main_path=""
   fi
 
-  # Deregister port/redis allocation
-  deregister_allocation "$wt_name" "$main_path"
-  log_info "Released port/redis allocation"
+  if [ -n "$main_path" ]; then
+    deregister_allocation "$wt_name" "$main_path"
+    deregister_worktree_path "$main_path" "$worktree_path"
+    log_info "Released port/redis allocation"
+  else
+    log_warn "Cannot verify the project for $worktree_path; leaving its allocation and shared databases in place"
+  fi
 
   if [ "$private_postgres" = true ]; then
     return 0
@@ -1368,14 +1512,13 @@ cleanup_worktree() {
     return 0
   fi
 
-  if [ -z "$project_root" ]; then
-    log_warn "Cannot identify the project for $worktree_path; leaving shared databases in place"
+  if [ -z "$main_path" ]; then
     return 0
   fi
 
   local stem owner db
-  stem="$(worktree_database_stem "$project_root" "$worktree_path")" || return 1
-  owner="$(database_owner_marker "$project_root" "$worktree_path")" || return 1
+  stem="$(worktree_database_stem "$main_path" "$worktree_path")" || return 1
+  owner="$(database_owner_marker "$main_path" "$worktree_path")" || return 1
   for db in "$stem" "${stem}_test"; do
     if db_exists "$db"; then
       if database_owned_by "$db" "$owner"; then
@@ -1400,16 +1543,27 @@ prune_project() {
     return 0
   fi
 
+  local project_main project_main_canonical active_paths active_wt_names="" active_wt_paths="" wt_path
+  project_main="$(cd "$project_dir" && get_main_worktree_path)"
+  project_main_canonical="$(cd "$project_main" && pwd -P)" || return 1
+  active_paths="$(cd "$project_dir" && git worktree list --porcelain | sed -n 's/^worktree //p')" || return 1
+  if [ -z "$active_paths" ]; then
+    log_error "Cannot list worktrees for $project_dir; leaving allocations and databases in place"
+    return 1
+  fi
+  while IFS= read -r wt_path; do
+    active_wt_names="${active_wt_names}$(basename "$wt_path")
+"
+    active_wt_paths="${active_wt_paths}$(canonical_worktree_path "$wt_path")
+"
+  done <<EOF_ACTIVE_PATHS
+$active_paths
+EOF_ACTIVE_PATHS
+
   # Prune stale allocations: remove entries for worktrees that no longer exist
   local alloc
   alloc="$(allocations_file)"
   if [ -f "$alloc" ]; then
-    local active_wt_names=""
-    while IFS= read -r wt_path; do
-      active_wt_names="${active_wt_names}$(basename "$wt_path")
-"
-    done < <(cd "$project_dir" && git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
-
     local tmp="${alloc}.tmp"
     while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
       if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
@@ -1421,6 +1575,25 @@ prune_project() {
     mv "$tmp" "$alloc"
   fi
 
+  # Retire path mappings for worktrees Git no longer knows about.
+  local worktree_reg
+  worktree_reg="$(worktree_registry_file)"
+  if [ -f "$worktree_reg" ]; then
+    local tmp="${worktree_reg}.tmp"
+    while IFS="$(printf '\t')" read -r a_project a_path; do
+      local a_project_canonical=""
+      if [ -d "$a_project" ]; then
+        a_project_canonical="$(cd "$a_project" && pwd -P)"
+      fi
+      if [ "$a_project_canonical" = "$project_main_canonical" ] && ! printf '%s' "$active_wt_paths" | grep -qxF "$a_path"; then
+        log_debug "Removing stale worktree path: $a_path"
+      else
+        printf '%s\t%s\n' "$a_project" "$a_path"
+      fi
+    done < "$worktree_reg" > "$tmp"
+    mv "$tmp" "$worktree_reg"
+  fi
+
   if ! has_psql; then
     log_warn "psql not found, skipping database prune"
     return 0
@@ -1428,11 +1601,12 @@ prune_project() {
 
   # Only inspect names in this project's namespace. Legacy shared names are
   # deliberately left alone because their owner cannot be established.
-  local project_root prefix all_wt_dbs
-  project_root="$(cd "$project_dir" && get_main_worktree_path)"
+  local project_root prefix owner_prefix all_wt_dbs
+  project_root="$project_main"
   project_root="$(cd "$project_root" && pwd -P)" || return 1
   prefix="$(project_database_prefix "$project_root")" || return 1
-  all_wt_dbs="$(psql -lqt 2>/dev/null | awk -v prefix="$prefix" 'index($1, prefix) == 1 {print $1}')"
+  owner_prefix="$(database_owner_prefix "$project_root")" || return 1
+  all_wt_dbs="$(psql -X -lqt 2>/dev/null | awk -v prefix="$prefix" 'index($1, prefix) == 1 {print $1}')"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
@@ -1447,17 +1621,18 @@ prune_project() {
     active_dbs="${active_dbs}${stem}
 ${stem}_test
 "
-  done < <(cd "$project_dir" && git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  done <<EOF_ACTIVE_PATHS
+$active_paths
+EOF_ACTIVE_PATHS
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue
 
-    local actual owner_prefix
+    local actual
     actual="$(database_owner "$db")" || {
       log_warn "Cannot check ownership of $db; leaving it in place"
       continue
     }
-    owner_prefix="werksfeer:${project_root}:"
     case "$actual" in
       "$owner_prefix"*) ;;
       *) log_warn "Leaving $db in place: ownership does not match"; continue ;;
@@ -1554,6 +1729,7 @@ run_setup() {
 
   # Register for prune-all
   register_project
+  register_worktree_path "$main_path" "$worktree_path"
 
   # Step 1: Copy env files
   log_step "Copying environment files"
