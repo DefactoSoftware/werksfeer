@@ -711,6 +711,101 @@ db_exists() {
   psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
+# Shared PostgreSQL databases are tied to paths, not branches: Conductor can
+# rename a branch after setup. Keep names below PostgreSQL's 63-byte limit.
+canonical_worktree_path() {
+  local parent
+  if [ -d "$1" ]; then
+    (cd "$1" && pwd -P)
+    return
+  fi
+  if parent="$(cd "$(dirname "$1")" 2>/dev/null && pwd -P)"; then
+    printf '%s/%s\n' "$parent" "$(basename "$1")"
+  else
+    case "$1" in
+      /*) printf '%s\n' "$1" ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+project_database_prefix() {
+  local project_root="$1" project_name project_hash
+  project_root="$(cd "$project_root" && pwd -P)" || return 1
+  project_name="$(sanitize_name "$(basename "$project_root")")"
+  project_hash="$(printf '%s' "$project_root" | git -C "$project_root" hash-object --stdin)" || return 1
+  printf 'worktree_%s_%s_' "${project_name:0:10}" "${project_hash:0:12}"
+}
+
+worktree_database_stem() {
+  local project_root="$1" worktree_path="$2" prefix wt_name wt_hash
+  prefix="$(project_database_prefix "$project_root")" || return 1
+  worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
+  wt_name="$(sanitize_name "$(basename "$worktree_path")")"
+  wt_hash="$(printf '%s' "$worktree_path" | git -C "$project_root" hash-object --stdin)" || return 1
+  printf '%s%s_%s\n' "$prefix" "${wt_name:0:10}" "${wt_hash:0:12}"
+}
+
+database_owner_marker() {
+  local project_root="$1" worktree_path="$2"
+  project_root="$(cd "$project_root" && pwd -P)" || return 1
+  worktree_path="$(canonical_worktree_path "$worktree_path")" || return 1
+  printf 'werksfeer:%s:%s' "$project_root" "$worktree_path"
+}
+
+sql_literal() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+sql_identifier() {
+  printf '%s' "$1" | sed 's/"/""/g'
+}
+
+database_owner() {
+  local name
+  name="$(sql_literal "$1")"
+  psql -At -c "SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = '$name';" 2>/dev/null
+}
+
+database_owned_by() {
+  local actual
+  actual="$(database_owner "$1")" || return 1
+  [ "$actual" = "$2" ]
+}
+
+clone_database() {
+  local source="$1" destination="$2" owner="$3" actual
+
+  if db_exists "$destination"; then
+    actual="$(database_owner "$destination")" || {
+      log_error "Cannot check ownership of $destination"
+      return 1
+    }
+    if [ "$actual" != "$owner" ]; then
+      log_error "Database $destination already exists without matching werksfeer ownership; refusing to reuse it"
+      return 1
+    fi
+    log_info "Database $destination already exists, skipping"
+  elif ! db_exists "$source"; then
+    log_warn "Template database $source not found, skipping DB clone"
+  else
+    log_info "Cloning $source -> $destination"
+    local quoted_source quoted_owner source_identifier
+    quoted_source="$(sql_literal "$source")"
+    quoted_owner="$(sql_literal "$owner")"
+    source_identifier="$(sql_identifier "$source")"
+    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$quoted_source' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! psql -q -c "CREATE DATABASE \"${destination}\" WITH TEMPLATE \"${source_identifier}\";"; then
+      log_error "Failed to clone $source -> $destination"
+      return 1
+    fi
+    if ! psql -q -c "COMMENT ON DATABASE \"${destination}\" IS '${quoted_owner}';"; then
+      log_error "Failed to record ownership of $destination; leaving it in place"
+      return 1
+    fi
+  fi
+}
+
 get_base_db_names() {
   local project_type="$1"
   local project_name
@@ -758,39 +853,14 @@ clone_databases() {
   base_dev="$(echo "$db_names" | awk '{print $1}')"
   base_test="$(echo "$db_names" | awk '{print $2}')"
 
-  local wt_name wt_branch
-  wt_name="$(sanitize_name "$(get_worktree_name)")"
-  wt_branch="$(sanitize_name "$(get_worktree_branch)")"
+  local stem owner
+  stem="$(worktree_database_stem "$(get_main_worktree_path)" "$(pwd)")" || return 1
+  owner="$(database_owner_marker "$(get_main_worktree_path)" "$(pwd)")" || return 1
+  NEW_DEV_DB="$stem"
+  NEW_TEST_DB="${stem}_test"
 
-  NEW_DEV_DB="worktree_${wt_branch}_${wt_name}"
-  NEW_TEST_DB="worktree_${wt_branch}_${wt_name}_test"
-
-  # Clone dev database
-  if db_exists "$NEW_DEV_DB"; then
-    log_info "Database $NEW_DEV_DB already exists, skipping"
-  elif ! db_exists "$base_dev"; then
-    log_warn "Template database $base_dev not found, skipping dev DB clone"
-  else
-    log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
-      log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
-    fi
-  fi
-
-  # Clone test database
-  if db_exists "$NEW_TEST_DB"; then
-    log_info "Database $NEW_TEST_DB already exists, skipping"
-  elif ! db_exists "$base_test"; then
-    log_warn "Template database $base_test not found, skipping test DB clone"
-  else
-    log_info "Cloning $base_test -> $NEW_TEST_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
-      log_error "Failed to clone $base_test -> $NEW_TEST_DB"
-    fi
-  fi
-
+  clone_database "$base_dev" "$NEW_DEV_DB" "$owner" || return 1
+  clone_database "$base_test" "$NEW_TEST_DB" "$owner"
 }
 
 use_private_postgres_cluster() {
@@ -1280,6 +1350,9 @@ cleanup_worktree() {
       fi
       run_services_action "cleanup" "$project_root"
     fi
+  elif is_git_repo; then
+    project_root="$(get_main_worktree_path)"
+    main_path="$project_root"
   fi
 
   # Deregister port/redis allocation
@@ -1295,38 +1368,24 @@ cleanup_worktree() {
     return 0
   fi
 
-  wt_name="$(sanitize_name "$wt_name")"
-
-  # Try to get the branch from the worktree if it still exists
-  local wt_branch=""
-  if [ -d "$worktree_path" ]; then
-    wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
+  if [ -z "$project_root" ]; then
+    log_warn "Cannot identify the project for $worktree_path; leaving shared databases in place"
+    return 0
   fi
 
-  if [ -n "$wt_branch" ]; then
-    # We know the exact DB names
-    local dev_db="worktree_${wt_branch}_${wt_name}"
-    local test_db="worktree_${wt_branch}_${wt_name}_test"
-    for db in "$dev_db" "$test_db"; do
-      if db_exists "$db"; then
+  local stem owner db
+  stem="$(worktree_database_stem "$project_root" "$worktree_path")" || return 1
+  owner="$(database_owner_marker "$project_root" "$worktree_path")" || return 1
+  for db in "$stem" "${stem}_test"; do
+    if db_exists "$db"; then
+      if database_owned_by "$db" "$owner"; then
         log_info "Dropping $db"
         dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      else
+        log_warn "Leaving $db in place: ownership does not match"
       fi
-    done
-  else
-    # Worktree already deleted — find DBs by suffix match on the worktree name
-    log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
-    local all_wt_dbs
-    all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
-    echo "$all_wt_dbs" | while IFS= read -r db; do
-      [ -z "$db" ] && continue
-      # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
-      if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
-        log_info "Dropping $db"
-        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
-      fi
-    done
-  fi
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -1346,12 +1405,10 @@ prune_project() {
   alloc="$(allocations_file)"
   if [ -f "$alloc" ]; then
     local active_wt_names=""
-    while IFS= read -r wt_line; do
-      local wt_path
-      wt_path="$(echo "$wt_line" | awk '{print $1}')"
+    while IFS= read -r wt_path; do
       active_wt_names="${active_wt_names}$(basename "$wt_path")
 "
-    done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+    done < <(cd "$project_dir" && git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
 
     local tmp="${alloc}.tmp"
     while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
@@ -1369,33 +1426,42 @@ prune_project() {
     return 0
   fi
 
-  # Get all worktree_* databases
-  local all_wt_dbs
-  all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  # Only inspect names in this project's namespace. Legacy shared names are
+  # deliberately left alone because their owner cannot be established.
+  local project_root prefix all_wt_dbs
+  project_root="$(cd "$project_dir" && get_main_worktree_path)"
+  project_root="$(cd "$project_root" && pwd -P)" || return 1
+  prefix="$(project_database_prefix "$project_root")" || return 1
+  all_wt_dbs="$(psql -lqt 2>/dev/null | awk -v prefix="$prefix" 'index($1, prefix) == 1 {print $1}')"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
     return 0
   fi
 
-  # Build exact list of expected DB names for all active worktrees.
-  # Each worktree produces two DBs: worktree_{branch}_{name} (dev)
-  # and worktree_{branch}_{name}_test (test).
-  # We cannot strip _test to infer stems because the worktree name
-  # itself may end with _test (e.g. wt-ragout-test).
+  # Build exact names for active worktrees. Branch names never enter the name.
   local active_dbs=""
-  while IFS= read -r wt_line; do
-    local wt_path wt_basename wt_branch
-    wt_path="$(echo "$wt_line" | awk '{print $1}')"
-    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
-    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
-    active_dbs="${active_dbs}worktree_${wt_branch}_${wt_basename}
-worktree_${wt_branch}_${wt_basename}_test
+  while IFS= read -r wt_path; do
+    local stem
+    stem="$(worktree_database_stem "$project_root" "$wt_path")" || return 1
+    active_dbs="${active_dbs}${stem}
+${stem}_test
 "
-  done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+  done < <(cd "$project_dir" && git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue
+
+    local actual owner_prefix
+    actual="$(database_owner "$db")" || {
+      log_warn "Cannot check ownership of $db; leaving it in place"
+      continue
+    }
+    owner_prefix="werksfeer:${project_root}:"
+    case "$actual" in
+      "$owner_prefix"*) ;;
+      *) log_warn "Leaving $db in place: ownership does not match"; continue ;;
+    esac
 
     local found=false
     while IFS= read -r active_db; do

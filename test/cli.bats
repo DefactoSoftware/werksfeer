@@ -51,6 +51,124 @@ teardown() {
   rm -rf "$TEST_ROOT"
 }
 
+@test "shared database names distinguish projects and survive branch renames" {
+  other_project="${TEST_ROOT}/other/example"
+  mkdir -p "$other_project"
+  git -C "$other_project" init -q
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+
+  run bash -c '
+    source "$1"
+    first="$(worktree_database_stem "$2" "$3")"
+    second="$(worktree_database_stem "$4" "$3")"
+    [ "$first" != "$second" ] || exit 1
+    [ "${#first}" -le 58 ] || exit 1
+    cd "$3"
+    [ "$(worktree_database_stem "$2" .)" = "$first" ] || exit 1
+    git -C "$3" switch -q -c renamed
+    [ "$(worktree_database_stem "$2" "$3")" = "$first" ]
+  ' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE" "$other_project"
+
+  [ "$status" -eq 0 ]
+}
+
+@test "shared cloning refuses a database with missing or foreign ownership" {
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+
+  run bash -c '
+    source "$1"
+    db_exists() { return 0; }
+    database_owner() { printf "%s\n" "$FOREIGN_OWNER"; }
+    for FOREIGN_OWNER in "" "werksfeer:other:worktree"; do
+      if clone_database template worktree_collision "werksfeer:expected:worktree"; then
+        exit 1
+      fi
+    done
+  ' _ "$functions"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refusing to reuse it"* ]]
+}
+
+@test "prune drops only orphaned databases owned by the current project" {
+  fake_bin="${TEST_ROOT}/bin"
+  mkdir -p "$fake_bin"
+  db_state="${TEST_ROOT}/databases"
+  drops="${TEST_ROOT}/drops"
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+  active="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  spaced_worktree="${TEST_ROOT}/worktrees/space name"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced_worktree" HEAD
+  spaced="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$spaced_worktree")"
+  orphan_path="${TEST_ROOT}/worktrees/removed"
+  orphan="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$orphan_path")"
+  foreign_project="${TEST_ROOT}/other/example"
+  mkdir -p "$foreign_project"
+  git -C "$foreign_project" init -q
+  foreign="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$foreign_project" "$orphan_path")"
+  active_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  spaced_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$spaced_worktree")"
+  orphan_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$orphan_path")"
+  foreign_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$foreign_project" "$orphan_path")"
+  printf '%s\t%s\n' "$active" "$active_owner" > "$db_state"
+  printf '%s\t%s\n' "$spaced" "$spaced_owner" >> "$db_state"
+  printf '%s\t%s\n' "$orphan" "$orphan_owner" >> "$db_state"
+  printf '%s\t%s\n' "${orphan}_test" "$orphan_owner" >> "$db_state"
+  printf '%s\t%s\n' "$foreign" "$foreign_owner" >> "$db_state"
+  printf '%s\t%s\n' 'worktree_oldbranch_removed' '' >> "$db_state"
+  printf '%s\t%s\n' "${active}_test" 'werksfeer:someone-else:worktree' >> "$db_state"
+
+  cat > "${fake_bin}/psql" <<'EOF_PSQL'
+#!/usr/bin/env bash
+if [ "$1" = -lqt ]; then
+  awk -F '\t' '{print $1 " |"}' "$DB_STATE"
+else
+  query="${*: -1}"
+  name="${query##*datname = \'}"
+  name="${name%%\'*}"
+  awk -F '\t' -v name="$name" '$1 == name {print $2}' "$DB_STATE"
+fi
+EOF_PSQL
+  cat > "${fake_bin}/dropdb" <<'EOF_DROPDB'
+#!/usr/bin/env bash
+printf '%s\n' "${*: -1}" >> "$DROPS"
+EOF_DROPDB
+  chmod +x "${fake_bin}/psql" "${fake_bin}/dropdb"
+
+  run env PATH="${fake_bin}:$PATH" DB_STATE="$db_state" DROPS="$drops" bash -c 'cd "$1"; "$2" --prune' _ "$WORKTREE_ONE" "$WERKSFEER"
+
+  [ "$status" -eq 0 ]
+  grep -qxF "$orphan" "$drops"
+  grep -qxF "${orphan}_test" "$drops"
+  [ "$(wc -l < "$drops")" -eq 2 ]
+}
+
+@test "cleanup finds its databases after a worktree and its branch are removed" {
+  functions="${TEST_ROOT}/functions.sh"
+  sed '$d' "$WERKSFEER" > "$functions"
+  expected="$(bash -c 'source "$1"; worktree_database_stem "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  expected_owner="$(bash -c 'source "$1"; database_owner_marker "$2" "$3"' _ "$functions" "$MAIN_REPO" "$WORKTREE_ONE")"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+  export WORKTREE_ONE expected_owner
+
+  run bash -c '
+    source "$1"
+    cd "$2"
+    has_psql() { return 0; }
+    db_exists() { return 0; }
+    dropdb() { printf "dropped:%s\n" "$2"; }
+    database_owned_by() { [ "$2" = "$expected_owner" ]; }
+    cleanup_worktree "$WORKTREE_ONE"
+  ' _ "$functions" "$MAIN_REPO"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dropped:${expected}"* ]]
+  [[ "$output" == *"dropped:${expected}_test"* ]]
+}
+
 @test "loads service modules from a development checkout" {
   run "$WERKSFEER" --version
 

@@ -265,6 +265,15 @@ When a worktree is removed, `--cleanup` drops its cloned databases and releases 
 
 Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Use `werksfeer --prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees — this is the most reliable approach.
 
+For shared PostgreSQL, clone names now include hashes of the project and
+worktree paths. A branch rename does not change the name. Werksfeer records the
+owning paths in each database's PostgreSQL comment and refuses to reuse or
+delete a database whose ownership does not match. Older `worktree_*` clones
+without this ownership record are left in place during the change; remove them
+manually after checking which project owns them. `--prune` only drops orphaned
+clones in the current project's namespace. Private PostgreSQL clusters are
+unaffected.
+
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)
 werksfeer --cleanup
