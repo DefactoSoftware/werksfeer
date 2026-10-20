@@ -265,28 +265,28 @@ When a worktree is removed, `--cleanup` drops its cloned databases and releases 
 
 Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Use `werksfeer --prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees — this is the most reliable approach.
 
-For shared PostgreSQL, clone names now include hashes of the project and
-worktree paths. A branch rename does not change the name. Werksfeer records the
-owning paths in each database's PostgreSQL comment and refuses to reuse or
+For shared PostgreSQL, clone names use IDs stored in the project's and each
+worktree's Git metadata. Moving a checkout keeps its ID and database; creating
+a new worktree at a reused path gives it a new ID and database. Werksfeer also
+records both IDs in each database's PostgreSQL comment and refuses to reuse or
 delete a database whose ownership does not match. On the next setup of an
-existing worktree, it copies the databases recorded in that worktree's
-werksfeer-managed environment block into the new namespace, preserving their
-data. The old clones remain untouched as a backup; remove them manually after
-checking which project owns them. If a recorded database is missing or already
-has an ownership comment from another worktree, setup stops for review instead
-of silently replacing its data. If the recorded database is missing, setup
-clones from the project template. A moved worktree keeps using its recorded,
-owned databases. `--prune` only drops orphaned clones in the current project's
-namespace. Older clones without an ownership comment are left for manual
-cleanup because werksfeer cannot establish which project owns them. Private
-PostgreSQL clusters are unaffected.
+existing worktree, it copies the database recorded in either generation of its
+werksfeer-managed environment block into the new namespace, preserving its
+data. The old clone remains untouched; check whether anything still uses it
+before removing it manually. A missing recorded database falls back to the
+project template, while a conflicting ownership comment stops setup for
+review. `--prune` drops orphaned clones in the current project's ID namespace
+and reports legacy names it leaves in place. Private PostgreSQL clusters are
+unaffected.
 
 Fresh worktrees still clone from the project's development and test templates.
 Only an existing shared-PostgreSQL worktree whose setup runs again after the
 upgrade copies its previously configured databases. That one-time copy needs
 disk space and may briefly interrupt local clients connected to its old
 databases. A clone or ownership error stops setup before werksfeer rewrites the
-worktree's environment.
+worktree's environment. New clones are created under a temporary name, then
+tagged and renamed together; a later setup removes an interrupted temporary
+clone before retrying.
 
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)
