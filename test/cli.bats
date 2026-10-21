@@ -5,6 +5,11 @@ setup() {
   TEST_ROOT="$(mktemp -d "${BATS_TMPDIR}/werksfeer.XXXXXX")"
   export XDG_DATA_HOME="${TEST_ROOT}/xdg"
   export XDG_CACHE_HOME="${TEST_ROOT}/cache"
+  # werksfeer runs shared-mode database commands with whatever psql is on PATH.
+  # Point libpq at a socket directory that does not exist so no test can reach
+  # the developer's own PostgreSQL server.
+  export PGHOST="${TEST_ROOT}/no-postgres" PGPORT=65432
+  unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGPASSFILE 2>/dev/null || true
   export WERKSFEER_LIB_DIR="${BATS_TEST_DIRNAME}/../lib/werksfeer"
   WERKSFEER="${BATS_TEST_DIRNAME}/../werksfeer"
 
