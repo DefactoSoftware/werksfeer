@@ -161,6 +161,30 @@ if [ -n "${OLD_WERKSFEER:-}" ]; then
     database_missing "$old_db"
 fi
 
+# 6. A workspace set up by werksfeer 0.1.0, which wrote its overrides after a
+#    single marker line, next to a leftover of a long-gone workspace.
+lagos="$(workspace learning_spaces lagos)"
+git -C "${ROOT}/projects/learning_spaces" -c core.hooksPath=/dev/null worktree add -q -b thijs/lagos "$lagos"
+createdb -T learning_spaces_development worktree_thijs_lagos_lagos
+createdb worktree_thijs_lagos_lagos_test
+printf '\n# Worktree overrides (added by werksfeer)\nPORT="3001"\nDATABASE_NAME="worktree_thijs_lagos_lagos"\nTEST_DATABASE_NAME="worktree_thijs_lagos_lagos_test"\n' > "${lagos}/.env.local"
+git -C "$lagos" branch -q -m thijs/lagos-feature
+createdb worktree_thijs_gone_gone
+createdb worktree_thijs_gone_gone_test
+add_workspace learning_spaces lisbon
+check "setup drops leftovers of older versions that no workspace uses" \
+  database_missing worktree_thijs_gone_gone
+check "setup keeps an older version's clone that a renamed workspace uses" \
+  database_exists worktree_thijs_lagos_lagos
+(cd "$lagos" && "$WERKSFEER") > "${ROOT}/setup-lagos.log" 2>&1
+check "rerunning setup in a 0.1.0 workspace keeps its database" \
+  test "$(database_of learning_spaces lagos)" = worktree_thijs_lagos_lagos
+archive_workspace learning_spaces lagos
+check "archiving a 0.1.0 workspace drops its database" \
+  database_missing worktree_thijs_lagos_lagos
+check "archiving a 0.1.0 workspace drops its test database" \
+  database_missing worktree_thijs_lagos_lagos_test
+
 if [ "$failures" -gt 0 ]; then
   printf '\n%s scenario check(s) failed. Remaining databases:\n' "$failures"
   databases_named

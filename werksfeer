@@ -745,8 +745,9 @@ worktree_database_name() {
   printf 'worktree_%s_%s\n' "$project_id" "${dir_name:0:40}"
 }
 
-# The database an older werksfeer recorded for this worktree in its managed
-# environment, named worktree_<branch>_<worktree dir>.
+# The database an older werksfeer recorded for this worktree, named
+# worktree_<branch>_<worktree dir>. Before 0.3 the values followed a single
+# marker line up to the next blank line; later versions use a managed block.
 legacy_database_name() {
   local key="$1" suffix="$2" file value
   for file in .env.local .envrc; do
@@ -754,15 +755,17 @@ legacy_database_name() {
     value="$(awk -v key="$key" '
       $0 == "# >>> werksfeer managed environment >>>" { managed = 1; next }
       $0 == "# <<< werksfeer managed environment <<<" { managed = 0; next }
+      $0 == "# Worktree overrides (added by werksfeer)" { managed = 2; next }
+      managed == 2 && $0 == "" { managed = 0; next }
       managed {
-        sub(/^export /, "")
-        if (index($0, key "=\"") == 1) {
-          value = substr($0, length(key) + 3)
+        line = $0
+        sub(/^export /, "", line)
+        if (index(line, key "=\"") == 1) {
+          value = substr(line, length(key) + 3)
           sub(/"$/, "", value)
-          print value
-          exit
         }
       }
+      END { if (value != "") print value }
     ' "$file")"
     case "$value" in
       worktree_*_"$suffix")
@@ -1525,6 +1528,7 @@ prune_current() {
   main_path="$(get_main_worktree_path)"
   log_step "Pruning orphaned databases for: $(basename "$main_path")"
   prune_project "$main_path"
+  prune_legacy_databases
 }
 
 prune_all() {
@@ -1545,6 +1549,62 @@ prune_all() {
     log_step "Pruning databases for: $(basename "$project_path")"
     prune_project "$project_path"
   done < "$reg"
+  prune_legacy_databases
+}
+
+# Every worktree_* database a worktree's env files mention, plus the names an
+# older werksfeer derived from its branch and directory. Names are cut to 63
+# bytes because PostgreSQL stored longer ones truncated.
+legacy_database_references() {
+  local worktree_path="$1" file name
+  for file in "$worktree_path"/.env*; do
+    [ -f "$file" ] || continue
+    grep -oE 'DATABASE_NAME="worktree_[^"]*"' "$file" | sed 's/^[A-Z_]*="//; s/"$//' || true
+  done
+  name="worktree_$(sanitize_name "$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")_$(sanitize_name "$(basename "$worktree_path")")"
+  printf '%s\n%s_test\n' "$name" "$name"
+}
+
+# Older werksfeer versions named clones worktree_<branch>_<worktree dir> and
+# their cleanup missed renamed branches, so clones of removed worktrees piled
+# up. Such a clone is dropped once no worktree of any registered project
+# references it. Every werksfeer version registers each project it sets up.
+prune_legacy_databases() {
+  has_psql || return 0
+  local reg
+  reg="$(registry_file)"
+  [ -f "$reg" ] || return 0
+
+  local project_path worktree_paths worktree_path references=""
+  while IFS= read -r project_path; do
+    [ -n "$project_path" ] && [ -d "$project_path" ] || continue
+    worktree_paths="$(cd "$project_path" && git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')" || worktree_paths=""
+    if [ -z "$worktree_paths" ]; then
+      log_warn "Could not list worktrees of $project_path, skipping legacy database prune"
+      return 0
+    fi
+    while IFS= read -r worktree_path; do
+      [ -d "$worktree_path" ] || continue
+      references="${references}$(legacy_database_references "$worktree_path" | cut -c1-63)
+"
+    done <<EOF_WORKTREES
+$worktree_paths
+EOF_WORKTREES
+  done < "$reg"
+
+  # Current names start with an 8 character hex project id and are pruned
+  # per project instead.
+  local db
+  psql -X -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' | grep -vE '^worktree_[0-9a-f]{8}_' |
+    while IFS= read -r db; do
+      if printf '%s' "$references" | grep -qxF "$db"; then
+        log_debug "Keeping referenced database: $db"
+      else
+        log_info "Dropping leftover database: $db"
+        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      fi
+    done
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1616,6 +1676,7 @@ run_setup() {
   # clones whose worktree is gone. Allocations are left to --cleanup and
   # --prune because concurrent setups append to the same registry.
   prune_project_databases "$main_path" || log_warn "Pruning leftover worktree databases failed"
+  prune_legacy_databases || log_warn "Pruning leftover databases of older werksfeer versions failed"
 
   # Step 5: Write environment overrides (DB names, ports, Redis)
   log_step "Writing environment overrides"
