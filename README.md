@@ -510,7 +510,7 @@ werksfeer --prune
 werksfeer --prune-all
 ```
 
-Shared-server clones are named `worktree_<project id>_<worktree directory>`. The project id is random, stored once in the repository's git directory, so workspaces with the same name in different repositories never share a database, and renaming a branch does not change the name. Pruning only drops the current project's clones whose worktree is gone. Clones from older werksfeer versions (`worktree_<branch>_<worktree>`) stay in use by their worktree and are dropped by `--cleanup`. Setup and pruning drop such a clone once no worktree of any project werksfeer has set up still references it.
+Shared-server clones are named `worktree_<project id>_<worktree directory>`. The project id is random, stored once in the repository's git directory, so workspaces with the same name in different repositories never share a database, and renaming a branch does not change the name. Pruning only drops the current project's clones whose worktree is gone. Clones from older werksfeer versions (`worktree_<branch>_<worktree>`) stay in use by their worktree and are dropped by `--cleanup`. Leftovers of such clones from worktrees that no longer exist are left in place.
 
 Private PostgreSQL processes must be stopped before their checkout is removed,
 because their control files live in that checkout. Configure
