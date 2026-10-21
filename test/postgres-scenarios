@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Runs werksfeer's shared-database lifecycle against a real, throwaway
+# PostgreSQL server. Nothing touches the developer's own server.
+#
+#   test/postgres-scenarios [path/to/werksfeer]
+#
+# Set OLD_WERKSFEER to a previous werksfeer to also check the upgrade path.
+# Requires initdb, pg_ctl, psql, createdb and dropdb on PATH.
+
+set -uo pipefail
+
+script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WERKSFEER="${1:-${script_directory}/../werksfeer}"
+WERKSFEER="$(cd "$(dirname "$WERKSFEER")" && pwd -P)/$(basename "$WERKSFEER")"
+export WERKSFEER_LIB_DIR="${WERKSFEER_LIB_DIR:-${script_directory}/../lib/werksfeer}"
+
+ROOT="$(mktemp -d /tmp/wf-pg.XXXXXX)"
+export PGHOST="$ROOT" PGPORT="$((55000 + RANDOM % 1000))" PGDATABASE=postgres
+export XDG_DATA_HOME="${ROOT}/xdg" XDG_CACHE_HOME="${ROOT}/cache"
+
+stop_server() {
+  pg_ctl -D "${ROOT}/data" -m immediate -w stop >/dev/null 2>&1 || true
+  rm -rf "$ROOT"
+}
+trap stop_server EXIT
+
+initdb -D "${ROOT}/data" -A trust --no-instructions >/dev/null
+pg_ctl -D "${ROOT}/data" -o "-k ${ROOT} -p ${PGPORT} -c listen_addresses=''" -l "${ROOT}/server.log" -w start >/dev/null
+
+failures=0
+pass() { printf 'PASS  %s\n' "$1"; }
+fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); }
+check() {
+  local description="$1"
+  shift
+  if "$@"; then pass "$description"; else fail "$description"; fi
+}
+
+# A Rails project whose template database contains a single marker table.
+make_project() {
+  local name="$1" table="$2" repo="${ROOT}/projects/$1"
+  mkdir -p "${repo}/config"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name "Werksfeer Test"
+  printf 'source "https://rubygems.org"\n' > "${repo}/Gemfile"
+  printf 'development:\n  adapter: postgresql\n' > "${repo}/config/database.yml"
+  printf '.env*\n.envrc\n' > "${repo}/.gitignore"
+  cat > "${repo}/.worktree.toml" <<EOF_CONFIG
+[database]
+base_name = "${name}"
+
+[cache]
+auto_warm = false
+
+[setup]
+command = "true"
+EOF_CONFIG
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm initial
+  createdb "${name}_development"
+  createdb "${name}_test"
+  psql -X -q -d "${name}_development" -c "CREATE TABLE ${table} (id int);"
+}
+
+# Creates a workspace the way Conductor does: a city-named directory on a
+# placeholder branch.
+add_workspace() {
+  local project="$1" city="$2" werksfeer="${3:-$WERKSFEER}" path="${ROOT}/workspaces/$1/$2"
+  mkdir -p "$(dirname "$path")"
+  git -C "${ROOT}/projects/${project}" -c core.hooksPath=/dev/null worktree add -q -b "thijs/${city}" "$path"
+  (cd "$path" && "$werksfeer") > "${ROOT}/setup-${project}-${city}.log" 2>&1
+}
+
+workspace() { printf '%s/workspaces/%s/%s\n' "$ROOT" "$1" "$2"; }
+
+database_of() {
+  sed -n 's/^DATABASE_NAME="\(.*\)"$/\1/p' "$(workspace "$1" "$2")/.env.local" | tail -1
+}
+
+database_exists() {
+  psql -X -At -c "SELECT 1 FROM pg_database WHERE datname = '$1'" | grep -qx 1
+}
+
+has_table() {
+  [ "$(psql -X -At -d "$1" -c "SELECT to_regclass('public.$2') IS NOT NULL")" = "t" ]
+}
+
+lacks_table() { ! has_table "$@"; }
+database_missing() { ! database_exists "$1"; }
+
+databases_named() {
+  psql -X -At -c "SELECT datname FROM pg_database WHERE datname LIKE 'worktree\\_%' ORDER BY 1"
+}
+
+archive_workspace() {
+  local path
+  path="$(workspace "$1" "$2")"
+  (cd "$path" && "$WERKSFEER" --cleanup "$path") > "${ROOT}/cleanup-$1-$2.log" 2>&1
+  git -C "${ROOT}/projects/$1" worktree remove --force "$path"
+}
+
+make_project quizmass quizzes
+make_project learning_spaces users
+
+# 1. The incident: a quizmass workspace is deleted without cleanup, then a
+#    LearningSpaces workspace with the same name and placeholder branch is set up.
+add_workspace quizmass dublin-v1
+git -C "${ROOT}/projects/quizmass" worktree remove --force "$(workspace quizmass dublin-v1)"
+add_workspace learning_spaces dublin-v1
+ls_db="$(database_of learning_spaces dublin-v1)"
+check "same workspace name in another project gets its own database" \
+  has_table "$ls_db" users
+check "that database does not contain the other project's schema" \
+  lacks_table "$ls_db" quizzes
+
+# 2. Archiving after Conductor renamed the branch drops the workspace's databases.
+add_workspace learning_spaces paris
+paris_db="$(database_of learning_spaces paris)"
+git -C "$(workspace learning_spaces paris)" branch -q -m thijs/some-feature
+archive_workspace learning_spaces paris
+check "archive after a branch rename drops the dev database" \
+  database_missing "$paris_db"
+check "archive after a branch rename drops the test database" \
+  database_missing "${paris_db}_test"
+
+# 3. A workspace removed without cleanup is pruned by the next setup in the
+#    same project, and other projects' databases stay.
+add_workspace learning_spaces rome
+rome_db="$(database_of learning_spaces rome)"
+add_workspace quizmass rome
+quiz_rome_db="$(database_of quizmass rome)"
+git -C "${ROOT}/projects/learning_spaces" worktree remove --force "$(workspace learning_spaces rome)"
+git -C "${ROOT}/projects/learning_spaces" worktree prune
+add_workspace learning_spaces oslo
+check "next setup drops the leftover of a deleted workspace" \
+  database_missing "$rome_db"
+check "that setup leaves another project's workspace database alone" \
+  database_exists "$quiz_rome_db"
+check "that setup leaves live workspaces of its own project alone" \
+  database_exists "$(database_of learning_spaces dublin-v1)"
+
+# 4. A symlinked alias of a workspace uses the same database.
+ln -s "$(workspace learning_spaces oslo)" "${ROOT}/workspaces/learning_spaces/some-feature"
+oslo_db="$(database_of learning_spaces oslo)"
+(cd "${ROOT}/workspaces/learning_spaces/some-feature" && "$WERKSFEER") > "${ROOT}/setup-alias.log" 2>&1
+check "setup through a symlinked alias keeps the workspace database" \
+  test "$(database_of learning_spaces oslo)" = "$oslo_db"
+
+# 5. Upgrade: a workspace set up by the previous werksfeer keeps its database
+#    when setup runs again, and archiving it still drops that database.
+if [ -n "${OLD_WERKSFEER:-}" ]; then
+  add_workspace learning_spaces lima "$OLD_WERKSFEER"
+  old_db="$(database_of learning_spaces lima)"
+  (cd "$(workspace learning_spaces lima)" && "$WERKSFEER") > "${ROOT}/setup-upgrade.log" 2>&1
+  check "rerunning setup after upgrade keeps the existing database" \
+    test "$(database_of learning_spaces lima)" = "$old_db"
+  git -C "$(workspace learning_spaces lima)" branch -q -m thijs/renamed
+  archive_workspace learning_spaces lima
+  check "archiving an upgraded workspace drops its old database" \
+    database_missing "$old_db"
+fi
+
+if [ "$failures" -gt 0 ]; then
+  printf '\n%s scenario check(s) failed. Remaining databases:\n' "$failures"
+  databases_named
+  exit 1
+fi
