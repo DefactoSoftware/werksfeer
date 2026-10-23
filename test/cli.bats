@@ -10,6 +10,7 @@ setup() {
   # the developer's own PostgreSQL server.
   export PGHOST="${TEST_ROOT}/no-postgres" PGPORT=65432
   unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGPASSFILE 2>/dev/null || true
+  unset CONDUCTOR_PORT
   export WERKSFEER_LIB_DIR="${BATS_TEST_DIRNAME}/../lib/werksfeer"
   WERKSFEER="${BATS_TEST_DIRNAME}/../werksfeer"
 
@@ -1048,12 +1049,14 @@ EOF_CONFIG
   git -C "$rails_main" commit -qm initial
   git -C "$rails_main" -c core.hooksPath=/dev/null worktree add -q --detach "$rails_worktree" HEAD
 
-  run bash -c "cd \"$rails_worktree\" && PATH=\"$fake_bin:\$PATH\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  run bash -c "cd \"$rails_worktree\" && PATH=\"$fake_bin:\$PATH\" COMMAND_LOG=\"$command_log\" CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
 
   grep -q '^bundle:install$' "$command_log"
   grep -q '^rails:development:db:prepare$' "$command_log"
   grep -q '^rails:test:db:prepare$' "$command_log"
+  grep -qx 'PORT="55100"' "${rails_worktree}/.env.local"
+  grep -qx 'export PORT="55100"' "${rails_worktree}/.envrc"
   grep -q 'DATABASE_NAME="rails_example_development"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.test.local"
@@ -1110,4 +1113,46 @@ EOF_PG_CTL
   [ "$status" -eq 42 ]
   [[ "$output" == *"isolated startup failure"* ]]
   [[ "$output" != *"unexpected-postgres-command"* ]]
+}
+
+@test "setup respects Conductor's assigned port on initial setup and reruns" {
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+
+  # Repeated setup keeps the harness port even though a fallback is registered.
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "Conductor overrides an older port without rewriting allocations or another worktree" {
+  run bash -c 'cd "$1" && WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run bash -c 'cd "$1" && WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_TWO" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  cp "${WORKTREE_TWO}/.envrc" "${TEST_ROOT}/other-env"
+  cp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations-before"
+  redis_before="$(awk -F'\t' '$2 == "one" {print $4 " " $5}' "${XDG_DATA_HOME}/werksfeer/allocations")"
+
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+  redis_after="$(awk -F'\t' '$2 == "one" {value = $4 " " $5} END {print value}' "${XDG_DATA_HOME}/werksfeer/allocations")"
+  [ "$redis_after" = "$redis_before" ]
+  cmp "${WORKTREE_TWO}/.envrc" "${TEST_ROOT}/other-env"
+  cmp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations-before"
+
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "setup rejects invalid Conductor ports before writing environment overrides" {
+  for port in abc 0 65536 999999999999999999999; do
+    run bash -c 'cd "$1" && CONDUCTOR_PORT="$3" WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER" "$port"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"CONDUCTOR_PORT must be an integer between 1 and 65535"* ]]
+    [ ! -f "${WORKTREE_ONE}/.envrc" ]
+  done
 }

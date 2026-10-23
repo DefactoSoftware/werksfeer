@@ -1033,6 +1033,20 @@ write_env_overrides() {
     register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
   fi
 
+  if [ -n "${CONDUCTOR_PORT:-}" ]; then
+    case "$CONDUCTOR_PORT" in
+      *[!0-9]*) log_error "CONDUCTOR_PORT must be an integer between 1 and 65535"; return 1 ;;
+    esac
+    if [ "${#CONDUCTOR_PORT}" -gt 5 ] ||
+        [ "$((10#$CONDUCTOR_PORT))" -lt 1 ] || [ "$((10#$CONDUCTOR_PORT))" -gt 65535 ]; then
+      log_error "CONDUCTOR_PORT must be an integer between 1 and 65535"
+      return 1
+    fi
+    # Conductor reserves its own port. Override the emitted environment while
+    # retaining our registry allocation as the fallback outside the harness.
+    wt_port="$((10#$CONDUCTOR_PORT))"
+  fi
+
   local wt_redis=""
   if [ -n "$base_redis" ]; then
     local base_stripped

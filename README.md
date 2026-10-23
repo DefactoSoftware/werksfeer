@@ -59,6 +59,10 @@ When a new worktree is created, werksfeer:
 6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
 7. **Runs framework setup** (dependencies, database preparation, migrations, and first-time seeds)
 
+When Conductor supplies `CONDUCTOR_PORT`, Werksfeer uses it for the application
+port, including when rerunning setup on a workspace with an older allocation.
+Other environments continue to use Werksfeer's port allocator.
+
 Everything is idempotent — safe to re-run. Private services are opt-in, so
 existing repositories retain the shared-server cloning behavior.
 
