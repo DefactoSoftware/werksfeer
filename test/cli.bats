@@ -5,6 +5,12 @@ setup() {
   TEST_ROOT="$(mktemp -d "${BATS_TMPDIR}/werksfeer.XXXXXX")"
   export XDG_DATA_HOME="${TEST_ROOT}/xdg"
   export XDG_CACHE_HOME="${TEST_ROOT}/cache"
+  # werksfeer runs shared-mode database commands with whatever psql is on PATH.
+  # Point libpq at a socket directory that does not exist so no test can reach
+  # the developer's own PostgreSQL server.
+  export PGHOST="${TEST_ROOT}/no-postgres" PGPORT=65432
+  unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGPASSFILE 2>/dev/null || true
+  unset CONDUCTOR_PORT
   export WERKSFEER_LIB_DIR="${BATS_TEST_DIRNAME}/../lib/werksfeer"
   WERKSFEER="${BATS_TEST_DIRNAME}/../werksfeer"
 
@@ -1043,15 +1049,110 @@ EOF_CONFIG
   git -C "$rails_main" commit -qm initial
   git -C "$rails_main" -c core.hooksPath=/dev/null worktree add -q --detach "$rails_worktree" HEAD
 
-  run bash -c "cd \"$rails_worktree\" && PATH=\"$fake_bin:\$PATH\" COMMAND_LOG=\"$command_log\" WERKSFEER_POSTGRES=false \"$WERKSFEER\""
+  run bash -c "cd \"$rails_worktree\" && PATH=\"$fake_bin:\$PATH\" COMMAND_LOG=\"$command_log\" CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false \"$WERKSFEER\""
   [ "$status" -eq 0 ]
 
   grep -q '^bundle:install$' "$command_log"
   grep -q '^rails:development:db:prepare$' "$command_log"
   grep -q '^rails:test:db:prepare$' "$command_log"
+  grep -qx 'PORT="55100"' "${rails_worktree}/.env.local"
+  grep -qx 'export PORT="55100"' "${rails_worktree}/.envrc"
   grep -q 'DATABASE_NAME="rails_example_development"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.local"
   grep -q 'TEST_DATABASE_NAME="rails_example_test"' "${rails_worktree}/.env.test.local"
   grep -q 'export DATABASE_NAME="rails_example_development"' "${rails_worktree}/.envrc"
   grep -q 'werksfeer services start' "${rails_worktree}/.envrc"
+}
+
+@test "PostgreSQL scenarios clear inherited connections and abort on initialization failure" {
+  fake_bin="${TEST_ROOT}/postgres-bin"
+  mkdir -p "$fake_bin"
+  cat > "${fake_bin}/initdb" <<'EOF_INITDB'
+#!/usr/bin/env bash
+for name in PGHOSTADDR PGSERVICE PGSERVICEFILE PGPASSFILE PGUSER PGPASSWORD PGOPTIONS; do
+  if printenv "$name" >/dev/null; then
+    echo "inherited connection setting: $name" >&2
+    exit 99
+  fi
+done
+echo 'isolated initdb failure' >&2
+exit 42
+EOF_INITDB
+  for command in pg_ctl psql createdb dropdb; do
+    printf '#!/usr/bin/env bash\necho unexpected-postgres-command >&2\nexit 99\n' > "${fake_bin}/${command}"
+  done
+  chmod +x "${fake_bin}/"*
+
+  run env PATH="$fake_bin:$PATH" PGHOSTADDR=192.0.2.1 PGSERVICE=unexpected \
+    PGSERVICEFILE=/missing PGPASSFILE=/missing PGUSER=unexpected \
+    PGPASSWORD=unexpected PGOPTIONS=unexpected \
+    "${BATS_TEST_DIRNAME}/postgres-scenarios"
+  [ "$status" -eq 42 ]
+  [[ "$output" == *"isolated initdb failure"* ]]
+  [[ "$output" != *"inherited connection setting"* ]]
+  [[ "$output" != *"unexpected-postgres-command"* ]]
+}
+
+@test "PostgreSQL scenarios abort before fixtures when the server cannot start" {
+  fake_bin="${TEST_ROOT}/postgres-bin"
+  mkdir -p "$fake_bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/initdb"
+  cat > "${fake_bin}/pg_ctl" <<'EOF_PG_CTL'
+#!/usr/bin/env bash
+case " $* " in
+  *' start '*) echo 'isolated startup failure' >&2; exit 42 ;;
+  *) exit 0 ;;
+esac
+EOF_PG_CTL
+  for command in psql createdb dropdb; do
+    printf '#!/usr/bin/env bash\necho unexpected-postgres-command >&2\nexit 99\n' > "${fake_bin}/${command}"
+  done
+  chmod +x "${fake_bin}/"*
+
+  run env PATH="$fake_bin:$PATH" "${BATS_TEST_DIRNAME}/postgres-scenarios"
+  [ "$status" -eq 42 ]
+  [[ "$output" == *"isolated startup failure"* ]]
+  [[ "$output" != *"unexpected-postgres-command"* ]]
+}
+
+@test "setup respects Conductor's assigned port on initial setup and reruns" {
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+
+  # Repeated setup keeps the harness port even though a fallback is registered.
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "Conductor overrides an older port without rewriting allocations or another worktree" {
+  run bash -c 'cd "$1" && WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run bash -c 'cd "$1" && WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_TWO" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  cp "${WORKTREE_TWO}/.envrc" "${TEST_ROOT}/other-env"
+  cp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations-before"
+  redis_before="$(awk -F'\t' '$2 == "one" {print $4 " " $5}' "${XDG_DATA_HOME}/werksfeer/allocations")"
+
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+  redis_after="$(awk -F'\t' '$2 == "one" {value = $4 " " $5} END {print value}' "${XDG_DATA_HOME}/werksfeer/allocations")"
+  [ "$redis_after" = "$redis_before" ]
+  cmp "${WORKTREE_TWO}/.envrc" "${TEST_ROOT}/other-env"
+  cmp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations-before"
+
+  run bash -c 'cd "$1" && CONDUCTOR_PORT=55100 WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qx 'export PORT="55100"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "setup rejects invalid Conductor ports before writing environment overrides" {
+  for port in abc 0 65536 999999999999999999999; do
+    run bash -c 'cd "$1" && CONDUCTOR_PORT="$3" WERKSFEER_POSTGRES=false "$2"' _ "$WORKTREE_ONE" "$WERKSFEER" "$port"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"CONDUCTOR_PORT must be an integer between 1 and 65535"* ]]
+    [ ! -f "${WORKTREE_ONE}/.envrc" ]
+  done
 }
