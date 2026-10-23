@@ -477,7 +477,7 @@ postgres_hydrate_from_template() {
     return "$setting_status"
   fi
 
-  local data_directory template staging
+  local data_directory template
   data_directory="$(postgres_data_directory "$project_root")"
 
   [ ! -f "${data_directory}/PG_VERSION" ] || return 0
@@ -498,6 +498,15 @@ postgres_hydrate_from_template() {
     return 0
   }
 
+  postgres_hydrate_data_directory "${template}/data" "$data_directory" "cached template $(basename "$template")"
+}
+
+postgres_hydrate_data_directory() {
+  local source="$1"
+  local data_directory="$2"
+  local description="$3"
+  local staging
+
   if [ -d "$data_directory" ]; then
     [ -z "$(find "$data_directory" -mindepth 1 -maxdepth 1 -print -quit)" ] || return 0
     rmdir "$data_directory"
@@ -505,13 +514,13 @@ postgres_hydrate_from_template() {
     return 0
   fi
 
-  log_info "Hydrating PostgreSQL from cached template $(basename "$template")"
+  log_info "Hydrating PostgreSQL from $description"
   staging="${data_directory}.template.$$"
-  if ! postgres_copy_tree "${template}/data" "$staging"; then
+  if ! postgres_copy_tree "$source" "$staging"; then
     case "$staging" in
       "${data_directory}".template.*) rm -rf -- "$staging" ;;
     esac
-    log_warn "Could not hydrate the cached PostgreSQL template; initializing a fresh cluster instead"
+    log_warn "Could not hydrate PostgreSQL from $description; initializing a fresh cluster instead"
     return 0
   fi
   if ! mv "$staging" "$data_directory"; then
