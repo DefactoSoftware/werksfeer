@@ -371,6 +371,32 @@ current selection with:
 werksfeer postgres template-status
 ```
 
+### Pinned snapshot
+
+To start every new worktree from a specific database instead of fresh seeds,
+for example a realistic development database on your shared server, pin a
+snapshot:
+
+```sh
+# Dump a database from the shared server (bare name = default local server)
+werksfeer postgres snapshot --from myapp_dev
+werksfeer postgres snapshot --from "host=localhost port=5432 dbname=myapp_dev"
+
+# Or freeze the current worktree's private cluster as it is
+werksfeer postgres snapshot
+
+# Stop using it
+werksfeer postgres snapshot --clear
+```
+
+`--from` dumps the source with `pg_dump`, restores it as the development
+database into a fresh cluster, and stores that stopped cluster under
+`${XDG_CACHE_HOME:-$HOME/.cache}/werksfeer/postgres-snapshots`. New worktrees
+copy it (copy-on-write where supported) before falling back to seeded
+templates, then run pending migrations. Snapshots are never republished as
+seeded templates. Re-run the command to refresh it; the previous snapshot is
+replaced only after the new one is complete.
+
 `werksfeer --cleanup` stops configured services before releasing allocations.
 Set `WERKSFEER_POSTGRES=false` to opt out for one process, or `true` to run the
 configured service from a main checkout.

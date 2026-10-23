@@ -48,6 +48,12 @@ EOF_CONFIG
 }
 
 teardown() {
+  # Stop any private clusters a test started, even when it failed midway.
+  local worktree
+  for worktree in "$WORKTREE_ONE" "$WORKTREE_TWO"; do
+    [ -f "${worktree}/.pg_data/postmaster.pid" ] || continue
+    (cd "$worktree" && "$WERKSFEER" services stop >/dev/null 2>&1) || true
+  done
   rm -rf "$TEST_ROOT"
 }
 
@@ -680,6 +686,45 @@ EOF_FEATURE_CONFIG
 
   printf 'worktree\n' > "${destination}/base/value"
   [ "$(cat "${source_dir}/base/value")" = "template" ]
+}
+
+@test "PostgreSQL snapshot sources accept bare names and connection strings" {
+  provider="${BATS_TEST_DIRNAME}/../lib/werksfeer/services/postgres.sh"
+
+  run bash -c 'source "$1"; postgres_snapshot_source_conninfo example_dev' _ "$provider"
+  [ "$output" = "dbname=example_dev" ]
+
+  run bash -c 'source "$1"; postgres_snapshot_source_conninfo "host=/tmp port=5432 dbname=example_dev"' _ "$provider"
+  [ "$output" = "host=/tmp port=5432 dbname=example_dev" ]
+
+  run bash -c 'source "$1"; postgres_snapshot_source_conninfo postgresql://localhost/example_dev' _ "$provider"
+  [ "$output" = "postgresql://localhost/example_dev" ]
+}
+
+@test "pinned PostgreSQL snapshots seed new worktrees and can be cleared" {
+  command -v pg_config >/dev/null 2>&1 || skip "PostgreSQL is not installed"
+
+  run bash -c "cd \"$MAIN_REPO\" && \"$WERKSFEER\" postgres snapshot --from \"host=/nonexistent dbname=missing\""
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"previous snapshot, if any, is unchanged"* ]]
+
+  run bash -c "cd \"$WORKTREE_ONE\" && \"$WERKSFEER\" services start && psql -h \"\$(\"$WERKSFEER\" postgres socket-dir)\" -U postgres -qd postgres -c 'CREATE DATABASE example_dev' && \"$WERKSFEER\" postgres snapshot"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Pinned PostgreSQL snapshot"* ]]
+
+  run bash -c "cd \"$WORKTREE_TWO\" && \"$WERKSFEER\" postgres template-status"
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == pinned_snapshot=*/postgres-snapshots/*/current ]]
+
+  run bash -c "cd \"$WORKTREE_TWO\" && \"$WERKSFEER\""
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Hydrating PostgreSQL from pinned snapshot"* ]]
+  run bash -c "cd \"$WORKTREE_TWO\" && \"$WERKSFEER\" postgres database-exists example_dev"
+  [ "$status" -eq 0 ]
+
+  run bash -c "cd \"$WORKTREE_TWO\" && \"$WERKSFEER\" postgres snapshot --clear && \"$WERKSFEER\" postgres template-status"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"pinned_snapshot="$'\n'* ]]
 }
 
 @test "exact clean revisions reuse isolated worktree caches" {

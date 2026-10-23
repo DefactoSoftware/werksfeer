@@ -466,6 +466,240 @@ postgres_find_compatible_template() {
   [ -n "$best" ] && printf '%s\n' "$best"
 }
 
+# A pinned snapshot is a stopped cluster chosen deliberately by the developer,
+# for example a dump of a realistic shared development database. Unlike seeded
+# templates it is not tied to a commit; new worktrees migrate it forward.
+postgres_snapshot_root() {
+  local project_root="$1"
+  local repository_key
+  repository_key="$(postgres_template_repository_key "$project_root")"
+  printf '%s/werksfeer/postgres-snapshots/%s/pg%s\n' \
+    "${XDG_CACHE_HOME:-$HOME/.cache}" \
+    "${repository_key:0:16}" \
+    "$(postgres_major_version)"
+}
+
+postgres_ready_snapshot() {
+  local project_root="$1"
+  local snapshot
+  snapshot="$(postgres_snapshot_root "$project_root")/current"
+
+  [ ! -L "$snapshot" ] || return 1
+  [ -f "${snapshot}/READY" ] || return 1
+  [ -f "${snapshot}/data/PG_VERSION" ] || return 1
+  [ ! -L "${snapshot}/data" ] || return 1
+  [ "$(postgres_directory_owner "${snapshot}/data")" = "$(id -u)" ] || return 1
+  printf '%s\n' "$snapshot"
+}
+
+postgres_install_snapshot() {
+  local staging="$1"
+  local snapshot_root="$2"
+  local current="${snapshot_root}/current"
+  local previous="${snapshot_root}/.previous.$$"
+
+  if [ -e "$current" ]; then
+    mv "$current" "$previous" || return 1
+  fi
+  if ! mv "$staging" "$current"; then
+    [ ! -e "$previous" ] || mv "$previous" "$current"
+    return 1
+  fi
+  [ ! -e "$previous" ] || rm -rf -- "$previous"
+}
+
+postgres_snapshot_from_worktree() {
+  local project_root="$1"
+  local staging="$2"
+  local data_directory
+  data_directory="$(postgres_data_directory "$project_root")"
+
+  [ -f "${data_directory}/PG_VERSION" ] || {
+    log_error "This worktree has no private PostgreSQL cluster to snapshot: $data_directory"
+    log_error "Use --from DATABASE to snapshot a database from your shared PostgreSQL server"
+    return 1
+  }
+
+  local was_running=false status=0
+  if postgres_cluster_running "$data_directory"; then
+    was_running=true
+  fi
+
+  werksfeer_service_postgres_stop "$project_root" || return 1
+  postgres_copy_tree "$data_directory" "${staging}/data" || status=$?
+  rm -f "${staging}/data/postgres.log" "${staging}/data/postmaster.pid"
+  printf 'source=worktree\npath=%s\n' "$project_root" > "${staging}/manifest"
+
+  if [ "$was_running" = true ]; then
+    werksfeer_service_postgres_start "$project_root" || status=$?
+  fi
+  return "$status"
+}
+
+postgres_snapshot_source_conninfo() {
+  # A bare name refers to a database on the default local server. Anything
+  # with '=' or '://' is passed to libpq unchanged.
+  case "$1" in
+    *=*|*://*) printf '%s\n' "$1" ;;
+    *) printf 'dbname=%s\n' "$1" ;;
+  esac
+}
+
+postgres_restore_into_cluster() {
+  local project_root="$1"
+  local project_type="$2"
+  local source="$3"
+  local data_directory="$4"
+  local socket_dir="$5"
+  local dump_file="$6"
+
+  local pg_dump pg_restore dev_db port user
+  pg_dump="$(postgres_resolve_tool pg_dump "$POSTGRES_PG_CONFIG")" || {
+    log_error "pg_dump was not found next to $(${POSTGRES_PG_CONFIG} --bindir)"
+    return 1
+  }
+  pg_restore="$(postgres_resolve_tool pg_restore "$POSTGRES_PG_CONFIG")" || {
+    log_error "pg_restore was not found next to $(${POSTGRES_PG_CONFIG} --bindir)"
+    return 1
+  }
+  dev_db="$(get_base_db_names "$project_type" | awk '{print $1}')"
+  [ -n "$dev_db" ] || {
+    log_error "Cannot determine the development database name for a $project_type project"
+    return 1
+  }
+  port="$(postgres_port)"
+  user="$(postgres_user)"
+
+  # The worktree environment points libpq at this worktree's private socket.
+  # Drop those variables so the source resolves against the shared server.
+  log_info "Dumping $source"
+  env -u PGHOST -u PGPORT -u PGUSER -u PGDATABASE -u PGSERVICE \
+    "$pg_dump" --format=custom --file="$dump_file" \
+    --dbname="$(postgres_snapshot_source_conninfo "$source")" || {
+      log_error "Could not dump $source"
+      return 1
+    }
+
+  postgres_initialize_cluster "$data_directory" >/dev/null || return 1
+  postgres_ensure_cluster_include "$data_directory" || return 1
+  postgres_write_cluster_config "$data_directory" "$socket_dir" || return 1
+
+  postgres_run_with_locale "$POSTGRES_PG_CTL" start \
+    --pgdata="$data_directory" \
+    --log="${data_directory}/postgres.log" \
+    --wait \
+    --timeout=30 >/dev/null || {
+      log_error "Could not start the temporary snapshot cluster; see ${data_directory}/postgres.log"
+      return 1
+    }
+
+  "$POSTGRES_PSQL" --host="$socket_dir" --port="$port" --username="$user" \
+    --dbname=postgres --quiet --set=ON_ERROR_STOP=1 \
+    --command="CREATE DATABASE \"${dev_db}\"" || return 1
+
+  log_info "Restoring into $dev_db"
+  "$pg_restore" --host="$socket_dir" --port="$port" --username="$user" \
+    --dbname="$dev_db" --no-owner --no-acl --exit-on-error --jobs=4 \
+    "$dump_file" || {
+      log_error "Could not restore $source into the snapshot cluster"
+      return 1
+    }
+}
+
+postgres_snapshot_from_database() {
+  local project_root="$1"
+  local staging="$2"
+  local source="$3"
+  local project_type socket_dir status=0
+  project_type="$(detect_project_type "$project_root")"
+
+  postgres_check_required_extensions || return 1
+  socket_dir="$(mktemp -d /tmp/werksfeer-snap.XXXXXX)" || return 1
+  chmod 700 "$socket_dir"
+
+  postgres_restore_into_cluster "$project_root" "$project_type" "$source" \
+    "${staging}/data" "$socket_dir" "${staging}/source.dump" || status=$?
+
+  if postgres_cluster_running "${staging}/data"; then
+    "$POSTGRES_PG_CTL" stop --pgdata="${staging}/data" --mode=fast --wait --timeout=30 >/dev/null || status=1
+  fi
+  rm -f "${staging}/source.dump" "${staging}/data/postgres.log"
+  rmdir "$socket_dir" 2>/dev/null || true
+
+  printf 'source=database\ndatabase=%s\n' "$source" > "${staging}/manifest"
+  return "$status"
+}
+
+werksfeer_service_postgres_snapshot() {
+  local project_root="$1"
+  shift
+  local source=""
+
+  case "${1:-}" in
+    "") ;;
+    --from)
+      source="${2:-}"
+      [ -n "$source" ] || {
+        log_error "postgres snapshot --from requires a database name or connection string"
+        return 2
+      }
+      ;;
+    --clear)
+      postgres_load_tools
+      local snapshot_root
+      snapshot_root="$(postgres_snapshot_root "$project_root")"
+      if [ -e "${snapshot_root}/current" ]; then
+        rm -rf -- "${snapshot_root}/current"
+        log_info "Removed the pinned PostgreSQL snapshot"
+      else
+        log_info "No pinned PostgreSQL snapshot exists"
+      fi
+      return 0
+      ;;
+    *)
+      log_error "Usage: werksfeer postgres snapshot [--from DATABASE | --clear]"
+      return 2
+      ;;
+  esac
+
+  postgres_load_tools
+
+  local snapshot_root staging lock_dir status=0
+  snapshot_root="$(postgres_snapshot_root "$project_root")"
+  (umask 077 && mkdir -p "$snapshot_root")
+  lock_dir="${snapshot_root}/.snapshot.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    log_error "Another process is creating a PostgreSQL snapshot ($lock_dir)"
+    return 1
+  fi
+  staging="${snapshot_root}/.snapshot-$$"
+  (umask 077 && mkdir "$staging") || status=$?
+
+  if [ "$status" -eq 0 ]; then
+    if [ -n "$source" ]; then
+      postgres_snapshot_from_database "$project_root" "$staging" "$source" || status=$?
+    else
+      postgres_snapshot_from_worktree "$project_root" "$staging" || status=$?
+    fi
+  fi
+  if [ "$status" -eq 0 ]; then
+    printf '%s\n' "$(date +%s)" > "${staging}/READY"
+    postgres_install_snapshot "$staging" "$snapshot_root" || status=$?
+  fi
+
+  if [ "$status" -eq 0 ]; then
+    log_info "Pinned PostgreSQL snapshot at ${snapshot_root}/current"
+    log_info "New worktrees will start from it and apply pending migrations"
+  else
+    case "$staging" in
+      "${snapshot_root}"/.snapshot-*) rm -rf -- "$staging" ;;
+    esac
+    log_error "PostgreSQL snapshot failed; the previous snapshot, if any, is unchanged"
+  fi
+  rmdir "$lock_dir" 2>/dev/null || true
+  return "$status"
+}
+
 postgres_hydrate_from_template() {
   local project_root="$1"
   local project_type="$2"
@@ -477,10 +711,22 @@ postgres_hydrate_from_template() {
     return "$setting_status"
   fi
 
-  local data_directory template
+  local data_directory template snapshot
   data_directory="$(postgres_data_directory "$project_root")"
 
   [ ! -f "${data_directory}/PG_VERSION" ] || return 0
+
+  # A pinned snapshot wins over seeded templates and is used even when the
+  # template cache is disabled, because the developer chose it explicitly.
+  # Its data is never republished as a seeded template.
+  postgres_load_tools
+  snapshot="$(postgres_ready_snapshot "$project_root")" || snapshot=""
+  if [ -n "$snapshot" ]; then
+    POSTGRES_TEMPLATE_PUBLISH_ELIGIBLE=0
+    postgres_hydrate_data_directory "${snapshot}/data" "$data_directory" "pinned snapshot"
+    return $?
+  fi
+
   postgres_template_cache_enabled || {
     local enabled_status=$?
     [ "$enabled_status" -eq 1 ] && return 0
@@ -491,7 +737,6 @@ postgres_hydrate_from_template() {
   # shared template. Never snapshot an existing developer database.
   POSTGRES_TEMPLATE_PUBLISH_ELIGIBLE=1
 
-  postgres_load_tools
   template="$(postgres_find_compatible_template "$project_root" "$project_type")" || template=""
   [ -n "$template" ] || {
     log_info "No compatible PostgreSQL template is cached; this worktree will seed a fresh database"
@@ -856,8 +1101,12 @@ werksfeer_service_postgres_template_publish() {
 
 werksfeer_service_postgres_template_status() {
   local project_root="$1"
-  local project_type template_ref ref_commit template=""
+  local project_type template_ref ref_commit template="" snapshot
   project_type="$(detect_project_type "$project_root")"
+
+  postgres_load_tools
+  snapshot="$(postgres_ready_snapshot "$project_root")" || snapshot=""
+  printf 'pinned_snapshot=%s\n' "$snapshot"
 
   if postgres_template_cache_enabled; then
     printf 'enabled=true\n'
@@ -870,7 +1119,6 @@ werksfeer_service_postgres_template_status() {
     return "$enabled_status"
   fi
 
-  postgres_load_tools
   template_ref="$(postgres_template_ref "$project_root")" || template_ref=""
   if [ -n "$template_ref" ]; then
     ref_commit="$(git -C "$project_root" rev-parse "${template_ref}^{commit}" 2>/dev/null || true)"
