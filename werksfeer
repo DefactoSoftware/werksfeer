@@ -707,42 +707,53 @@ db_exists() {
   psql -X -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
-# Shared-server clones are named worktree_<project id>_<worktree dir>. The
-# project id is random and stored in the git common dir, so it follows the
-# repository when it moves and differs between separate clones. Without it,
-# workspaces with the same name in different repositories shared a database.
-# With "create", the id is generated on first use.
-project_database_id() {
-  local common file tmp id
-  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
-  file="$(cd "$common" && pwd -P)/werksfeer-project-id"
-
-  if [ ! -s "$file" ] && [ "${1:-}" = "create" ]; then
-    tmp="${file}.$$"
-    od -An -N4 -tx1 /dev/urandom | tr -d ' \n' > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    # A concurrent setup may have stored an id first; keep that one.
-    mv -n "$tmp" "$file" 2>/dev/null || true
+# IDs live with Git metadata: the project ID follows the repository and the
+# worktree ID follows a worktree until Git removes it. Reusing a path then
+# gets a fresh ID, while branch renames, aliases and moves keep the same ID.
+stored_database_id() {
+  local file="$1" bytes="$2" mode="${3:-}" tmp id
+  if [ ! -e "$file" ] && [ "$mode" = "create" ]; then
+    tmp="$(mktemp "${file}.XXXXXX")" || return 1
+    od -An -N"$bytes" -tx1 /dev/urandom | tr -d ' \n' > "$tmp" || { rm -f "$tmp"; return 1; }
+    # Publish atomically without replacing an ID another setup already wrote.
+    ln "$tmp" "$file" 2>/dev/null || true
     rm -f "$tmp"
   fi
 
-  [ -s "$file" ] || return 1
-  id="$(cat "$file")"
+  [ -f "$file" ] || return 1
+  id="$(cat "$file")" || return 1
   case "$id" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) printf '%s\n' "$id" ;;
-    *) log_error "Invalid werksfeer project id in $file"; return 1 ;;
+    ''|*[!0-9a-f]*) log_error "Invalid werksfeer database id in $file"; return 1 ;;
   esac
+  if [ "${#id}" -ne "$((bytes * 2))" ]; then
+    log_error "Invalid werksfeer database id in $file"
+    return 1
+  fi
+  printf '%s\n' "$id"
 }
 
-# Database-safe name of the worktree directory. Resolves symlinks so an alias
-# of the workspace maps to the same database.
+project_database_id() {
+  local common
+  common="$(git rev-parse --git-common-dir 2>/dev/null)" || return 1
+  common="$(cd "$common" && pwd -P)" || return 1
+  stored_database_id "${common}/werksfeer-project-id" 4 "${1:-}"
+}
+
+worktree_database_id() {
+  local git_dir
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  stored_database_id "${git_dir}/werksfeer-worktree-id" 8 "${1:-}"
+}
+
+# Only used to recognize database names recorded by older versions.
 worktree_database_dir_name() {
   sanitize_name "$(basename "$(cd "$1" && pwd -P)")"
 }
 
-# Truncated so the "_test" variant fits PostgreSQL's 63 byte name limit.
+# Both IDs are fixed-width hex, so appending _test cannot match another
+# worktree's development database. Both names fit PostgreSQL's 63 byte limit.
 worktree_database_name() {
-  local project_id="$1" dir_name="$2"
-  printf 'worktree_%s_%s\n' "$project_id" "${dir_name:0:40}"
+  printf 'worktree_%s_%s\n' "$1" "$2"
 }
 
 # The database an older werksfeer recorded for this worktree, named
@@ -823,14 +834,18 @@ clone_databases() {
   base_dev="$(echo "$db_names" | awk '{print $1}')"
   base_test="$(echo "$db_names" | awk '{print $2}')"
 
-  local project_id wt_name legacy
+  local project_id worktree_id wt_name legacy
   if ! project_id="$(project_database_id create)"; then
-    log_error "Could not store the werksfeer project id in the git directory, skipping database cloning"
-    return 0
+    log_error "Could not store the werksfeer project id in the git directory"
+    return 1
+  fi
+  if ! worktree_id="$(worktree_database_id create)"; then
+    log_error "Could not store the werksfeer worktree id in the git directory"
+    return 1
   fi
   wt_name="$(worktree_database_dir_name .)"
 
-  NEW_DEV_DB="$(worktree_database_name "$project_id" "$wt_name")"
+  NEW_DEV_DB="$(worktree_database_name "$project_id" "$worktree_id")"
   NEW_TEST_DB="${NEW_DEV_DB}_test"
 
   # Worktrees set up by an older werksfeer keep the databases they use.
@@ -1373,27 +1388,15 @@ cleanup_worktree() {
     return 0
   fi
 
-  local project_id="" db_dir_name="" dev_db dbs=""
+  local project_id="" dbs=""
   if [ -n "$project_root" ]; then
     project_id="$(cd "$worktree_path" && project_database_id)" || project_id=""
-    db_dir_name="$(worktree_database_dir_name "$worktree_path")"
-    # Databases an older werksfeer created for this worktree
-    dbs="$(cd "$worktree_path" && legacy_database_name DATABASE_NAME "$db_dir_name")
-$(cd "$worktree_path" && legacy_database_name TEST_DATABASE_NAME "${db_dir_name}_test")"
+    dbs="$(cd "$worktree_path" && worktree_database_names "$project_id")" || return 1
   elif is_git_repo; then
-    # The worktree is gone, so its project can only be the caller's repository.
-    # Never touch a database that a live worktree with the same name uses.
-    db_dir_name="$(sanitize_name "$wt_name")"
-    if ! project_worktree_dir_names "$(get_main_worktree_path)" | grep -qxF "$db_dir_name"; then
-      project_id="$(project_database_id)" || project_id=""
-    fi
-  fi
-
-  if [ -n "$project_id" ]; then
-    dev_db="$(worktree_database_name "$project_id" "$db_dir_name")"
-    dbs="${dbs}
-${dev_db}
-${dev_db}_test"
+    # Git has removed the worktree metadata, so its ID is no longer available.
+    # Sweep only orphaned clones in the caller's project, as setup does.
+    prune_project_databases "$(get_main_worktree_path)"
+    return
   fi
 
   local db
@@ -1408,14 +1411,36 @@ $dbs
 EOF_CLEANUP_DBS
 }
 
-# Database-safe directory names of the project's worktrees that still exist.
-project_worktree_dir_names() {
-  local wt_path
-  (cd "$1" && git worktree list --porcelain 2>/dev/null) | sed -n 's/^worktree //p' |
-    while IFS= read -r wt_path; do
-      [ -d "$wt_path" ] && worktree_database_dir_name "$wt_path"
-    done
-  return 0
+# Expected names plus recorded legacy names for the current worktree. Shared
+# by cleanup and pruning so an upgrade does not orphan an existing database.
+worktree_database_names() {
+  local project_id="$1" git_dir worktree_id dev_db dir_name
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  if [ -n "$project_id" ] && [ -e "${git_dir}/werksfeer-worktree-id" ]; then
+    worktree_id="$(worktree_database_id)" || return 1
+    dev_db="$(worktree_database_name "$project_id" "$worktree_id")"
+    printf '%s\n%s_test\n' "$dev_db" "$dev_db"
+  fi
+  dir_name="$(worktree_database_dir_name .)"
+  legacy_database_name DATABASE_NAME "$dir_name"
+  legacy_database_name TEST_DATABASE_NAME "${dir_name}_test"
+}
+
+project_worktree_database_names() {
+  local project_dir="$1" project_id="$2" worktrees line wt_path
+  worktrees="$(cd "$project_dir" && git -c core.quotePath=false worktree list --porcelain)" || return 1
+  [ -n "$worktrees" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      'worktree '*)
+        wt_path="${line#worktree }"
+        [ -d "$wt_path" ] || continue
+        (cd "$wt_path" && worktree_database_names "$project_id") || return 1
+        ;;
+    esac
+  done <<EOF_WORKTREES
+$worktrees
+EOF_WORKTREES
 }
 
 # ---------------------------------------------------------------------------
@@ -1480,21 +1505,11 @@ prune_project_databases() {
     return 0
   fi
 
-  # Each live worktree has a dev and a test database. The test name is not
-  # derived by stripping _test because a worktree name may end with _test.
-  local dir_names dir_name active_dbs=""
-  dir_names="$(project_worktree_dir_names "$project_dir")"
-  if [ -z "$dir_names" ]; then
-    log_warn "Could not list worktrees of $project_dir, skipping database prune"
-    return 0
+  local active_dbs
+  if ! active_dbs="$(project_worktree_database_names "$project_dir" "$project_id")"; then
+    log_warn "Could not read worktree database identities for $project_dir, skipping database prune"
+    return 1
   fi
-  while IFS= read -r dir_name; do
-    active_dbs="${active_dbs}$(worktree_database_name "$project_id" "$dir_name")
-$(worktree_database_name "$project_id" "$dir_name")_test
-"
-  done <<EOF_DIR_NAMES
-$dir_names
-EOF_DIR_NAMES
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue

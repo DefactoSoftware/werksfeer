@@ -43,7 +43,7 @@ wt switch -c my-feature
 [werksfeer] ==> Setting up worktree
 [werksfeer] Copied .env
 [werksfeer] Symlinked node_modules -> /path/to/main/node_modules
-[werksfeer] Cloning myapp_development -> worktree_3f9a1c2e_my_feature
+[werksfeer] Cloning myapp_development -> worktree_3f9a1c2e_92d0d6f41a35b708
 [werksfeer] ==> Worktree setup complete!
 ```
 
@@ -510,7 +510,7 @@ werksfeer --prune
 werksfeer --prune-all
 ```
 
-Shared-server clones are named `worktree_<project id>_<worktree directory>`. The project id is random, stored once in the repository's git directory, so workspaces with the same name in different repositories never share a database, and renaming a branch does not change the name. Pruning only drops the current project's clones whose worktree is gone. Clones from older werksfeer versions (`worktree_<branch>_<worktree>`) stay in use by their worktree and are dropped by `--cleanup`. Leftovers of such clones from worktrees that no longer exist are left in place.
+Shared-server clones are named `worktree_<project id>_<worktree id>` (with `_test` for the test database). Random IDs are stored in Git's common directory and each worktree's Git metadata. They survive branch renames, symlink aliases and `git worktree move`. Removing a worktree and recreating its path gives it a new ID and fresh databases; directory names never determine database identity. Pruning only drops the current project's clones whose worktree is gone. Clones from older werksfeer versions (`worktree_<branch>_<worktree>`) stay in use by their worktree and are dropped by `--cleanup`. Leftovers of such clones from worktrees that no longer exist are left in place.
 
 Private PostgreSQL processes must be stopped before their checkout is removed,
 because their control files live in that checkout. Configure
