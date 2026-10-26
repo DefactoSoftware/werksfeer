@@ -43,7 +43,7 @@ wt switch -c my-feature
 [werksfeer] ==> Setting up worktree
 [werksfeer] Copied .env
 [werksfeer] Symlinked node_modules -> /path/to/main/node_modules
-[werksfeer] Cloning myapp_development -> worktree_feature_branch_my_feature
+[werksfeer] Cloning myapp_development -> worktree_3f9a1c2e_92d0d6f41a35b708
 [werksfeer] ==> Worktree setup complete!
 ```
 
@@ -58,6 +58,10 @@ When a new worktree is created, werksfeer:
 5. **Allocates a unique port and Redis database** per worktree, tracked in a registry
 6. **Writes overrides** to a shared `.envrc` contract plus framework dotenv files where useful
 7. **Runs framework setup** (dependencies, database preparation, migrations, and first-time seeds)
+
+When Conductor supplies `CONDUCTOR_PORT`, Werksfeer uses it for the application
+port, including when rerunning setup on a workspace with an older allocation.
+Other environments continue to use Werksfeer's port allocator.
 
 Everything is idempotent — safe to re-run. Private services are opt-in, so
 existing repositories retain the shared-server cloning behavior.
@@ -197,11 +201,11 @@ Add to `.claude/settings.json` (or `.claude/settings.local.json`):
 }
 ```
 
-The `WorktreeRemove` hook drops the worktree's cloned databases when the session ends. Note that Claude Code does not always fire this hook reliably (e.g. when the worktree directory is already deleted before the hook runs). Use `werksfeer --prune` periodically to catch any missed cleanups.
+The `WorktreeRemove` hook drops the worktree's cloned databases when the session ends. Note that Claude Code does not always fire this hook reliably (e.g. when the worktree directory is already deleted before the hook runs). Missed cleanups are caught by the next werksfeer setup in the same project.
 
 ### Claude Desktop
 
-Claude Desktop does **not** fire `WorktreeCreate` or `WorktreeRemove` hooks. Use the [git hooks](#git-hooks) approach instead, and run `werksfeer --prune` to clean up after worktrees are removed.
+Claude Desktop does **not** fire `WorktreeCreate` or `WorktreeRemove` hooks. Use the [git hooks](#git-hooks) approach instead; each new worktree setup cleans up after removed ones.
 
 ### Codex App
 
@@ -263,7 +267,7 @@ If your agent supports post-worktree hooks or setup scripts, point them at `werk
 
 When a worktree is removed, `--cleanup` drops its cloned databases and releases its port/redis allocations. You can run this manually from inside a worktree before deleting it, or pass a path.
 
-Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Use `werksfeer --prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees — this is the most reliable approach.
+Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Every setup therefore also drops the project's shared-server clones whose worktree no longer exists. `--prune` does the same and also releases stale port/Redis allocations.
 
 ```sh
 # Clean up current worktree (drops DBs, releases port/redis)
@@ -536,7 +540,7 @@ werksfeer --prune
 werksfeer --prune-all
 ```
 
-Smart pruning compares `worktree_*` databases against active worktrees — only orphaned databases are dropped and only stale allocations are released.
+Shared-server clones are named `worktree_<project id>_<worktree id>` (with `_test` for the test database). Random IDs are stored in Git's common directory and each worktree's Git metadata. They survive branch renames, symlink aliases and `git worktree move`. Removing a worktree and recreating its path gives it a new ID and fresh databases; directory names never determine database identity. Pruning only drops the current project's clones whose worktree is gone. Clones from older werksfeer versions (`worktree_<branch>_<worktree>`) stay in use by their worktree and are dropped by `--cleanup`. Leftovers of such clones from worktrees that no longer exist are left in place.
 
 Private PostgreSQL processes must be stopped before their checkout is removed,
 because their control files live in that checkout. Configure
