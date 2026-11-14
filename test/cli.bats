@@ -1233,6 +1233,46 @@ run_in_worktree() {
   [ "$(cat "$PG_DBS")" = "example_dev" ]
 }
 
+@test "prune drops orphaned databases with the shared server settings" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
+  printf '%s\n' example_dev "worktree_gone_branch_gone" > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_gone_branch_gone$' "$PG_LOG"
+}
+
+@test "cleanup finds the shared server settings after the worktree is removed" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"'
+  printf '[database]\npassword = "file-pw"\n' > "${MAIN_REPO}/.worktree.local.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'worktree_head_one$' "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+  [ ! -d "$WORKTREE_ONE" ]
+  : > "$PG_LOG"
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_one_test$' "$PG_LOG"
+  [ "$(cat "$PG_DBS")" = "$(printf 'example_dev\nexample_test')" ]
+}
+
+@test "cleanup after removal falls back to the checkout it runs from" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
+  printf '%s\n' example_dev "worktree_head_one" > "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
+}
+
 @test "the shared server password never appears in werksfeer output" {
   install_fake_pg
   write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "s3cret-pw"'

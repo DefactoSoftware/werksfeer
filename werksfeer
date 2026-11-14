@@ -1285,35 +1285,29 @@ register_project() {
 # Cleanup (drop databases for a specific worktree)
 # ---------------------------------------------------------------------------
 
-cleanup_worktree() {
+# Print the main checkouts that have an allocation for this worktree name.
+# Used to find the project configuration once the worktree directory is gone.
+allocation_projects_for_worktree() {
+  local wt_name="$1"
+  local alloc
+  alloc="$(allocations_file)"
+  [ -f "$alloc" ] || return 0
+
+  awk -F'\t' -v w="$wt_name" '$2 == w {print $1}' "$alloc" | sort -u
+}
+
+# Load the project configuration (including the main checkout's
+# .worktree.local.toml) from a main checkout, starting from a clean slate.
+load_main_configuration() {
+  local main_path="$1"
+  [ -d "$main_path" ] || return 1
+  toml_reset
+  load_project_configuration "$main_path"
+}
+
+cleanup_worktree_databases() {
   local worktree_path="$1"
-  local wt_name
-  wt_name="$(basename "$worktree_path")"
-
-  log_step "Cleaning up worktree: $wt_name"
-
-  local project_root=""
-  local main_path=""
-  local private_postgres=false
-  if [ -d "$worktree_path" ] && (cd "$worktree_path" && is_git_repo); then
-    project_root="$(cd "$worktree_path" && current_project_root)"
-    main_path="$(cd "$project_root" && get_main_worktree_path)"
-
-    if load_project_configuration "$project_root"; then
-      if use_private_postgres_cluster; then
-        private_postgres=true
-      fi
-      run_services_action "cleanup" "$project_root"
-    fi
-  fi
-
-  # Deregister port/redis allocation
-  deregister_allocation "$wt_name" "$main_path"
-  log_info "Released port/redis allocation"
-
-  if [ "$private_postgres" = true ]; then
-    return 0
-  fi
+  local wt_name="$2"
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
@@ -1352,6 +1346,70 @@ cleanup_worktree() {
       fi
     done
   fi
+}
+
+cleanup_worktree() {
+  local worktree_path="$1"
+  local wt_name
+  wt_name="$(basename "$worktree_path")"
+
+  log_step "Cleaning up worktree: $wt_name"
+
+  local project_root=""
+  local main_path=""
+  local private_postgres=false
+  local configured=false
+  if [ -d "$worktree_path" ] && (cd "$worktree_path" && is_git_repo); then
+    project_root="$(cd "$worktree_path" && current_project_root)"
+    main_path="$(cd "$project_root" && get_main_worktree_path)"
+
+    if load_project_configuration "$project_root"; then
+      configured=true
+      if use_private_postgres_cluster; then
+        private_postgres=true
+      fi
+      run_services_action "cleanup" "$project_root"
+    fi
+  fi
+
+  # The worktree is gone (or no longer a git repo): its allocation still names
+  # the main checkout, which holds the configuration and the local settings
+  # (such as the database password). Look it up before releasing it.
+  local lookup_mains=""
+  if [ "$configured" = false ] && [ -z "$main_path" ]; then
+    lookup_mains="$(allocation_projects_for_worktree "$wt_name")"
+    # No allocation left: fall back to the checkout the command runs from.
+    if [ -z "$lookup_mains" ] && is_git_repo; then
+      lookup_mains="$(get_main_worktree_path)"
+    fi
+  fi
+
+  # Deregister port/redis allocation
+  deregister_allocation "$wt_name" "$main_path"
+  log_info "Released port/redis allocation"
+
+  if [ "$private_postgres" = true ]; then
+    return 0
+  fi
+
+  if [ "$configured" = true ] || [ -z "$lookup_mains" ]; then
+    cleanup_worktree_databases "$worktree_path" "$wt_name"
+    return 0
+  fi
+
+  local lookup_main
+  while IFS= read -r lookup_main; do
+    [ -z "$lookup_main" ] && continue
+    if load_main_configuration "$lookup_main"; then
+      log_debug "Loaded configuration from $lookup_main"
+      if use_private_postgres_cluster; then
+        continue
+      fi
+    fi
+    cleanup_worktree_databases "$worktree_path" "$wt_name"
+  done <<EOF_MAINS
+$lookup_mains
+EOF_MAINS
 }
 
 # ---------------------------------------------------------------------------
@@ -1393,6 +1451,11 @@ prune_project() {
     log_warn "psql not found, skipping database prune"
     return 0
   fi
+
+  # Connection settings live in the project's configuration, which is not
+  # loaded yet when pruning from outside a setup run (and differs per project
+  # for --prune-all).
+  load_main_configuration "$project_dir" || log_debug "No configuration loaded for $project_dir"
 
   # Get all worktree_* databases
   local all_wt_dbs
