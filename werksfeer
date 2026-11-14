@@ -707,8 +707,33 @@ has_psql() {
   command -v psql >/dev/null 2>&1
 }
 
+# Run a PostgreSQL client command (psql, dropdb, createdb) against the shared
+# server. Keys set under [database] (host, port, user, password) become
+# PGHOST/PGPORT/PGUSER/PGPASSWORD for this one command. Keys that are not set
+# leave the caller's environment alone. They are never written to env files and
+# never reach `werksfeer exec` children or setup hooks.
+shared_pg() {
+  local -a pg_env=()
+  local value
+
+  value="$(toml_get "database" "host" "")"
+  [ -n "$value" ] && pg_env+=("PGHOST=$value")
+  value="$(toml_get "database" "port" "")"
+  [ -n "$value" ] && pg_env+=("PGPORT=$value")
+  value="$(toml_get "database" "user" "")"
+  [ -n "$value" ] && pg_env+=("PGUSER=$value")
+  value="$(toml_get "database" "password" "")"
+  [ -n "$value" ] && pg_env+=("PGPASSWORD=$value")
+
+  if [ "${#pg_env[@]}" -gt 0 ]; then
+    env "${pg_env[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
 db_exists() {
-  psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
 get_base_db_names() {
@@ -772,8 +797,8 @@ clone_databases() {
     log_warn "Template database $base_dev not found, skipping dev DB clone"
   else
     log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
+    shared_pg psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
       log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
     fi
   fi
@@ -785,8 +810,8 @@ clone_databases() {
     log_warn "Template database $base_test not found, skipping test DB clone"
   else
     log_info "Cloning $base_test -> $NEW_TEST_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
+    shared_pg psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
       log_error "Failed to clone $base_test -> $NEW_TEST_DB"
     fi
   fi
@@ -1310,20 +1335,20 @@ cleanup_worktree() {
     for db in "$dev_db" "$test_db"; do
       if db_exists "$db"; then
         log_info "Dropping $db"
-        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
       fi
     done
   else
     # Worktree already deleted — find DBs by suffix match on the worktree name
     log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
     local all_wt_dbs
-    all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+    all_wt_dbs="$(shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
     echo "$all_wt_dbs" | while IFS= read -r db; do
       [ -z "$db" ] && continue
       # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
       if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
         log_info "Dropping $db"
-        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
       fi
     done
   fi
@@ -1371,7 +1396,7 @@ prune_project() {
 
   # Get all worktree_* databases
   local all_wt_dbs
-  all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  all_wt_dbs="$(shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
@@ -1410,7 +1435,7 @@ EOF
 
     if [ "$found" = false ]; then
       log_info "Dropping orphaned database: $db"
-      dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
     else
       log_debug "Keeping active database: $db"
     fi
