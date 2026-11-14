@@ -451,6 +451,13 @@ base_name = "myapp"
 # Override suffixes
 dev_suffix = "_development"
 test_suffix = "_test"
+# Connection to a shared PostgreSQL server (see "Shared server with a
+# password"). A key you leave out keeps the environment's value.
+# host = "localhost"
+# port = 5432
+# user = "agent"
+# Keep the password in the ignored .worktree.local.toml instead:
+# password = "..."
 
 [services]
 # Built-in lifecycle providers. Omit this section to keep shared DB cloning.
@@ -523,6 +530,44 @@ either setting changes, Werksfeer will not reuse older cached templates. An
 existing worktree data directory is never rewritten in place; if its metadata
 does not match the current configuration, Werksfeer refuses to use it and
 prints the path that must be moved or removed before rebuilding.
+
+## Shared server with a password
+
+Without a private cluster, werksfeer clones, drops and prunes databases on a
+shared PostgreSQL server with `psql` and `dropdb`. These commands only know the
+process environment. If the server needs a host, user or password, set them
+under `[database]`:
+
+```toml
+# .worktree.toml
+[database]
+host = "localhost"
+user = "agent"
+```
+
+Put the password in the main checkout's `.worktree.local.toml`. Ignore that
+file in git so the password stays out of the repository:
+
+```toml
+# .worktree.local.toml
+[database]
+password = "..."
+```
+
+Werksfeer passes each key you set as `PGHOST`, `PGPORT`, `PGUSER` or
+`PGPASSWORD` to its own database commands, and only to those. A key you set
+overrides the environment, because the environment can come from another
+project (for example through direnv). A key you leave out keeps the
+environment's value. Werksfeer does not write these settings to env files and
+does not pass them to `werksfeer exec` or setup hooks, because the application
+has its own database configuration. It never prints the password.
+
+`--cleanup` and `--prune` read the same settings from the main checkout, also
+when the worktree directory is already gone.
+
+Werksfeer checks the connection once before it clones, cleans up or prunes. If
+the server cannot be reached, it warns with the first line of the `psql` error
+and skips the database part. The rest of the run goes on.
 
 ## Pruning orphaned databases
 
