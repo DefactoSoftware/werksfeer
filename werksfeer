@@ -747,7 +747,7 @@ shared_pg_reachable() {
 }
 
 db_exists() {
-  shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
 get_base_db_names() {
@@ -816,8 +816,8 @@ clone_databases() {
     log_warn "Template database $base_dev not found, skipping dev DB clone"
   else
     log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    shared_pg psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
+    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
       log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
     fi
   fi
@@ -829,8 +829,8 @@ clone_databases() {
     log_warn "Template database $base_test not found, skipping test DB clone"
   else
     log_info "Cloning $base_test -> $NEW_TEST_DB"
-    shared_pg psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
+    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
       log_error "Failed to clone $base_test -> $NEW_TEST_DB"
     fi
   fi
@@ -1360,7 +1360,7 @@ cleanup_worktree_databases() {
     # Worktree already deleted — find DBs by suffix match on the worktree name
     log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
     local all_wt_dbs
-    all_wt_dbs="$(shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+    all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
     echo "$all_wt_dbs" | while IFS= read -r db; do
       [ -z "$db" ] && continue
       # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
@@ -1488,7 +1488,7 @@ prune_project() {
 
   # Get all worktree_* databases
   local all_wt_dbs
-  all_wt_dbs="$(shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"

@@ -1147,6 +1147,14 @@ if [ -e "$PG_DOWN" ]; then
   printf 'psql: error: connection to server at "db.example" failed: Connection refused\n\tIs the server running?\n' >&2
   exit 2
 fi
+# Like a real server where the user has no database of the same name: a call
+# that does not name the maintenance database explicitly fails.
+case " $* " in
+  *" -d postgres "*) ;;
+  *)
+    printf 'psql: error: connection failed: FATAL:  database "%s" does not exist\n' "${PGUSER-unknown}" >&2
+    exit 2 ;;
+esac
 printf 'psql PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
   "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
 case "$*" in
