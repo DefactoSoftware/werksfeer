@@ -1100,3 +1100,227 @@ EOF_CONFIG
   grep -q 'export DATABASE_NAME="rails_example_development"' "${rails_worktree}/.envrc"
   grep -q 'werksfeer services start' "${rails_worktree}/.envrc"
 }
+
+# ---------------------------------------------------------------------------
+# Shared PostgreSQL server connection settings
+# ---------------------------------------------------------------------------
+
+# Writes a shared-server configuration (no private cluster) to the main
+# checkout and both worktrees. Arguments are extra lines for [database].
+write_shared_config() {
+  local target
+  {
+    cat <<'EOF_CONFIG'
+[cache]
+auto_warm = false
+
+[setup]
+command = "true"
+
+[database]
+base_name = "example"
+EOF_CONFIG
+    printf '%s\n' "$@"
+  } > "${MAIN_REPO}/.worktree.toml"
+  for target in "$WORKTREE_ONE" "$WORKTREE_TWO"; do
+    cp "${MAIN_REPO}/.worktree.toml" "${target}/.worktree.toml"
+  done
+}
+
+# Puts fake psql, dropdb and elixir first on PATH. Each psql/dropdb call is
+# appended to $PG_LOG with the connection variables it saw. The databases the
+# fake server holds are listed in $PG_DBS, one name per line. Create
+# $PG_DOWN to make every connection fail.
+install_fake_pg() {
+  FAKE_BIN="${TEST_ROOT}/fake-pg-bin"
+  PG_LOG="${TEST_ROOT}/pg.log"
+  PG_DBS="${TEST_ROOT}/pg.dbs"
+  PG_DOWN="${TEST_ROOT}/pg.down"
+  export PG_LOG PG_DBS PG_DOWN
+  mkdir -p "$FAKE_BIN"
+  : > "$PG_LOG"
+  printf '%s\n' example_dev example_test > "$PG_DBS"
+
+  cat > "${FAKE_BIN}/psql" <<'EOF_PSQL'
+#!/usr/bin/env bash
+if [ -e "$PG_DOWN" ]; then
+  printf 'psql: error: connection to server at "db.example" failed: Connection refused\n\tIs the server running?\n' >&2
+  exit 2
+fi
+# Like a real server where the user has no database of the same name: a call
+# that does not name the maintenance database explicitly fails.
+case " $* " in
+  *" -d postgres "*) ;;
+  *)
+    printf 'psql: error: connection failed: FATAL:  database "%s" does not exist\n' "${PGUSER-unknown}" >&2
+    exit 2 ;;
+esac
+printf 'psql PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
+  "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
+case "$*" in
+  *-lqt*) sed 's/$/ | owner | UTF8/' "$PG_DBS" ;;
+  *"CREATE DATABASE"*)
+    name="$(printf '%s' "$*" | sed 's/.*CREATE DATABASE "\([^"]*\)".*/\1/')"
+    printf '%s\n' "$name" >> "$PG_DBS" ;;
+esac
+exit 0
+EOF_PSQL
+
+  cat > "${FAKE_BIN}/dropdb" <<'EOF_DROPDB'
+#!/usr/bin/env bash
+printf 'dropdb PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
+  "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
+grep -vxF "${!#}" "$PG_DBS" > "${PG_DBS}.new" || true
+mv "${PG_DBS}.new" "$PG_DBS"
+EOF_DROPDB
+
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${FAKE_BIN}/elixir"
+  chmod +x "${FAKE_BIN}/psql" "${FAKE_BIN}/dropdb" "${FAKE_BIN}/elixir"
+}
+
+run_in_worktree() {
+  local worktree="$1"
+  shift
+  run bash -c "cd \"$worktree\" && PATH=\"$FAKE_BIN:/usr/bin:/bin:\$PATH\" \"\$@\"" _ "$@"
+}
+
+@test "shared server settings reach psql when cloning databases" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'port = 5433' 'user = "agent"'
+  printf '[database]\npassword = "s3cret-pw"\n' > "${MAIN_REPO}/.worktree.local.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'psql PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=s3cret-pw .*CREATE DATABASE "worktree_.*_one" WITH TEMPLATE "example_dev"' "$PG_LOG"
+  grep -q 'CREATE DATABASE "worktree_.*_one_test" WITH TEMPLATE "example_test"' "$PG_LOG"
+  run grep -qv 'PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=s3cret-pw' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "shared server settings that are not set leave the environment alone" {
+  install_fake_pg
+  write_shared_config 'user = "agent"'
+
+  run_in_worktree "$WORKTREE_ONE" env PGHOST=env-host PGPORT=6000 PGUSER=env-user PGPASSWORD=env-pw "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'psql PGHOST=env-host PGPORT=6000 PGUSER=agent PGPASSWORD=env-pw ' "$PG_LOG"
+  run grep -q 'PGUSER=env-user' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "shared server settings win over the environment" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'port = 5433' 'user = "agent"' 'password = "file-pw"'
+
+  run_in_worktree "$WORKTREE_ONE" env PGHOST=env-host PGPORT=6000 PGUSER=env-user PGPASSWORD=env-pw "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=file-pw ' "$PG_LOG"
+  run grep -q 'env-host\|env-user\|env-pw\|PGPORT=6000' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "an unconfigured shared server keeps using the environment" {
+  install_fake_pg
+  write_shared_config
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'psql PGHOST=<unset> PGPORT=<unset> PGUSER=<unset> PGPASSWORD=<unset> ' "$PG_LOG"
+}
+
+@test "cleanup drops worktree databases with the shared server settings" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
+  printf '%s\n' example_dev "worktree_head_one" "worktree_head_one_test" > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_one_test$' "$PG_LOG"
+  [ "$(cat "$PG_DBS")" = "example_dev" ]
+}
+
+@test "prune drops orphaned databases with the shared server settings" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
+  printf '%s\n' example_dev "worktree_gone_branch_gone" > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_gone_branch_gone$' "$PG_LOG"
+}
+
+@test "cleanup finds the shared server settings after the worktree is removed" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"'
+  printf '[database]\npassword = "file-pw"\n' > "${MAIN_REPO}/.worktree.local.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'worktree_head_one$' "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+  [ ! -d "$WORKTREE_ONE" ]
+  : > "$PG_LOG"
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_one_test$' "$PG_LOG"
+  [ "$(cat "$PG_DBS")" = "$(printf 'example_dev\nexample_test')" ]
+}
+
+@test "cleanup after removal falls back to the checkout it runs from" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
+  printf '%s\n' example_dev "worktree_head_one" > "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
+}
+
+@test "an unreachable shared server gives a warning and the run still succeeds" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "s3cret-pw"'
+  touch "$PG_DOWN"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'WARNING: Cannot reach the PostgreSQL server: psql: error: connection to server at "db.example" failed: Connection refused'* ]]
+  [[ "$output" != *"Is the server running?"* ]]
+  [[ "$output" == *"Set host, user and password under [database]"* ]]
+  [[ "$output" == *".worktree.local.toml"* ]]
+  [[ "$output" != *"Template database"* ]]
+  [[ "$output" != *"s3cret-pw"* ]]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_TWO"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot reach the PostgreSQL server"* ]]
+  [[ "$output" == *"Skipping database cleanup"* ]]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot reach the PostgreSQL server"* ]]
+  [[ "$output" == *"Skipping database prune"* ]]
+  [[ "$output" != *"s3cret-pw"* ]]
+}
+
+@test "the shared server password never appears in werksfeer output" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "s3cret-pw"'
+  printf '%s\n' example_dev "worktree_head_two" > "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_DEBUG=1 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"s3cret-pw"* ]]
+
+  run_in_worktree "$MAIN_REPO" env WERKSFEER_DEBUG=1 "$WERKSFEER" --cleanup "$WORKTREE_TWO"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"s3cret-pw"* ]]
+
+  run_in_worktree "$MAIN_REPO" env WERKSFEER_DEBUG=1 "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"s3cret-pw"* ]]
+}

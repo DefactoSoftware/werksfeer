@@ -707,8 +707,47 @@ has_psql() {
   command -v psql >/dev/null 2>&1
 }
 
+# Run a PostgreSQL client command (psql, dropdb, createdb) against the shared
+# server. Keys set under [database] (host, port, user, password) become
+# PGHOST/PGPORT/PGUSER/PGPASSWORD for this one command. Keys that are not set
+# leave the caller's environment alone. They are never written to env files and
+# never reach `werksfeer exec` children or setup hooks.
+shared_pg() {
+  local -a pg_env=()
+  local value
+
+  value="$(toml_get "database" "host" "")"
+  [ -n "$value" ] && pg_env+=("PGHOST=$value")
+  value="$(toml_get "database" "port" "")"
+  [ -n "$value" ] && pg_env+=("PGPORT=$value")
+  value="$(toml_get "database" "user" "")"
+  [ -n "$value" ] && pg_env+=("PGUSER=$value")
+  value="$(toml_get "database" "password" "")"
+  [ -n "$value" ] && pg_env+=("PGPASSWORD=$value")
+
+  if [ "${#pg_env[@]}" -gt 0 ]; then
+    env "${pg_env[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Check once that the shared server accepts our connection. Warns with the
+# first line of psql's error and a hint, and returns 1 when it does not.
+shared_pg_reachable() {
+  local error_output first_line
+  if error_output="$(PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" shared_pg psql -Atqc 'select 1' -d postgres 2>&1 >/dev/null)"; then
+    return 0
+  fi
+
+  first_line="$(printf '%s\n' "$error_output" | head -n 1)"
+  log_warn "Cannot reach the PostgreSQL server: ${first_line:-psql failed without a message}"
+  log_warn "Set host, user and password under [database] in .worktree.toml (put the password in .worktree.local.toml)"
+  return 1
+}
+
 db_exists() {
-  psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
 
 get_base_db_names() {
@@ -758,6 +797,11 @@ clone_databases() {
   base_dev="$(echo "$db_names" | awk '{print $1}')"
   base_test="$(echo "$db_names" | awk '{print $2}')"
 
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database cloning"
+    return 0
+  fi
+
   local wt_name wt_branch
   wt_name="$(sanitize_name "$(get_worktree_name)")"
   wt_branch="$(sanitize_name "$(get_worktree_branch)")"
@@ -772,8 +816,8 @@ clone_databases() {
     log_warn "Template database $base_dev not found, skipping dev DB clone"
   else
     log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
+    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
       log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
     fi
   fi
@@ -785,8 +829,8 @@ clone_databases() {
     log_warn "Template database $base_test not found, skipping test DB clone"
   else
     log_info "Cloning $base_test -> $NEW_TEST_DB"
-    psql -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! psql -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
+    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
+    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
       log_error "Failed to clone $base_test -> $NEW_TEST_DB"
     fi
   fi
@@ -1260,38 +1304,37 @@ register_project() {
 # Cleanup (drop databases for a specific worktree)
 # ---------------------------------------------------------------------------
 
-cleanup_worktree() {
+# Print the main checkouts that have an allocation for this worktree name.
+# Used to find the project configuration once the worktree directory is gone.
+allocation_projects_for_worktree() {
+  local wt_name="$1"
+  local alloc
+  alloc="$(allocations_file)"
+  [ -f "$alloc" ] || return 0
+
+  awk -F'\t' -v w="$wt_name" '$2 == w {print $1}' "$alloc" | sort -u
+}
+
+# Load the project configuration (including the main checkout's
+# .worktree.local.toml) from a main checkout, starting from a clean slate.
+load_main_configuration() {
+  local main_path="$1"
+  [ -d "$main_path" ] || return 1
+  toml_reset
+  load_project_configuration "$main_path"
+}
+
+cleanup_worktree_databases() {
   local worktree_path="$1"
-  local wt_name
-  wt_name="$(basename "$worktree_path")"
-
-  log_step "Cleaning up worktree: $wt_name"
-
-  local project_root=""
-  local main_path=""
-  local private_postgres=false
-  if [ -d "$worktree_path" ] && (cd "$worktree_path" && is_git_repo); then
-    project_root="$(cd "$worktree_path" && current_project_root)"
-    main_path="$(cd "$project_root" && get_main_worktree_path)"
-
-    if load_project_configuration "$project_root"; then
-      if use_private_postgres_cluster; then
-        private_postgres=true
-      fi
-      run_services_action "cleanup" "$project_root"
-    fi
-  fi
-
-  # Deregister port/redis allocation
-  deregister_allocation "$wt_name" "$main_path"
-  log_info "Released port/redis allocation"
-
-  if [ "$private_postgres" = true ]; then
-    return 0
-  fi
+  local wt_name="$2"
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
+    return 0
+  fi
+
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database cleanup"
     return 0
   fi
 
@@ -1310,23 +1353,87 @@ cleanup_worktree() {
     for db in "$dev_db" "$test_db"; do
       if db_exists "$db"; then
         log_info "Dropping $db"
-        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
       fi
     done
   else
     # Worktree already deleted — find DBs by suffix match on the worktree name
     log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
     local all_wt_dbs
-    all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+    all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
     echo "$all_wt_dbs" | while IFS= read -r db; do
       [ -z "$db" ] && continue
       # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
       if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
         log_info "Dropping $db"
-        dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
       fi
     done
   fi
+}
+
+cleanup_worktree() {
+  local worktree_path="$1"
+  local wt_name
+  wt_name="$(basename "$worktree_path")"
+
+  log_step "Cleaning up worktree: $wt_name"
+
+  local project_root=""
+  local main_path=""
+  local private_postgres=false
+  local configured=false
+  if [ -d "$worktree_path" ] && (cd "$worktree_path" && is_git_repo); then
+    project_root="$(cd "$worktree_path" && current_project_root)"
+    main_path="$(cd "$project_root" && get_main_worktree_path)"
+
+    if load_project_configuration "$project_root"; then
+      configured=true
+      if use_private_postgres_cluster; then
+        private_postgres=true
+      fi
+      run_services_action "cleanup" "$project_root"
+    fi
+  fi
+
+  # The worktree is gone (or no longer a git repo): its allocation still names
+  # the main checkout, which holds the configuration and the local settings
+  # (such as the database password). Look it up before releasing it.
+  local lookup_mains=""
+  if [ "$configured" = false ] && [ -z "$main_path" ]; then
+    lookup_mains="$(allocation_projects_for_worktree "$wt_name")"
+    # No allocation left: fall back to the checkout the command runs from.
+    if [ -z "$lookup_mains" ] && is_git_repo; then
+      lookup_mains="$(get_main_worktree_path)"
+    fi
+  fi
+
+  # Deregister port/redis allocation
+  deregister_allocation "$wt_name" "$main_path"
+  log_info "Released port/redis allocation"
+
+  if [ "$private_postgres" = true ]; then
+    return 0
+  fi
+
+  if [ "$configured" = true ] || [ -z "$lookup_mains" ]; then
+    cleanup_worktree_databases "$worktree_path" "$wt_name"
+    return 0
+  fi
+
+  local lookup_main
+  while IFS= read -r lookup_main; do
+    [ -z "$lookup_main" ] && continue
+    if load_main_configuration "$lookup_main"; then
+      log_debug "Loaded configuration from $lookup_main"
+      if use_private_postgres_cluster; then
+        continue
+      fi
+    fi
+    cleanup_worktree_databases "$worktree_path" "$wt_name"
+  done <<EOF_MAINS
+$lookup_mains
+EOF_MAINS
 }
 
 # ---------------------------------------------------------------------------
@@ -1369,9 +1476,19 @@ prune_project() {
     return 0
   fi
 
+  # Connection settings live in the project's configuration, which is not
+  # loaded yet when pruning from outside a setup run (and differs per project
+  # for --prune-all).
+  load_main_configuration "$project_dir" || log_debug "No configuration loaded for $project_dir"
+
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database prune"
+    return 0
+  fi
+
   # Get all worktree_* databases
   local all_wt_dbs
-  all_wt_dbs="$(psql -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
@@ -1410,7 +1527,7 @@ EOF
 
     if [ "$found" = false ]; then
       log_info "Dropping orphaned database: $db"
-      dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
+      shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
     else
       log_debug "Keeping active database: $db"
     fi
