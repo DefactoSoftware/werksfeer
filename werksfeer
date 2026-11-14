@@ -732,6 +732,20 @@ shared_pg() {
   fi
 }
 
+# Check once that the shared server accepts our connection. Warns with the
+# first line of psql's error and a hint, and returns 1 when it does not.
+shared_pg_reachable() {
+  local error_output first_line
+  if error_output="$(PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" shared_pg psql -Atqc 'select 1' -d postgres 2>&1 >/dev/null)"; then
+    return 0
+  fi
+
+  first_line="$(printf '%s\n' "$error_output" | head -n 1)"
+  log_warn "Cannot reach the PostgreSQL server: ${first_line:-psql failed without a message}"
+  log_warn "Set host, user and password under [database] in .worktree.toml (put the password in .worktree.local.toml)"
+  return 1
+}
+
 db_exists() {
   shared_pg psql -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
 }
@@ -782,6 +796,11 @@ clone_databases() {
   local base_dev base_test
   base_dev="$(echo "$db_names" | awk '{print $1}')"
   base_test="$(echo "$db_names" | awk '{print $2}')"
+
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database cloning"
+    return 0
+  fi
 
   local wt_name wt_branch
   wt_name="$(sanitize_name "$(get_worktree_name)")"
@@ -1314,6 +1333,11 @@ cleanup_worktree_databases() {
     return 0
   fi
 
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database cleanup"
+    return 0
+  fi
+
   wt_name="$(sanitize_name "$wt_name")"
 
   # Try to get the branch from the worktree if it still exists
@@ -1456,6 +1480,11 @@ prune_project() {
   # loaded yet when pruning from outside a setup run (and differs per project
   # for --prune-all).
   load_main_configuration "$project_dir" || log_debug "No configuration loaded for $project_dir"
+
+  if ! shared_pg_reachable; then
+    log_warn "Skipping database prune"
+    return 0
+  fi
 
   # Get all worktree_* databases
   local all_wt_dbs

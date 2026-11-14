@@ -1273,6 +1273,32 @@ run_in_worktree() {
   grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
 }
 
+@test "an unreachable shared server gives a warning and the run still succeeds" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "s3cret-pw"'
+  touch "$PG_DOWN"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'WARNING: Cannot reach the PostgreSQL server: psql: error: connection to server at "db.example" failed: Connection refused'* ]]
+  [[ "$output" != *"Is the server running?"* ]]
+  [[ "$output" == *"Set host, user and password under [database]"* ]]
+  [[ "$output" == *".worktree.local.toml"* ]]
+  [[ "$output" != *"Template database"* ]]
+  [[ "$output" != *"s3cret-pw"* ]]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_TWO"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot reach the PostgreSQL server"* ]]
+  [[ "$output" == *"Skipping database cleanup"* ]]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot reach the PostgreSQL server"* ]]
+  [[ "$output" == *"Skipping database prune"* ]]
+  [[ "$output" != *"s3cret-pw"* ]]
+}
+
 @test "the shared server password never appears in werksfeer output" {
   install_fake_pg
   write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "s3cret-pw"'
