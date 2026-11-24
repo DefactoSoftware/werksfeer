@@ -1424,3 +1424,47 @@ seed_two_project_server() {
   [ "$status" -eq 1 ]
   [ "$(wc -l < "$PG_DBS")" -eq 9 ]
 }
+
+@test "prune keeps the databases of a worktree whose path has a space" {
+  install_fake_pg
+  setup_second_project
+  local spaced="${TEST_ROOT}/worktrees/my tree"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced" HEAD
+  seed_two_project_server
+  printf '%s\n' worktree_head_my_tree worktree_head_my_tree_test >> "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_head_my_tree "$PG_DBS"
+  grep -qxF worktree_head_my_tree_test "$PG_DBS"
+  grep -qxF worktree_head_one "$PG_DBS"
+  grep -qxF worktree_head_bone "$PG_DBS"
+  run grep -E 'dropdb .*worktree_head_(my_tree|one|bone|my)' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  grep -q 'dropdb .* --if-exists worktree_head_gone_a$' "$PG_LOG"
+}
+
+@test "prune drops nothing when a registered project cannot list its worktrees" {
+  install_fake_pg
+  setup_second_project
+  seed_two_project_server
+  local real_git
+  real_git="$(command -v git)"
+  cat > "${FAKE_BIN}/git" <<EOF_GIT
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "worktree list" ] && [ "\$(basename "\$PWD")" = "other" ]; then
+  echo "fatal: worktree metadata unreadable" >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
+EOF_GIT
+  chmod +x "${FAKE_BIN}/git"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot read the worktrees of ${OTHER_REPO}"* ]]
+  [[ "$output" == *"Skipping database prune"* ]]
+  run grep -q 'dropdb' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 9 ]
+}
