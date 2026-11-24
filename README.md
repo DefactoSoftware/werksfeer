@@ -581,7 +581,9 @@ werksfeer --prune
 werksfeer --prune-all
 ```
 
-Smart pruning compares `worktree_*` databases against active worktrees — only orphaned databases are dropped and only stale allocations are released.
+Pruning compares `worktree_*` databases against the active worktrees of every registered project, not just the current one. Projects can share a PostgreSQL server, so a database is dropped only when no registered project has an active worktree that owns it. Only stale allocations of the project being pruned are released.
+
+The first time you run `werksfeer` in a project, it records the project in `~/.local/share/werksfeer/projects`. If that file does not exist, `--prune` warns and skips the database part, because it cannot tell which databases belong to other projects. Run `werksfeer` in each project to register it, then prune again. A registered project whose directory no longer exists counts as having no active worktrees.
 
 Private PostgreSQL processes must be stopped before their checkout is removed,
 because their control files live in that checkout. Configure
