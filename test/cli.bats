@@ -1245,6 +1245,8 @@ run_in_worktree() {
   install_fake_pg
   write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
   printf '%s\n' example_dev "worktree_gone_branch_gone" > "$PG_DBS"
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  printf '%s\n' "$MAIN_REPO" > "${XDG_DATA_HOME}/werksfeer/projects"
 
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
   [ "$status" -eq 0 ]
@@ -1323,4 +1325,102 @@ run_in_worktree() {
   run_in_worktree "$MAIN_REPO" env WERKSFEER_DEBUG=1 "$WERKSFEER" --prune
   [ "$status" -eq 0 ]
   [[ "$output" != *"s3cret-pw"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Pruning with several projects on one PostgreSQL server
+# ---------------------------------------------------------------------------
+
+# Creates a second project ("other") with one linked worktree ("bone") and
+# registers both projects, the way running werksfeer in each would.
+setup_second_project() {
+  OTHER_REPO="${TEST_ROOT}/other"
+  OTHER_WORKTREE="${TEST_ROOT}/worktrees/bone"
+  mkdir -p "$OTHER_REPO"
+  git -C "$OTHER_REPO" init -q
+  git -C "$OTHER_REPO" config user.email test@example.com
+  git -C "$OTHER_REPO" config user.name "Werksfeer Test"
+  printf 'defmodule Other.MixProject do\nend\n' > "${OTHER_REPO}/mix.exs"
+  printf '[database]\nbase_name = "other"\n' > "${OTHER_REPO}/.worktree.toml"
+  git -C "$OTHER_REPO" add mix.exs .worktree.toml
+  git -C "$OTHER_REPO" commit -qm initial
+  git -C "$OTHER_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$OTHER_WORKTREE" HEAD
+
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  printf '%s\n' "$MAIN_REPO" "$OTHER_REPO" > "${XDG_DATA_HOME}/werksfeer/projects"
+}
+
+# One server holds the databases of both projects' active worktrees and one
+# orphaned pair per project.
+seed_two_project_server() {
+  printf '%s\n' \
+    example_dev \
+    worktree_head_one worktree_head_one_test \
+    worktree_head_bone worktree_head_bone_test \
+    worktree_head_gone_a worktree_head_gone_a_test \
+    worktree_head_gone_b worktree_head_gone_b_test > "$PG_DBS"
+}
+
+@test "prune in one project keeps the databases of other registered projects" {
+  install_fake_pg
+  setup_second_project
+  seed_two_project_server
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_one worktree_head_one_test worktree_head_bone worktree_head_bone_test)" ]
+  grep -q 'dropdb .* --if-exists worktree_head_gone_a$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_gone_a_test$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_gone_b$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_head_gone_b_test$' "$PG_LOG"
+  run grep -E 'dropdb .*worktree_head_(one|bone)' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "prune-all drops only databases that no registered project owns" {
+  install_fake_pg
+  setup_second_project
+  seed_two_project_server
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --prune-all
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_one worktree_head_one_test worktree_head_bone worktree_head_bone_test)" ]
+  run grep -E 'dropdb .*worktree_head_(one|bone)' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "prune counts the current project even when it is not registered yet" {
+  install_fake_pg
+  setup_second_project
+  printf '%s\n' "$OTHER_REPO" > "${XDG_DATA_HOME}/werksfeer/projects"
+  seed_two_project_server
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_one worktree_head_one_test worktree_head_bone worktree_head_bone_test)" ]
+}
+
+@test "a registered project whose directory is gone keeps nothing alive" {
+  install_fake_pg
+  setup_second_project
+  seed_two_project_server
+  rm -rf "$OTHER_WORKTREE" "$OTHER_REPO"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_one worktree_head_one_test)" ]
+}
+
+@test "prune skips the database part when the project registry is missing" {
+  install_fake_pg
+  seed_two_project_server
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/projects" ]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"No project registry found"* ]]
+  [[ "$output" == *"Skipping database prune"* ]]
+  run grep -q 'dropdb' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 9 ]
 }
