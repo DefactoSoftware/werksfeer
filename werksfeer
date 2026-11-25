@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-WERKSFEER_VERSION="0.3.0"
+WERKSFEER_VERSION="0.3.1"
 
 WERKSFEER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
@@ -1440,6 +1440,40 @@ EOF_MAINS
 # Prune
 # ---------------------------------------------------------------------------
 
+# Print the database names the active worktrees of a project own, one per line.
+# Each worktree produces two DBs: worktree_{branch}_{name} (dev) and
+# worktree_{branch}_{name}_test (test). We cannot strip _test to infer stems
+# because the worktree name itself may end with _test (e.g. wt-ragout-test).
+#
+# Returns 1 when the project cannot be inspected completely (the worktree list
+# fails, or the branch of a worktree that exists cannot be read). Callers must
+# not drop databases against an incomplete list. Paths come from the porcelain
+# output, so a path with spaces stays whole. A listed worktree whose directory
+# is gone is not active and contributes nothing.
+expected_worktree_databases() {
+  local project_dir="$1"
+  local listing wt_line wt_path wt_basename wt_branch
+
+  (cd "$project_dir" && is_git_repo) || return 0
+
+  listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
+
+  while IFS= read -r wt_line; do
+    case "$wt_line" in
+      "worktree "*) wt_path="${wt_line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ -d "$wt_path" ] || continue
+    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
+    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || return 1
+    [ -n "$wt_branch" ] || return 1
+    printf 'worktree_%s_%s\nworktree_%s_%s_test\n' \
+      "$wt_branch" "$wt_basename" "$wt_branch" "$wt_basename"
+  done <<EOF_LISTING
+$listing
+EOF_LISTING
+}
+
 prune_project() {
   local project_dir="${1:-.}"
 
@@ -1495,21 +1529,41 @@ prune_project() {
     return 0
   fi
 
-  # Build exact list of expected DB names for all active worktrees.
-  # Each worktree produces two DBs: worktree_{branch}_{name} (dev)
-  # and worktree_{branch}_{name}_test (test).
-  # We cannot strip _test to infer stems because the worktree name
-  # itself may end with _test (e.g. wt-ragout-test).
-  local active_dbs=""
-  while IFS= read -r wt_line; do
-    local wt_path wt_basename wt_branch
-    wt_path="$(echo "$wt_line" | awk '{print $1}')"
-    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
-    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
-    active_dbs="${active_dbs}worktree_${wt_branch}_${wt_basename}
-worktree_${wt_branch}_${wt_basename}_test
+  # A database is orphaned only when no registered project owns it: projects
+  # can share one PostgreSQL server (or one local server), so the worktrees of
+  # this project alone do not tell which databases are safe to drop. Without
+  # the registry we cannot tell, so we drop nothing.
+  local reg
+  reg="$(registry_file)"
+  if [ ! -f "$reg" ] || [ ! -r "$reg" ]; then
+    log_warn "No project registry found at $reg"
+    log_warn "Other projects may use databases on this server, and without the registry werksfeer cannot tell which ones. Run werksfeer in each project to register it."
+    log_warn "Skipping database prune"
+    return 0
+  fi
+
+  # The current project may not be registered yet; registered projects whose
+  # directory is gone contribute nothing.
+  local active_dbs
+  if ! active_dbs="$(expected_worktree_databases "$project_dir")"; then
+    log_warn "Cannot read the worktrees of $project_dir"
+    log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
+    return 0
+  fi
+  active_dbs="${active_dbs}
 "
-  done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+  local registered_project registered_dbs
+  while IFS= read -r registered_project || [ -n "$registered_project" ]; do
+    [ -z "$registered_project" ] && continue
+    [ -d "$registered_project" ] || continue
+    if ! registered_dbs="$(expected_worktree_databases "$registered_project")"; then
+      log_warn "Cannot read the worktrees of $registered_project"
+      log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
+      return 0
+    fi
+    active_dbs="${active_dbs}${registered_dbs}
+"
+  done < "$reg"
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue
