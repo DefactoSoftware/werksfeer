@@ -1139,7 +1139,8 @@ install_fake_pg() {
   PG_DROP_FAIL="${TEST_ROOT}/pg.dropfail"
   PG_LIST_FAIL="${TEST_ROOT}/pg.listfail"
   PG_CREATE_RACE="${TEST_ROOT}/pg.createrace"
-  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL PG_LIST_FAIL PG_CREATE_RACE
+  PG_LIST_FAIL_AFTER="${TEST_ROOT}/pg.listfailafter"
+  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL PG_LIST_FAIL PG_CREATE_RACE PG_LIST_FAIL_AFTER
   mkdir -p "$FAKE_BIN"
   : > "$PG_LOG"
   printf '%s\n' example_dev example_test > "$PG_DBS"
@@ -1164,6 +1165,12 @@ case "$*" in
   *-lqt*)
     # Only the catalog listing fails, the way a dropped connection would.
     [ -e "$PG_LIST_FAIL" ] && exit 2
+    # The listing fails from the nth call on; the file holds n.
+    if [ -e "$PG_LIST_FAIL_AFTER" ]; then
+      calls=$(( $(cat "${PG_LIST_FAIL_AFTER}.count" 2>/dev/null || echo 0) + 1 ))
+      echo "$calls" > "${PG_LIST_FAIL_AFTER}.count"
+      [ "$calls" -gt "$(cat "$PG_LIST_FAIL_AFTER")" ] && exit 2
+    fi
     sed 's/$/ | owner | UTF8/' "$PG_DBS" ;;
   *"CREATE DATABASE"*)
     name="$(printf '%s' "$*" | sed 's/.*CREATE DATABASE "\([^"]*\)".*/\1/')"
@@ -2215,8 +2222,9 @@ recorded_database_of() {
   [ "$status" -eq 0 ]
   local first
   first="$(recorded_database_of "$WORKTREE_ONE")"
-  rm -f "$(DB_RECORD)"
-  : > "$PG_LOG"
+  # Start again from an empty server and an empty record.
+  rm -f "$(DB_RECORD)" "${WORKTREE_ONE}/.envrc"
+  printf '%s\n' example_dev example_test > "$PG_DBS"
   run_in_worktree "$WORKTREE_ONE" env WERKSFEER_MACHINE_ID=machine-a "$WERKSFEER"
   [ "$status" -eq 0 ]
   [ "$(recorded_database_of "$WORKTREE_ONE")" = "$first" ]
@@ -2636,4 +2644,125 @@ ${snippet}"
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/gone/fix"
   [ "$status" -eq 0 ]
   grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+# ---------------------------------------------------------------------------
+# Review round 3: lists of hosts, ownership provenance, failed reads
+# ---------------------------------------------------------------------------
+
+@test "a list of hosts is remote, also behind a socket directory" {
+  local snippet='toml_get() { echo "${TOML_HOST:-}"; }; shared_server_is_remote'
+  local fns="shared_server_host shared_server_is_remote"
+
+  with_functions "$fns" "unset PGHOSTADDR PGSERVICE; PGHOST=/var/run/postgresql,db.example; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGHOST PGSERVICE; PGHOSTADDR=127.0.0.1,10.0.0.1; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGHOSTADDR PGSERVICE PGHOST; TOML_HOST=/tmp,db.example; $snippet"
+  [ "$status" -eq 0 ]
+  # A single socket directory stays local, also with a comma-free PGHOSTADDR.
+  with_functions "$fns" "unset PGHOSTADDR PGSERVICE; PGHOST=/var/run/postgresql; $snippet"
+  [ "$status" -eq 1 ]
+}
+
+@test "a hashed name that is occupied and not recorded is never reused" {
+  install_fake_pg
+  write_shared_config
+  # The readable name is taken, so this worktree is given the hashed name.
+  printf '%s\n' example_dev example_test worktree_example_head_one worktree_example_head_one_test > "$PG_DBS"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local hashed
+  hashed="$(recorded_database_of "$WORKTREE_ONE")"
+  [[ "$hashed" =~ _[0-9a-f]{10}$ ]]
+
+  # The record is lost; the hashed databases are still there, unrecorded.
+  rm -f "$(DB_RECORD)" "${WORKTREE_ONE}/.envrc"
+  : > "$PG_LOG"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"exists and is not this worktree's"* ]]
+  [[ "$output" != *"already exists, skipping"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+  run grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
+  [ "$status" -eq 1 ]
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+
+  # And cleanup never drops what it does not own.
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  grep -qxF "$hashed" "$PG_DBS"
+}
+
+@test "a database that exists under a reserved name is not skipped as if it were ours" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  git -C "$WORKTREE_ONE" checkout -q -b "$LONG_BRANCH"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local mine
+  mine="$(recorded_database_of "$WORKTREE_ONE")"
+  rm -f "$(DB_RECORD)"
+  : > "$PG_LOG"
+
+  # A remote server: the occupied machine-specific name has no fallback.
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"Database ${mine} already exists, skipping"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+}
+
+@test "a catalog read that fails after the first one stops setup before the record and environment change" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev example_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+  printf '\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="worktree_head_one"\nexport TEST_DATABASE_NAME="worktree_head_one_test"\n# <<< werksfeer managed environment <<<\n' > "${WORKTREE_ONE}/.envrc"
+  cp "${WORKTREE_ONE}/.envrc" "${TEST_ROOT}/envrc.before"
+  # The preflight listing works, the next one fails.
+  printf '1' > "$PG_LIST_FAIL_AFTER"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot ask the PostgreSQL server"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+  cmp "${TEST_ROOT}/envrc.before" "${WORKTREE_ONE}/.envrc"
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "a catalog read that fails while cloning takes the reservation back and writes no environment" {
+  install_fake_pg
+  write_shared_config
+  # Calls: preflight, legacy and readable checks for dev and test (4), then cloning.
+  printf '5' > "$PG_LIST_FAIL_AFTER"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot ask the PostgreSQL server"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+  [ ! -e "${WORKTREE_ONE}/.envrc" ] || ! grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "a worktree without a database of its own never sets up the default database" {
+  with_functions "run_database_setup" "WERKSFEER_DB_UNCONFIGURED=1; run_database_setup elixir /nowhere; run_database_setup rails /nowhere"
+  [ "$status" -eq 0 ]
+}
+
+@test "a recorded name that someone else takes before the clone is not kept, and its fallback is not adopted" {
+  install_fake_pg
+  write_shared_config
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev custom_dev
+  printf '%s' 'custom_dev' > "$PG_CREATE_RACE"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local dev
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  [[ "$dev" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  grep -q "CREATE DATABASE \"${dev}\" WITH TEMPLATE" "$PG_LOG"
+  grep -qxF custom_dev "$PG_DBS"
+  run grep -qxF "$(printf '%s\t%s\tdev\tcustom_dev' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
 }

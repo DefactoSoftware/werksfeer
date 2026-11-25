@@ -978,16 +978,21 @@ env_names_database() {
   grep -qxF "export ${2}=\"${3}\"" "${1}/.envrc" 2>/dev/null
 }
 
-# Pick the database name of one role ("dev" or "test") for a worktree.
+# Pick the database name of one role ("dev" or "test") for a worktree and print
+# "name<TAB>origin". The origin says what werksfeer may assume about the name:
 #
-# 1. The name in the record: keep using it.
-# 2. A name of 0.3.1 and earlier (worktree_<branch>_<folder>) that this
-#    worktree was set up with, so running werksfeer again keeps its databases.
-#    It must exist, the worktree's own environment file must name it (or the
-#    worktree has an allocation and no other worktree uses it), because two
-#    projects could hold the same old name.
-# 3. The new name with the project in it. If a database of that name exists
-#    already, it is not this worktree's, so the hashed form is used.
+# recorded  the record named it for this worktree before this run: it is ours.
+# legacy    a name of 0.3.1 and earlier (worktree_<branch>_<folder>) that exists
+#           and that this worktree was set up with (its own environment file
+#           names it, or it has an allocation and no other worktree uses it;
+#           on a remote server only the environment counts): it is ours.
+# new       only a reservation. The name is the project-named form (the hashed
+#           form on a remote server, or when the readable one exists or is
+#           recorded for another worktree). A database that exists under it is
+#           not ours; only our own successful CREATE DATABASE makes it ours.
+#
+# Returns 2 when the server could not be asked, so that the caller stops
+# before it changes anything.
 choose_database_name() {
   local role="$1"
   local project_path="$2"
@@ -1003,59 +1008,110 @@ choose_database_name() {
   local name
   name="$(recorded_database "$worktree_path" "$role" "$project_path")"
   if [ -n "$name" ]; then
-    printf '%s\n' "$name"
+    printf '%s\trecorded\n' "$name"
     return 0
   fi
 
-  local legacy
+  local legacy state
   legacy="worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")${suffix}"
   name="$(pg_identifier "$legacy")"
-  if db_exists "$name" &&
-      { [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; }; then
-    # On a server shared with other machines an allocation says nothing about
-    # who made the database, so only the worktree's own environment counts.
-    if env_names_database "$worktree_path" "$variable" "$legacy" ||
-        { ! shared_server_is_remote &&
-          [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
-          ! database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; }; then
-      log_info "Keeping the existing database $name for this worktree"
-      printf '%s\n' "$name"
-      return 0
-    fi
-  fi
+  state=0
+  db_exists "$name" || state=$?
+  case "$state" in
+    0)
+      if [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; then
+        if env_names_database "$worktree_path" "$variable" "$legacy" ||
+            { ! shared_server_is_remote &&
+              [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
+              ! database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; }; then
+          log_info "Keeping the existing database $name for this worktree" >&2
+          printf '%s\tlegacy\n' "$name"
+          return 0
+        fi
+      fi
+      ;;
+    1) ;;
+    *) return 2 ;;
+  esac
 
-  # Without a record, a database with the readable name is not ours: another
-  # worktree or another machine made it, or it is a leftover. Never reuse it.
   name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
   # On a server other machines use, two of them can see the same readable name
   # as free at the same time, so the machine-specific name is used from the
   # start there.
-  if shared_server_is_remote || db_exists "$name" || database_recorded_for_other_worktree "$name" "$worktree_path"; then
+  if shared_server_is_remote; then
     name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
+  else
+    state=0
+    db_exists "$name" || state=$?
+    case "$state" in
+      0) name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}" ;;
+      1)
+        if database_recorded_for_other_worktree "$name" "$worktree_path"; then
+          name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
+        fi
+        ;;
+      *) return 2 ;;
+    esac
   fi
-  printf '%s\n' "$name"
+  printf '%s\tnew\n' "$name"
 }
 
 # Clone one database from its template and print the name to use ("" when there
-# is none). The name was reserved in the record. When the server says the name
-# exists already although it looked free (another machine or setup created it
-# in between), that database is not ours: take the machine-specific name once,
-# and if that is taken too, use no database.
+# is none). Arguments: role, template, name, origin (see choose_database_name),
+# project, worktree, branch, folder.
+#
+# A database is this worktree's only when the record said so before this run
+# (recorded), the pre-0.4.0 rule verified it (legacy), or this run's own
+# CREATE DATABASE succeeded. "Already exists, skipping" is only said for the
+# first two. A reserved name (new) that turns out to exist, whether it was
+# visible before the CREATE or the CREATE lost a race, is someone else's: the
+# machine-specific name is tried once, and if that is occupied too, the role
+# gets no database.
+#
+# Returns 2 when the server could not be asked.
 clone_one_database() {
-  local role="$1" base="$2" name="$3" project="$4" worktree="$5" branch="$6" folder="$7"
-  local suffix="" attempt status hashed clone_error
+  local role="$1" base="$2" name="$3" origin="$4" project="$5" worktree="$6" branch="$7" folder="$8"
+  local suffix="" attempt status hashed clone_error state template_state
   [ "$role" = "test" ] && suffix="_test"
 
   for attempt in 1 2; do
-    if db_exists "$name"; then
-      log_info "Database $name already exists, skipping" >&2
-      printf '%s\n' "$name"
-      return 0
-    elif ! db_exists "$base"; then
-      log_warn "Template database $base not found, skipping $role DB clone" >&2
-      printf '%s\n' "$name"
-      return 0
-    fi
+    state=0
+    db_exists "$name" || state=$?
+    hashed="$(new_database_stem "$project" "$worktree" "$branch" "$folder" hash)${suffix}"
+
+    case "$state" in
+      0)
+        if [ "$origin" != "new" ]; then
+          log_info "Database $name already exists, skipping" >&2
+          printf '%s\n' "$name"
+          return 0
+        fi
+        # A database exists under a name this run only reserved.
+        if [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
+          log_warn "Database $name exists and is not this worktree's, trying $hashed" >&2
+          name="$hashed"
+          origin="new"
+          record_database "$project" "$worktree" "$role" "$name"
+          continue
+        fi
+        log_warn "Database $name exists and is not this worktree's: not using it, the $role database stays unconfigured" >&2
+        return 0
+        ;;
+      1) ;;
+      *) return 2 ;;
+    esac
+
+    template_state=0
+    db_exists "$base" || template_state=$?
+    case "$template_state" in
+      0) ;;
+      1)
+        log_warn "Template database $base not found, skipping $role DB clone" >&2
+        printf '%s\n' "$name"
+        return 0
+        ;;
+      *) return 2 ;;
+    esac
 
     log_info "Cloning $base -> $name" >&2
     shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
@@ -1069,14 +1125,15 @@ clone_one_database() {
 
     case "$clone_error" in
       *"already exists"*)
-        hashed="$(new_database_stem "$project" "$worktree" "$branch" "$folder" hash)${suffix}"
+        # Someone else won the race for this name.
         if [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
-          log_warn "Database $name was created by someone else in the meantime, using $hashed" >&2
+          log_warn "Database $name was created by someone else in the meantime, trying $hashed" >&2
           name="$hashed"
+          origin="new"
           record_database "$project" "$worktree" "$role" "$name"
           continue
         fi
-        log_error "Database $name exists and is not this worktree's, not using it" >&2
+        log_warn "Database $name exists and is not this worktree's: not using it, the $role database stays unconfigured" >&2
         return 0
         ;;
     esac
@@ -1088,6 +1145,7 @@ clone_one_database() {
 
 clone_databases() {
   local project_type="$1"
+  WERKSFEER_DB_UNCONFIGURED=""
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cloning"
@@ -1124,34 +1182,71 @@ clone_databases() {
   # Choosing a name and reserving it in the record is one step under the lock:
   # another setup that picks next sees the record and takes a different name.
   # The lock is not held while the databases are cloned, which can take long.
+  # When the server cannot be asked, setup stops before it changes the record
+  # or the environment files.
+  local dev_choice test_choice dev_origin test_origin status=0
   state_lock_acquire || return 1
-  NEW_DEV_DB="$(choose_database_name dev "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
-  NEW_TEST_DB="$(choose_database_name test "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
+  dev_choice="$(choose_database_name dev "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  if [ "$status" -eq 0 ]; then
+    test_choice="$(choose_database_name test "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    state_lock_release
+    log_error "Cannot ask the PostgreSQL server which databases exist: stopping before anything is changed"
+    return 1
+  fi
+  NEW_DEV_DB="${dev_choice%%"$TAB"*}"
+  dev_origin="${dev_choice#*"$TAB"}"
+  NEW_TEST_DB="${test_choice%%"$TAB"*}"
+  test_origin="${test_choice#*"$TAB"}"
   # Two names that end up as the same database would share its data.
   if [ "$(pg_identifier "$NEW_TEST_DB")" = "$(pg_identifier "$NEW_DEV_DB")" ]; then
     NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$clone_branch" "$clone_folder" hash)_test"
+    test_origin="new"
   fi
   record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
   record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
   state_lock_release
 
-  NEW_DEV_DB="$(clone_one_database dev "$base_dev" "$NEW_DEV_DB" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
-  NEW_TEST_DB="$(clone_one_database test "$base_test" "$NEW_TEST_DB" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
+  local dev_result test_result
+  status=0
+  dev_result="$(clone_one_database dev "$base_dev" "$NEW_DEV_DB" "$dev_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  if [ "$status" -eq 0 ]; then
+    test_result="$(clone_one_database test "$base_test" "$NEW_TEST_DB" "$test_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    # Take back the reservations this run made; what the record said before stays.
+    [ "$dev_origin" != "new" ] || unrecord_database "$record_project" "$record_worktree" dev
+    [ "$test_origin" != "new" ] || unrecord_database "$record_project" "$record_worktree" test
+    log_error "Cannot ask the PostgreSQL server which databases exist: stopping before the environment is written"
+    return 1
+  fi
+  NEW_DEV_DB="$dev_result"
+  NEW_TEST_DB="$test_result"
 
-  # The names were reserved in the record above. A database that the server
-  # says does not exist (no template, or the clone failed) leaves no record
-  # behind. When the server cannot be asked, the record stays.
-  local state
-  state=0
-  [ -z "$NEW_DEV_DB" ] || db_exists "$NEW_DEV_DB" || state=$?
-  if [ -z "$NEW_DEV_DB" ] || [ "$state" -eq 1 ]; then
-    unrecord_database "$record_project" "$record_worktree" dev
-  fi
-  state=0
-  [ -z "$NEW_TEST_DB" ] || db_exists "$NEW_TEST_DB" || state=$?
-  if [ -z "$NEW_TEST_DB" ] || [ "$state" -eq 1 ]; then
-    unrecord_database "$record_project" "$record_worktree" test
-  fi
+  # A role without a database leaves no record and no environment variable.
+  # A database that the server says does not exist (no template, or the clone
+  # failed) leaves no record behind either. When the server cannot be asked,
+  # the record stays and setup stops.
+  local role name state
+  for role in dev test; do
+    if [ "$role" = "dev" ]; then name="$NEW_DEV_DB"; else name="$NEW_TEST_DB"; fi
+    if [ -z "$name" ]; then
+      unrecord_database "$record_project" "$record_worktree" "$role"
+      WERKSFEER_DB_UNCONFIGURED=1
+      continue
+    fi
+    state=0
+    db_exists "$name" || state=$?
+    case "$state" in
+      0) ;;
+      1) unrecord_database "$record_project" "$record_worktree" "$role" ;;
+      *)
+        log_error "Cannot ask the PostgreSQL server whether $name exists: stopping before the environment is written"
+        return 1
+        ;;
+    esac
+  done
 }
 
 use_private_postgres_cluster() {
@@ -1542,6 +1637,13 @@ run_dependency_setup() {
 run_database_setup() {
   local project_type="$1"
   local worktree_root="$2"
+
+  # Without a database of its own the worktree must not set up whichever
+  # database the application would fall back to.
+  if [ "${WERKSFEER_DB_UNCONFIGURED:-}" = "1" ]; then
+    log_warn "This worktree has no database of its own, skipping database setup"
+    return 0
+  fi
 
   case "$project_type" in
     rails)
@@ -2076,17 +2178,21 @@ $(registered_project_list)")"; then
     else
       local exists=0
       db_exists "$db" || exists=$?
-      if [ "$exists" -eq 0 ]; then
-        log_info "Dropping $db"
-        if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
-          log_warn "Failed to drop $db"
+      case "$exists" in
+        0)
+          log_info "Dropping $db"
+          if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
+            log_warn "Failed to drop $db"
+            failed=true
+          fi
+          ;;
+        1) ;;
+        *)
+          # Could not ask is not the same as gone: keep the record.
+          log_warn "Cannot tell whether $db exists"
           failed=true
-        fi
-      elif [ "$exists" -eq 2 ]; then
-        # Could not ask is not the same as gone: keep the record.
-        log_warn "Cannot tell whether $db exists"
-        failed=true
-      fi
+          ;;
+      esac
     fi
   done <<EOF_CANDIDATES
 $candidates
