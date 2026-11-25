@@ -746,6 +746,27 @@ shared_pg_reachable() {
   return 1
 }
 
+# The host the shared-server commands connect to: [database] host, else
+# PGHOST, else empty (the default local socket).
+shared_server_host() {
+  local host
+  host="$(toml_get "database" "host" "")"
+  [ -n "$host" ] || host="${PGHOST:-}"
+  printf '%s\n' "$host"
+}
+
+# Returns 0 when the shared server is on another machine, so that other
+# machines may have worktrees there that this machine knows nothing about.
+# Local: no host, a socket directory, localhost, 127.0.0.1 or ::1.
+shared_server_is_remote() {
+  local host
+  host="$(shared_server_host | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    ""|/*|localhost|127.0.0.1|::1|"[::1]") return 1 ;;
+  esac
+  return 0
+}
+
 db_exists() {
   # The server cuts names at 63 bytes, so that is the name it lists.
   shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$(pg_identifier "$1")"
@@ -784,9 +805,23 @@ get_base_db_names() {
 # (the name of the main checkout), the branch and the worktree folder. PostgreSQL
 # cuts identifiers at 63 bytes without an error, and the test database adds
 # "_test", so a readable name over 58 bytes is cut to 47 bytes and ends with a
-# short hash of the project path and worktree path: "..._<10 hex digits>". That
-# stays unique and stable. Printing a name with "hash" as $5 forces that form,
+# short hash of the machine, project path and worktree path: "..._<10 hex
+# digits>". That stays unique and stable. Printing a name with "hash" as $5 forces that form,
 # which is what a name already taken by another worktree falls back to.
+# Identifies this machine, so two machines that share a server and use the same
+# paths (agent servers do) never derive the same hashed name. WERKSFEER_MACHINE_ID
+# overrides it; it exists for tests only.
+werksfeer_machine_id() {
+  local id="${WERKSFEER_MACHINE_ID:-}"
+  if [ -z "$id" ] && [ -r /etc/machine-id ]; then
+    id="$(cat /etc/machine-id 2>/dev/null || true)"
+  fi
+  if [ -z "$id" ]; then
+    id="$(hostname 2>/dev/null || uname -n)"
+  fi
+  printf '%s\n' "$id"
+}
+
 new_database_stem() {
   local project_path="$1"
   local worktree_path="$2"
@@ -802,7 +837,7 @@ new_database_stem() {
     return 0
   fi
 
-  hash="$(printf '%s\t%s' "$project_path" "$worktree_path" | werksfeer_sha256 | cut -c1-10)" || return 1
+  hash="$(printf '%s\t%s\t%s' "$(werksfeer_machine_id)" "$project_path" "$worktree_path" | werksfeer_sha256 | cut -c1-10)" || return 1
   prefix="$(printf '%s' "$readable" | cut -c1-47)"
   while [ "${prefix%_}" != "$prefix" ]; do
     prefix="${prefix%_}"
@@ -829,6 +864,11 @@ $(registered_project_list)")" || return 0
   printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$database")"
 }
 
+# Returns 0 when the managed environment of the worktree sets $2 to $3.
+env_names_database() {
+  grep -qxF "export ${2}=\"${3}\"" "${1}/.envrc" 2>/dev/null
+}
+
 # Pick the database name of one role ("dev" or "test") for a worktree.
 #
 # 1. The name in the record: keep using it.
@@ -837,7 +877,8 @@ $(registered_project_list)")" || return 0
 #    It must exist, the worktree's own environment file must name it (or the
 #    worktree has an allocation and no other worktree uses it), because two
 #    projects could hold the same old name.
-# 3. The new name with the project in it.
+# 3. The new name with the project in it. If a database of that name exists
+#    already, it is not this worktree's, so the hashed form is used.
 choose_database_name() {
   local role="$1"
   local project_path="$2"
@@ -862,8 +903,11 @@ choose_database_name() {
   name="$(pg_identifier "$legacy")"
   if db_exists "$name" &&
       { [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; }; then
-    if grep -qxF "export ${variable}=\"${legacy}\"" "${worktree_path}/.envrc" 2>/dev/null ||
-        { [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
+    # On a server shared with other machines an allocation says nothing about
+    # who made the database, so only the worktree's own environment counts.
+    if env_names_database "$worktree_path" "$variable" "$legacy" ||
+        { ! shared_server_is_remote &&
+          [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
           ! database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; }; then
       log_info "Keeping the existing database $name for this worktree"
       printf '%s\n' "$name"
@@ -871,8 +915,10 @@ choose_database_name() {
     fi
   fi
 
+  # Without a record, a database with the readable name is not ours: another
+  # worktree or another machine made it, or it is a leftover. Never reuse it.
   name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
-  if db_exists "$name" && database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; then
+  if db_exists "$name"; then
     name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
   fi
   printf '%s\n' "$name"
