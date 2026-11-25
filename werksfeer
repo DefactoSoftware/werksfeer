@@ -1513,9 +1513,81 @@ load_main_configuration() {
   load_project_configuration "$main_path"
 }
 
+# Print the main checkouts that have a record or an allocation for a worktree.
+# Used to find the project configuration once the worktree directory is gone.
+cleanup_projects_for_worktree() {
+  local worktree_path="$1"
+  local wt_name="$2"
+
+  {
+    recorded_lines "$worktree_path" | cut -f1
+    allocation_projects_for_worktree "$wt_name"
+  } | sort -u
+}
+
+# Returns 0 when the project has an existing worktree named $2 besides the one
+# at path $3, 1 when it has none, and 2 when its worktrees cannot be listed.
+project_has_worktree_named() {
+  local project="$1"
+  local wt_name="$2"
+  local excluded="$3"
+  local listing wt_line wt_path
+
+  [ -d "$project" ] || return 1
+  (cd "$project" && is_git_repo) || return 1
+  listing="$(cd "$project" && git worktree list --porcelain 2>/dev/null)" || return 2
+
+  while IFS= read -r wt_line; do
+    case "$wt_line" in
+      "worktree "*) wt_path="${wt_line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ "$wt_path" = "$excluded" ] && continue
+    [ -d "$wt_path" ] || continue
+    if [ "$(basename "$wt_path")" = "$wt_name" ]; then
+      return 0
+    fi
+  done <<EOF_LISTING
+$listing
+EOF_LISTING
+  return 1
+}
+
+# Release the port/redis allocation of a worktree name in one project, unless
+# another worktree of that project still has that name (allocations are keyed
+# by project and name, so that one would lose its ports).
+release_worktree_allocation() {
+  local project="$1"
+  local wt_name="$2"
+  local worktree_path="$3"
+  local status=0
+
+  project_has_worktree_named "$project" "$wt_name" "$worktree_path" || status=$?
+  case "$status" in
+    0) log_info "Keeping the port/redis allocation for $wt_name in $project: another worktree has that name" ;;
+    2) log_warn "Cannot read the worktrees of $project, keeping its port/redis allocation for $wt_name" ;;
+    *)
+      deregister_allocation "$wt_name" "$project"
+      log_info "Released port/redis allocation"
+      ;;
+  esac
+}
+
+# Drop the databases of one worktree, going by the record. The connection
+# settings must be loaded already; $3 is the main checkout they came from.
+#
+# - With a record: exactly the recorded databases, then the record goes.
+# - Without one, folder still there: the two names of 0.3.1 and earlier.
+# - Without one, folder gone: the databases whose name ends in the worktree
+#   name, but only those no existing worktree of any registered project uses
+#   and no record names. A name alone says nothing about which repo it is from.
+#
+# A database that another existing worktree also uses is never dropped. When
+# that cannot be told, nothing is dropped and `werksfeer --prune` is named.
 cleanup_worktree_databases() {
   local worktree_path="$1"
   local wt_name="$2"
+  local project="${3:-}"
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
@@ -1529,40 +1601,97 @@ cleanup_worktree_databases() {
 
   wt_name="$(sanitize_name "$wt_name")"
 
-  # Try to get the branch from the worktree if it still exists
-  local wt_branch=""
-  if [ -d "$worktree_path" ]; then
-    wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
+  # A worktree that still exists is found by its path alone; once it is gone
+  # the record is read for the project whose configuration is loaded.
+  local record_project="$project"
+  [ -d "$worktree_path" ] && record_project=""
+
+  local recorded candidates="" from_record=false
+  recorded="$(recorded_lines "$worktree_path" "$record_project")"
+  if [ -n "$recorded" ]; then
+    from_record=true
+    candidates="$(printf '%s\n' "$recorded" | cut -f4)"
+  else
+    local wt_branch=""
+    if [ -d "$worktree_path" ]; then
+      wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || wt_branch=""
+    fi
+
+    if [ -n "$wt_branch" ]; then
+      candidates="$(pg_identifier "worktree_${wt_branch}_${wt_name}")
+$(pg_identifier "worktree_${wt_branch}_${wt_name}_test")"
+    elif [ -n "$wt_name" ]; then
+      log_debug "No record and the worktree directory is gone, looking for databases ending with _${wt_name}"
+      local all_wt_dbs recorded_dbs db
+      all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+      recorded_dbs=""
+      [ -f "$(databases_file)" ] && recorded_dbs="$(cut -f4 "$(databases_file)")"
+      while IFS= read -r db; do
+        [ -n "$db" ] || continue
+        # The record names the databases of its own worktrees.
+        if printf '%s\n' "$recorded_dbs" | grep -qxF "$db"; then
+          continue
+        fi
+        if printf '%s\n' "$db" | grep -qE "_${wt_name}(_test)?$"; then
+          candidates="${candidates}${db}
+"
+        fi
+      done <<EOF_ALL
+$all_wt_dbs
+EOF_ALL
+    fi
   fi
 
-  if [ -n "$wt_branch" ]; then
-    # We know the exact DB names
-    local dev_db="worktree_${wt_branch}_${wt_name}"
-    local test_db="worktree_${wt_branch}_${wt_name}_test"
-    for db in "$dev_db" "$test_db"; do
-      if db_exists "$db"; then
-        log_info "Dropping $db"
-        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
-      fi
-    done
-  else
-    # Worktree already deleted — find DBs by suffix match on the worktree name
-    log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
-    local all_wt_dbs
-    all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
-    echo "$all_wt_dbs" | while IFS= read -r db; do
-      [ -z "$db" ] && continue
-      # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
-      if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
-        log_info "Dropping $db"
-        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
-      fi
-    done
+  [ -n "$candidates" ] || return 0
+
+  if [ -z "$project" ] && [ ! -d "$worktree_path" ] && is_git_repo; then
+    project="$(get_main_worktree_path)"
   fi
+
+  if [ -z "$project" ] && [ -z "$(registered_project_list)" ]; then
+    log_warn "Not dropping the databases of $wt_name: werksfeer does not know which project it belonged to"
+    log_warn "Run werksfeer --prune to remove them once they are orphaned"
+    return 0
+  fi
+
+  local claimed
+  if ! claimed="$(claimed_databases "$worktree_path" "${project}
+$(registered_project_list)")"; then
+    log_warn "Not dropping the databases of $wt_name: without the worktrees of that project werksfeer cannot tell whether another worktree uses them"
+    log_warn "Run werksfeer --prune to remove them once they are orphaned"
+    return 0
+  fi
+
+  local db failed=false
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    if printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$db")"; then
+      log_info "Keeping $db: another worktree uses it"
+    elif db_exists "$db"; then
+      log_info "Dropping $db"
+      if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
+        log_warn "Failed to drop $db"
+        failed=true
+      fi
+    fi
+  done <<EOF_CANDIDATES
+$candidates
+EOF_CANDIDATES
+
+  # Keep the record while a database is left, so --prune can try again.
+  if [ "$from_record" = true ]; then
+    if [ "$failed" = false ]; then
+      forget_worktree_databases "$worktree_path" "$record_project"
+    else
+      log_warn "Keeping the record of $worktree_path; werksfeer --prune will try again"
+    fi
+  fi
+  return 0
 }
 
 cleanup_worktree() {
-  local worktree_path="$1"
+  local worktree_path
+  worktree_path="$(normalize_path "$1")"
   local wt_name
   wt_name="$(basename "$worktree_path")"
 
@@ -1585,32 +1714,46 @@ cleanup_worktree() {
     fi
   fi
 
-  # The worktree is gone (or no longer a git repo): its allocation still names
-  # the main checkout, which holds the configuration and the local settings
-  # (such as the database password). Look it up before releasing it.
+  # The worktree is gone (or no longer a git repo): the record and the
+  # allocation still name the main checkout, which holds the configuration and
+  # the local settings (such as the database password). Look it up before
+  # releasing anything.
   local lookup_mains=""
-  if [ "$configured" = false ] && [ -z "$main_path" ]; then
-    lookup_mains="$(allocation_projects_for_worktree "$wt_name")"
-    # No allocation left: fall back to the checkout the command runs from.
+  if [ -n "$main_path" ]; then
+    release_worktree_allocation "$main_path" "$wt_name" "$worktree_path"
+  else
+    lookup_mains="$(cleanup_projects_for_worktree "$worktree_path" "$wt_name")"
+    # Nothing known: fall back to the checkout the command runs from.
     if [ -z "$lookup_mains" ] && is_git_repo; then
       lookup_mains="$(get_main_worktree_path)"
     fi
-  fi
 
-  # Deregister port/redis allocation
-  deregister_allocation "$wt_name" "$main_path"
-  log_info "Released port/redis allocation"
+    # Only the projects that had this worktree release its allocation, and
+    # only when they have no existing worktree of that name left.
+    local lookup_main
+    while IFS= read -r lookup_main; do
+      [ -n "$lookup_main" ] || continue
+      release_worktree_allocation "$lookup_main" "$wt_name" "$worktree_path"
+    done <<EOF_RELEASE
+$lookup_mains
+EOF_RELEASE
+  fi
 
   if [ "$private_postgres" = true ]; then
     return 0
   fi
 
-  if [ "$configured" = true ] || [ -z "$lookup_mains" ]; then
-    cleanup_worktree_databases "$worktree_path" "$wt_name"
+  # A record names the project of its databases; the allocations are only a
+  # hint for worktrees that have none.
+  local database_mains
+  database_mains="$(recorded_lines "$worktree_path" | cut -f1 | sort -u)"
+  [ -n "$database_mains" ] || database_mains="$lookup_mains"
+
+  if [ "$configured" = true ] || [ -z "$database_mains" ]; then
+    cleanup_worktree_databases "$worktree_path" "$wt_name" "$main_path"
     return 0
   fi
 
-  local lookup_main
   while IFS= read -r lookup_main; do
     [ -z "$lookup_main" ] && continue
     if load_main_configuration "$lookup_main"; then
@@ -1619,9 +1762,9 @@ cleanup_worktree() {
         continue
       fi
     fi
-    cleanup_worktree_databases "$worktree_path" "$wt_name"
+    cleanup_worktree_databases "$worktree_path" "$wt_name" "$lookup_main"
   done <<EOF_MAINS
-$lookup_mains
+$database_mains
 EOF_MAINS
 }
 

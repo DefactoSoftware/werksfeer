@@ -1649,3 +1649,203 @@ write_record() {
   run grep -q dropdb "$PG_LOG"
   [ "$status" -eq 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# Cleanup goes by the record and never by the end of a name alone
+# ---------------------------------------------------------------------------
+
+# Adds a worktree to the second project, outside the first project's folder.
+add_other_worktree() {
+  git -C "$OTHER_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "${TEST_ROOT}/other-trees/$1" HEAD
+}
+
+write_allocations() {
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  : > "${XDG_DATA_HOME}/werksfeer/allocations"
+  while [ "$#" -gt 0 ]; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" 1 "$((6000 + $3))" >> "${XDG_DATA_HOME}/werksfeer/allocations"
+    shift 3
+  done
+}
+
+@test "cleanup of a gone worktree without a record keeps databases another project uses" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  add_other_worktree other_fix
+  printf '%s\n' example_dev \
+    worktree_head_fix worktree_head_fix_test \
+    worktree_head_other_fix worktree_head_other_fix_test \
+    worktree_head_two > "$PG_DBS"
+  local gone="${TEST_ROOT}/worktrees/fix"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$gone"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_other_fix worktree_head_other_fix_test worktree_head_two)" ]
+  run grep -E 'dropdb .*other_fix' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "cleanup of a gone worktree keeps a database that an existing worktree shares" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  add_other_worktree fix
+  printf '%s\n' example_dev worktree_head_fix worktree_head_fix_test > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_head_fix "$PG_DBS"
+  grep -qxF worktree_head_fix_test "$PG_DBS"
+  [[ "$output" == *"Keeping worktree_head_fix: another worktree uses it"* ]]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "cleanup of a gone worktree releases the allocation in its own project only" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  add_other_worktree fix
+  write_allocations "$MAIN_REPO" fix 3001 "$OTHER_REPO" fix 3002 "$MAIN_REPO" two 3003
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  run grep -F "$(printf '%s\t%s\t' "$MAIN_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
+  [ "$status" -eq 1 ]
+  grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
+  grep -qF "$(printf '%s\t%s\t' "$MAIN_REPO" two)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+@test "cleanup with the folder present releases only the allocation of its own project" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  add_other_worktree one
+  write_allocations "$MAIN_REPO" one 3001 "$OTHER_REPO" one 3002
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "${XDG_DATA_HOME}/werksfeer/allocations")" -eq 1 ]
+  grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" one)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+@test "cleanup of a gone worktree with a record drops exactly the recorded databases" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  add_other_worktree fix
+  local gone="${TEST_ROOT}/worktrees/fix"
+  printf '%s\n' example_dev \
+    worktree_example_head_fix worktree_example_head_fix_test \
+    worktree_other_head_fix worktree_other_head_fix_test \
+    worktree_head_fix > "$PG_DBS"
+  write_record "$MAIN_REPO" "$gone" dev worktree_example_head_fix
+  write_record "$MAIN_REPO" "$gone" test worktree_example_head_fix_test
+  write_record "$OTHER_REPO" "${TEST_ROOT}/other-trees/fix" dev worktree_other_head_fix
+  write_allocations "$MAIN_REPO" fix 3001 "$OTHER_REPO" fix 3002
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$gone"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_other_head_fix worktree_other_head_fix_test worktree_head_fix)" ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  grep -qF "other-trees/fix" "$(DB_RECORD)"
+  [ "$(wc -l < "${XDG_DATA_HOME}/werksfeer/allocations")" -eq 1 ]
+}
+
+@test "cleanup of a gone worktree under a path with a space goes by the record" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  local spaced="${TEST_ROOT}/worktrees/my tree"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced" HEAD
+  write_shared_config
+  cp "${MAIN_REPO}/.worktree.toml" "${spaced}/.worktree.toml"
+  run_in_worktree "$spaced" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_head_my_tree "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$spaced"
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$spaced"
+  [ "$status" -eq 0 ]
+  run grep -q 'worktree_head_my_tree' "$PG_DBS"
+  [ "$status" -eq 1 ]
+  [ ! -s "$(DB_RECORD)" ]
+}
+
+@test "cleanup with the folder present drops the recorded databases, not the old names" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev custom_one custom_one_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev custom_one
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" test custom_one_test
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_one worktree_head_one_test)" ]
+  [ ! -s "$(DB_RECORD)" ]
+}
+
+@test "cleanup with a relative or slashed path finds the record" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev custom_one > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev custom_one
+
+  run_in_worktree "${TEST_ROOT}/worktrees" "$WERKSFEER" --cleanup "./one/"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "example_dev" ]
+}
+
+@test "cleanup never drops a recorded database that an existing worktree also records" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev shared_db > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev shared_db
+  write_record "$OTHER_REPO" "$OTHER_WORKTREE" dev shared_db
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/gone"
+  [ "$status" -eq 0 ]
+  grep -qxF shared_db "$PG_DBS"
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  grep -qF "$OTHER_WORKTREE" "$(DB_RECORD)"
+}
+
+@test "cleanup of a gone worktree drops nothing when another project cannot be inspected" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev worktree_head_fix worktree_head_fix_test > "$PG_DBS"
+  local real_git
+  real_git="$(command -v git)"
+  cat > "${FAKE_BIN}/git" <<EOF_GIT
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "worktree list" ] && [ "\$(basename "\$PWD")" = "other" ]; then
+  echo "fatal: worktree metadata unreadable" >&2
+  exit 128
+fi
+exec "$real_git" "\$@"
+EOF_GIT
+  chmod +x "${FAKE_BIN}/git"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"werksfeer --prune"* ]]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 3 ]
+}
+
+@test "cleanup of a gone worktree drops nothing when it cannot tell which project it was" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev worktree_head_fix > "$PG_DBS"
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"werksfeer --prune"* ]]
+  grep -qxF worktree_head_fix "$PG_DBS"
+}
