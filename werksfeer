@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-WERKSFEER_VERSION="0.3.1"
+WERKSFEER_VERSION="0.4.0"
 
 WERKSFEER_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
@@ -222,6 +222,102 @@ allocate_redis_port() {
   done
 }
 
+# One lock for the files under werksfeer/ that are read, changed and renamed
+# (allocations and the database record). mkdir is atomic on Linux and macOS,
+# which have no common flock. The owner's pid is stored in the lock; a lock whose
+# owner is gone is stale and removed. A lock that cannot be taken within
+# WERKSFEER_LOCK_TIMEOUT seconds (default 30) fails loudly: the caller must not
+# go on unlocked. Taking it again in the same process only counts.
+WERKSFEER_LOCK_DEPTH=0
+WERKSFEER_LOCK_DIR=""
+WERKSFEER_WORKTREE_LOCK_DIR=""
+
+# Take the lock directory $1, waiting up to $2 seconds. Used by both locks.
+lock_take() {
+  local dir="$1" seconds="$2"
+  local ticks=0 limit owner
+  limit=$(( seconds * 10 ))
+  mkdir -p "$(dirname "$dir")" || return 1
+
+  until mkdir "$dir" 2>/dev/null; do
+    owner="$(cat "${dir}/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      log_warn "Removing stale werksfeer lock of process $owner"
+      rm -f "${dir}/pid"
+      rmdir "$dir" 2>/dev/null || true
+      continue
+    fi
+    ticks=$(( ticks + 1 ))
+    if [ "$ticks" -gt "$limit" ]; then
+      log_error "Could not take the werksfeer lock $dir in ${seconds}s (held by process ${owner:-unknown}). If no werksfeer is running, remove that directory."
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "${dir}/pid" || return 1
+  trap 'werksfeer_on_exit' EXIT
+}
+
+# Release the lock directory $1 if this process owns it.
+lock_drop() {
+  local dir="$1"
+  [ -n "$dir" ] || return 0
+  if [ "$(cat "${dir}/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "${dir}/pid"
+    rmdir "$dir" 2>/dev/null || true
+  fi
+}
+
+state_lock_acquire() {
+  if [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ]; then
+    WERKSFEER_LOCK_DEPTH=$(( WERKSFEER_LOCK_DEPTH + 1 ))
+    return 0
+  fi
+
+  local dir
+  dir="$(dirname "$(allocations_file)")/state.lock"
+  lock_take "$dir" "${WERKSFEER_LOCK_TIMEOUT:-30}" || return 1
+  WERKSFEER_LOCK_DIR="$dir"
+  WERKSFEER_LOCK_DEPTH=1
+}
+
+# One setup at a time per worktree, from the choice of the database names until
+# the environment files are written, however long the cloning takes (the git
+# hook and a harness may both run werksfeer for a new worktree). It is taken
+# before the state lock and never while holding it, so the two cannot deadlock.
+# WERKSFEER_SETUP_LOCK_TIMEOUT seconds (default 900) to wait; failing is loud.
+worktree_lock_acquire() {
+  local path="$1" key dir
+  [ -z "$WERKSFEER_WORKTREE_LOCK_DIR" ] || return 0
+  key="$(printf '%s' "$path" | werksfeer_sha256 | cut -c1-24)" || return 1
+  dir="$(dirname "$(allocations_file)")/worktree-locks/${key}.lock"
+  lock_take "$dir" "${WERKSFEER_SETUP_LOCK_TIMEOUT:-900}" || return 1
+  WERKSFEER_WORKTREE_LOCK_DIR="$dir"
+}
+
+worktree_lock_release() {
+  lock_drop "$WERKSFEER_WORKTREE_LOCK_DIR"
+  WERKSFEER_WORKTREE_LOCK_DIR=""
+}
+
+state_lock_release() {
+  [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ] || return 0
+  WERKSFEER_LOCK_DEPTH=$(( WERKSFEER_LOCK_DEPTH - 1 ))
+  if [ "$WERKSFEER_LOCK_DEPTH" -eq 0 ]; then
+    lock_drop "$WERKSFEER_LOCK_DIR"
+  fi
+}
+
+# The EXIT trap: release only what this process still holds.
+werksfeer_on_exit() {
+  if [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ]; then
+    WERKSFEER_LOCK_DEPTH=1
+    state_lock_release
+  fi
+  worktree_lock_release
+}
+
 # Register an allocation
 register_allocation() {
   local project="$1"
@@ -244,6 +340,7 @@ deregister_allocation() {
   alloc="$(allocations_file)"
   [ ! -f "$alloc" ] && return 0
 
+  state_lock_acquire || return 1
   local tmp="${alloc}.tmp"
   if [ -n "$project" ]; then
     awk -F'\t' -v p="$project" -v w="$wt_name" '!($1 == p && $2 == w)' "$alloc" > "$tmp"
@@ -251,6 +348,7 @@ deregister_allocation() {
     awk -F'\t' -v w="$wt_name" '$2 != w' "$alloc" > "$tmp"
   fi
   mv "$tmp" "$alloc"
+  state_lock_release
 }
 
 # Look up existing allocation for a worktree. Prints "port<TAB>redis_db<TAB>redis_port" or empty.
@@ -746,8 +844,57 @@ shared_pg_reachable() {
   return 1
 }
 
+# The host the shared-server commands connect to: [database] host, else
+# PGHOST, else empty (the default local socket).
+shared_server_host() {
+  local host
+  # A service file can set any host and wins over the environment.
+  if [ -n "${PGSERVICE:-}" ]; then
+    printf 'PGSERVICE=%s\n' "$PGSERVICE"
+    return 0
+  fi
+  # PGHOSTADDR is the address libpq connects to when it is set.
+  host="${PGHOSTADDR:-}"
+  [ -n "$host" ] || host="$(toml_get "database" "host" "")"
+  [ -n "$host" ] || host="${PGHOST:-}"
+  printf '%s\n' "$host"
+}
+
+# Returns 0 when the shared server is on another machine, so that other
+# machines may have worktrees there that this machine knows nothing about.
+# Local: no host, a socket directory, localhost, 127.0.0.1 or ::1. A service,
+# a list of hosts or anything else that cannot be classified counts as remote.
+shared_server_is_remote() {
+  local host candidate
+  # A comma anywhere means a list of hosts: libpq may fall back to any of them.
+  for candidate in "${PGHOSTADDR:-}" "$(toml_get "database" "host" "")" "${PGHOST:-}"; do
+    case "$candidate" in
+      *,*) return 0 ;;
+    esac
+  done
+  host="$(shared_server_host | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    ""|/*|localhost|127.0.0.1|::1|"[::1]") return 1 ;;
+  esac
+  return 0
+}
+
+# Print the names of the databases on the shared server. Fails when the server
+# cannot be asked: "could not ask" is never "does not exist".
+list_server_databases() {
+  local output
+  output="$(shared_pg psql -d postgres -lqt 2>/dev/null)" || return 1
+  printf '%s\n' "$output" | awk 'NF { print $1 }'
+}
+
+# Returns 0 when the database exists, 1 when the server says it does not, and 2
+# when the server could not be asked. Callers that remove a record or drop a
+# database must tell 1 from 2.
 db_exists() {
-  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  local listing
+  listing="$(list_server_databases)" || return 2
+  # The server cuts names at 63 bytes, so that is the name it lists.
+  printf '%s\n' "$listing" | grep -qxF "$(pg_identifier "$1")"
 }
 
 get_base_db_names() {
@@ -779,11 +926,329 @@ get_base_db_names() {
   echo "${project_name}${dev_suffix}" "${project_name}${test_suffix}"
 }
 
+# The database names of a worktree start with "worktree_", then the project
+# (the name of the main checkout), the branch and the worktree folder. PostgreSQL
+# cuts identifiers at 63 bytes without an error, and the test database adds
+# "_test", so a readable name over 58 bytes is cut to 47 bytes and ends with a
+# short hash of the machine, project path and worktree path: "..._<10 hex
+# digits>". That stays unique and stable. Printing a name with "hash" as $5 forces that form,
+# which is what a name already taken by another worktree falls back to.
+# Identifies this machine, so two machines that share a server and use the same
+# paths (agent servers do) never derive the same hashed name. WERKSFEER_MACHINE_ID
+# overrides it; it exists for tests only.
+werksfeer_machine_id() {
+  local id="${WERKSFEER_MACHINE_ID:-}"
+  if [ -z "$id" ] && [ -r /etc/machine-id ]; then
+    id="$(cat /etc/machine-id 2>/dev/null || true)"
+  fi
+  if [ -z "$id" ]; then
+    id="$(hostname 2>/dev/null || uname -n)"
+  fi
+  printf '%s\n' "$id"
+}
+
+new_database_stem() {
+  local project_path="$1"
+  local worktree_path="$2"
+  local branch="$3"
+  local folder="$4"
+  local force_hash="${5:-}"
+  local readable hash prefix
+
+  readable="worktree_$(sanitize_name "$(basename "$project_path")")_$(sanitize_name "$branch")_$(sanitize_name "$folder")"
+  readable="$(printf '%s' "$readable" | sed 's/__*/_/g')"
+  if [ "$force_hash" != "hash" ] && [ "${#readable}" -le 58 ]; then
+    printf '%s\n' "$readable"
+    return 0
+  fi
+
+  hash="$(printf '%s\t%s\t%s' "$(werksfeer_machine_id)" "$project_path" "$worktree_path" | werksfeer_sha256 | cut -c1-10)" || return 1
+  prefix="$(printf '%s' "$readable" | cut -c1-47)"
+  while [ "${prefix%_}" != "$prefix" ]; do
+    prefix="${prefix%_}"
+  done
+  printf '%s_%s\n' "$prefix" "$hash"
+}
+
+# Returns 0 when the record names database $1 for a worktree other than the one
+# at path $2, whether or not that worktree or database exists right now.
+database_recorded_for_other_worktree() {
+  local file
+  file="$(databases_file)"
+  [ -f "$file" ] || return 1
+  WF_DB="$(pg_identifier "$1")" WF_WORKTREE="$2" \
+    awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"
+}
+
+# Returns 0 when an existing worktree other than the one at path $2 uses (or a
+# record of any other worktree names) database $1, or when that cannot be told.
+database_used_by_other_worktree() {
+  local database="$1"
+  local worktree_path="$2"
+  local project="$3"
+  local claimed
+
+  if database_recorded_for_other_worktree "$database" "$worktree_path"; then
+    return 0
+  fi
+
+  claimed="$(claimed_databases "$worktree_path" "${project}
+$(registered_project_list)")" || return 0
+  printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$database")"
+}
+
+# Print the database names the managed environment of a worktree exports as
+# DATABASE_NAME and TEST_DATABASE_NAME, as the server lists them.
+worktree_env_databases() {
+  [ -f "${1}/.envrc" ] || return 0
+  sed -n \
+    -e 's/^export DATABASE_NAME="\(.*\)"$/\1/p' \
+    -e 's/^export TEST_DATABASE_NAME="\(.*\)"$/\1/p' "${1}/.envrc" |
+    LC_ALL=C cut -c1-63
+}
+
+# Print the value the file exports for variable $2, or nothing. The managed
+# block wins; outside it the last export wins, as the shell would have it.
+env_export_value() {
+  [ -f "$1" ] || return 0
+  awk -v var="$2" '
+    $0 == "# >>> werksfeer managed environment >>>" { inside = 1; next }
+    $0 == "# <<< werksfeer managed environment <<<" { inside = 0; next }
+    {
+      prefix = "export " var "=\""
+      if (index($0, prefix) == 1 && substr($0, length($0)) == "\"") {
+        value = substr($0, length(prefix) + 1, length($0) - length(prefix) - 1)
+        if (inside) { managed = value; have_managed = 1 } else { outside = value; have_outside = 1 }
+      }
+    }
+    END {
+      if (have_managed) print managed
+      else if (have_outside) print outside
+    }' "$1"
+}
+
+# Returns 0 when the managed environment of the worktree sets $2 to $3.
+env_names_database() {
+  grep -qxF "export ${2}=\"${3}\"" "${1}/.envrc" 2>/dev/null
+}
+
+# Pick the database name of one role ("dev" or "test") for a worktree and print
+# "name<TAB>origin". The origin says what werksfeer may assume about the name:
+#
+# recorded  the record named it for this worktree before this run: it is ours.
+# legacy    a name of 0.3.1 and earlier (worktree_<branch>_<folder>) that exists
+#           and that this worktree was set up with (its own environment file
+#           names it, or it has an allocation and no other worktree uses it;
+#           on a remote server only the environment counts): it is ours.
+# new       only a reservation. The name is the project-named form (the hashed
+#           form on a remote server, or when the readable one exists or is
+#           recorded for another worktree). A database that exists under it is
+#           not ours; only our own successful CREATE DATABASE makes it ours.
+#
+# Returns 2 when the server could not be asked, so that the caller stops
+# before it changes anything.
+choose_database_name() {
+  local role="$1"
+  local project_path="$2"
+  local worktree_path="$3"
+  local branch="$4"
+  local folder="$5"
+  local suffix="" variable="DATABASE_NAME"
+  if [ "$role" = "test" ]; then
+    suffix="_test"
+    variable="TEST_DATABASE_NAME"
+  fi
+
+  local name
+  name="$(recorded_database "$worktree_path" "$role" "$project_path")"
+  if [ -n "$name" ]; then
+    printf '%s\trecorded\n' "$name"
+    return 0
+  fi
+
+  local legacy state
+  legacy="worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")${suffix}"
+  name="$(pg_identifier "$legacy")"
+  state=0
+  db_exists "$name" || state=$?
+  case "$state" in
+    0)
+      if [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; then
+        if env_names_database "$worktree_path" "$variable" "$legacy" ||
+            { ! shared_server_is_remote &&
+              [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
+              ! database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; }; then
+          log_info "Keeping the existing database $name for this worktree" >&2
+          printf '%s\tlegacy\n' "$name"
+          return 0
+        fi
+      fi
+      ;;
+    1) ;;
+    *) return 2 ;;
+  esac
+
+  name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
+  # On a server other machines use, two of them can see the same readable name
+  # as free at the same time, so the machine-specific name is used from the
+  # start there.
+  if shared_server_is_remote; then
+    name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
+  else
+    state=0
+    db_exists "$name" || state=$?
+    case "$state" in
+      0) name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}" ;;
+      1)
+        if database_recorded_for_other_worktree "$name" "$worktree_path"; then
+          name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
+        fi
+        ;;
+      *) return 2 ;;
+    esac
+  fi
+  printf '%s\tnew\n' "$name"
+}
+
+# Clone one database from its template. Prints "name<TAB>state"; arguments are
+# role, template, name, origin (see choose_database_name), project, worktree,
+# branch, folder.
+#
+# A database is this worktree's only when the record said so before this run
+# (recorded), the pre-0.4.0 rule verified it (legacy), or this run's own
+# CREATE DATABASE succeeded. The state says what the caller may rely on:
+#
+# owned    the database exists and is this worktree's.
+# pending  the database does not exist yet (no template, or the clone failed
+#          and the server confirms it is absent). The name is reserved in the
+#          record and exported to the worktree; the project's own tools create
+#          the database under it later. A name that is exported stays recorded,
+#          whether or not the database exists yet.
+# none     the name is occupied by a database that is not ours, and so is the
+#          machine-specific fallback. The role gets no database.
+#
+# A name this run only reserved ("new") that turns out to exist, whether it was
+# visible before the CREATE or lost in a race, is someone else's: the
+# machine-specific name is tried once. After any CREATE that did not succeed
+# the name is not this run's unless the server confirms it is absent.
+#
+# Returns 0 normally, 1 when the record could not be updated and 2 when the
+# server could not be asked. Nothing here relies on errexit.
+clone_one_database() {
+  local role="$1" base="$2" name="$3" origin="$4" project="$5" worktree="$6" branch="$7" folder="$8"
+  local suffix="" attempt status hashed clone_error state template_state occupied
+  [ "$role" = "test" ] && suffix="_test"
+  # After the switch to the fallback name its reservation is unused until this
+  # function reports a database for it, so failing takes it back.
+  fallback_failed() {
+    [ "$attempt" -eq 2 ] && { unrecord_database "$project" "$worktree" "$role" || true; }
+    return "$1"
+  }
+
+  for attempt in 1 2; do
+    occupied=false
+    state=0
+    db_exists "$name" || state=$?
+    hashed="$(new_database_stem "$project" "$worktree" "$branch" "$folder" hash)${suffix}"
+
+    case "$state" in
+      0)
+        if [ "$origin" != "new" ]; then
+          log_info "Database $name already exists, skipping" >&2
+          printf '%s\towned\n' "$name"
+          return 0
+        fi
+        # A database exists under a name this run only reserved.
+        log_warn "Database $name exists and is not this worktree's" >&2
+        occupied=true
+        ;;
+      1)
+        template_state=0
+        db_exists "$base" || template_state=$?
+        case "$template_state" in
+          0) ;;
+          1)
+            log_warn "Template database $base not found, skipping $role DB clone" >&2
+            printf '%s\tpending\n' "$name"
+            return 0
+            ;;
+          *) fallback_failed 2; return ;;
+        esac
+
+        log_info "Cloning $base -> $name" >&2
+        shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+        status=0
+        # VERBOSITY=verbose puts the SQLSTATE in the error line in any language.
+        clone_error="$(shared_pg psql -d postgres -q -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -c "CREATE DATABASE \"${name}\" WITH TEMPLATE \"${base}\";" 2>&1 >/dev/null)" || status=$?
+        if [ "$status" -eq 0 ]; then
+          printf '%s\towned\n' "$name"
+          return 0
+        fi
+        printf '%s\n' "$clone_error" >&2
+
+        case "$clone_error" in
+          *"42P04"*)
+            # duplicate_database: someone else won the race for this name.
+            log_warn "Database $name was created by someone else in the meantime" >&2
+            occupied=true
+            ;;
+          *)
+            log_error "Failed to clone $base -> $name" >&2
+            # The failed CREATE says nothing about who owns the name: look.
+            state=0
+            db_exists "$name" || state=$?
+            case "$state" in
+              1)
+                printf '%s\tpending\n' "$name"
+                return 0
+                ;;
+              0) occupied=true ;;
+              *) fallback_failed 2; return ;;
+            esac
+            ;;
+        esac
+        ;;
+      *) fallback_failed 2; return ;;
+    esac
+
+    if [ "$occupied" = true ] && [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
+      log_warn "Trying $hashed instead" >&2
+      # The record must stop naming the occupied database before anything else.
+      if ! record_database "$project" "$worktree" "$role" "$hashed"; then
+        unrecord_database "$project" "$worktree" "$role" || true
+        log_error "Cannot update the database record: stopping" >&2
+        return 1
+      fi
+      name="$hashed"
+      origin="new"
+      continue
+    fi
+    log_warn "The $role database stays unconfigured: no database of this worktree's own was found or created" >&2
+    printf '\tnone\n'
+    return 0
+  done
+  return 2
+}
+
+# Leave the role as it was before this run: remove the reservation this run made.
+release_reservation() {
+  local project="$1" worktree="$2" role="$3" origin="$4" state="$5"
+  # A recorded or verified legacy name, and a database this run created, stay.
+  if [ "$origin" = "new" ] && [ "$state" != "owned" ]; then
+    unrecord_database "$project" "$worktree" "$role" || log_warn "Could not remove the reservation of the $role database from the record"
+  fi
+  return 0
+}
+
 clone_databases() {
   local project_type="$1"
+  WERKSFEER_DB_UNCONFIGURED=""
+  WERKSFEER_DB_PENDING=""
+  WERKSFEER_DB_SKIPPED=""
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cloning"
+    WERKSFEER_DB_SKIPPED=1
     return 0
   fi
 
@@ -799,42 +1264,114 @@ clone_databases() {
 
   if ! shared_pg_reachable; then
     log_warn "Skipping database cloning"
+    WERKSFEER_DB_SKIPPED=1
     return 0
   fi
 
-  local wt_name wt_branch
-  wt_name="$(sanitize_name "$(get_worktree_name)")"
-  wt_branch="$(sanitize_name "$(get_worktree_branch)")"
-
-  NEW_DEV_DB="worktree_${wt_branch}_${wt_name}"
-  NEW_TEST_DB="worktree_${wt_branch}_${wt_name}_test"
-
-  # Clone dev database
-  if db_exists "$NEW_DEV_DB"; then
-    log_info "Database $NEW_DEV_DB already exists, skipping"
-  elif ! db_exists "$base_dev"; then
-    log_warn "Template database $base_dev not found, skipping dev DB clone"
-  else
-    log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
-      log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
-    fi
+  # Every catalog check below relies on being able to list the databases. A
+  # server that accepts the connection but cannot list them stops setup here,
+  # before the environment of an existing worktree is rewritten.
+  if ! list_server_databases > /dev/null; then
+    log_error "Cannot list the databases on the PostgreSQL server: stopping before the record and the environment files change"
+    return 1
   fi
 
-  # Clone test database
-  if db_exists "$NEW_TEST_DB"; then
-    log_info "Database $NEW_TEST_DB already exists, skipping"
-  elif ! db_exists "$base_test"; then
-    log_warn "Template database $base_test not found, skipping test DB clone"
-  else
-    log_info "Cloning $base_test -> $NEW_TEST_DB"
-    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
-      log_error "Failed to clone $base_test -> $NEW_TEST_DB"
-    fi
-  fi
+  local record_project record_worktree clone_branch clone_folder
+  record_project="$(get_main_worktree_path)"
+  record_worktree="$(pwd -P)"
+  clone_branch="$(get_worktree_branch)"
+  clone_folder="$(get_worktree_name)"
 
+  # Choosing a name and reserving it in the record is one step under the lock:
+  # another setup that picks next sees the record and takes a different name.
+  # The lock is not held while the databases are cloned, which can take long.
+  # After any failure a role is either as it was before this run or fully this
+  # worktree's: owned databases stay recorded, unused reservations are removed.
+  local dev_choice test_choice dev_origin test_origin status=0
+  local dev_state="" test_state=""
+  state_lock_acquire || return 1
+  dev_choice="$(choose_database_name dev "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  if [ "$status" -eq 0 ]; then
+    test_choice="$(choose_database_name test "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    state_lock_release
+    log_error "Cannot ask the PostgreSQL server which databases exist: stopping before anything is changed"
+    return 1
+  fi
+  NEW_DEV_DB="${dev_choice%%"$TAB"*}"
+  dev_origin="${dev_choice#*"$TAB"}"
+  NEW_TEST_DB="${test_choice%%"$TAB"*}"
+  test_origin="${test_choice#*"$TAB"}"
+  # Two names that end up as the same database would share its data.
+  if [ "$(pg_identifier "$NEW_TEST_DB")" = "$(pg_identifier "$NEW_DEV_DB")" ]; then
+    NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$clone_branch" "$clone_folder" hash)_test"
+    test_origin="new"
+  fi
+  if ! record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB" ||
+      ! record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"; then
+    release_reservation "$record_project" "$record_worktree" dev "$dev_origin" ""
+    release_reservation "$record_project" "$record_worktree" test "$test_origin" ""
+    state_lock_release
+    log_error "Cannot update the database record: stopping before the environment files change"
+    return 1
+  fi
+  state_lock_release
+
+  local dev_result test_result
+  status=0
+  dev_result="$(clone_one_database dev "$base_dev" "$NEW_DEV_DB" "$dev_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+  if [ "$status" -eq 0 ]; then
+    dev_state="${dev_result#*"$TAB"}"
+    test_result="$(clone_one_database test "$base_test" "$NEW_TEST_DB" "$test_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+    [ "$status" -ne 0 ] || test_state="${test_result#*"$TAB"}"
+  fi
+  if [ "$status" -ne 0 ]; then
+    # What this run created stays recorded; unused reservations go.
+    release_reservation "$record_project" "$record_worktree" dev "$dev_origin" "$dev_state"
+    release_reservation "$record_project" "$record_worktree" test "$test_origin" "$test_state"
+    log_error "Stopping before the environment files change: the PostgreSQL server could not be asked, or the record could not be updated"
+    return 1
+  fi
+  NEW_DEV_DB="${dev_result%%"$TAB"*}"
+  NEW_TEST_DB="${test_result%%"$TAB"*}"
+
+  # What is exported is recorded, and what is not recorded is not exported:
+  # - owned and pending names stay in the record. A pending database does not
+  #   exist yet; the project's own tools create it under the exported name
+  #   later, so its absence now says nothing about ownership.
+  # - a role without a database has no record and no variable.
+  local role state name
+  for role in dev test; do
+    if [ "$role" = "dev" ]; then
+      name="$NEW_DEV_DB"; state="$dev_state"
+    else
+      name="$NEW_TEST_DB"; state="$test_state"
+    fi
+    case "$state" in
+      owned) ;;
+      pending) [ "$role" != "dev" ] || WERKSFEER_DB_PENDING=1 ;;
+      *)
+        if ! unrecord_database "$record_project" "$record_worktree" "$role"; then
+          log_error "Cannot remove the reservation of the $role database from the record: stopping"
+          return 1
+        fi
+        WERKSFEER_DB_UNCONFIGURED=1
+        ;;
+    esac
+    # Check the invariant before the environment is written.
+    local recorded
+    recorded="$(recorded_database "$record_worktree" "$role" "$record_project")"
+    if [ -n "$name" ] && [ "$recorded" != "$(pg_identifier "$name")" ]; then
+      log_error "The $role database $name would be exported without a record: stopping"
+      return 1
+    fi
+    if [ -z "$name" ] && [ -n "$recorded" ]; then
+      log_error "The $role database has no name but is still recorded as $recorded: stopping"
+      return 1
+    fi
+  done
+  return 0
 }
 
 use_private_postgres_cluster() {
@@ -960,6 +1497,10 @@ write_env_overrides() {
   existing="$(lookup_allocation "$project_root" "$wt_name")"
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
 
+  # Choosing free ports and registering them must not interleave with another
+  # setup, or two worktrees could get the same port.
+  state_lock_acquire || return 1
+  existing="$(lookup_allocation "$project_root" "$wt_name")"
   local wt_port redis_db redis_port=""
   if [ -n "$existing" ]; then
     wt_port="$(echo "$existing" | cut -f1)"
@@ -983,6 +1524,7 @@ write_env_overrides() {
   if [ -z "$existing" ]; then
     register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
   fi
+  state_lock_release
 
   local wt_redis=""
   if [ -n "$base_redis" ]; then
@@ -997,6 +1539,12 @@ write_env_overrides() {
 
   local dev_db="${NEW_DEV_DB:-}"
   local test_db="${NEW_TEST_DB:-}"
+  # The database part was skipped because the server or psql was not available:
+  # an existing worktree keeps the database variables it already has.
+  if [ "${WERKSFEER_DB_SKIPPED:-}" = "1" ]; then
+    [ -n "$dev_db" ] || dev_db="$(env_export_value ".envrc" DATABASE_NAME)"
+    [ -n "$test_db" ] || test_db="$(env_export_value ".envrc" TEST_DATABASE_NAME)"
+  fi
   local service_env
   service_env="$(services_environment "$worktree_root")"
 
@@ -1114,9 +1662,40 @@ run_with_asdf() {
   fi
 }
 
+# Print the NAME=value pairs of the managed environment block of an .envrc, so
+# that they can be passed to a command without direnv. Only plain
+# `export NAME="value"` lines inside the block are read; nothing is sourced.
+managed_env_assignments() {
+  [ -f "$1" ] || return 0
+  awk '
+    $0 == "# >>> werksfeer managed environment >>>" { inside = 1; next }
+    $0 == "# <<< werksfeer managed environment <<<" { inside = 0; next }
+    inside && /^export [A-Za-z_][A-Za-z0-9_]*=".*"$/ {
+      line = substr($0, 8)
+      name = line; sub(/=.*/, "", name)
+      value = line; sub(/^[^=]*="/, "", value); sub(/"$/, "", value)
+      print name "=" value
+    }' "$1"
+}
+
 run_in_project_environment() {
   local mise_bin=""
   local asdf_bin=""
+  local -a managed=()
+  local assignment
+
+  # Without direnv nothing loads the .envrc, so the managed variables (the
+  # database names, the port) are passed in the command's environment.
+  if ! { command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; }; then
+    while IFS= read -r assignment; do
+      [ -n "$assignment" ] && managed+=("$assignment")
+    done <<EOF_MANAGED
+$(managed_env_assignments ".envrc")
+EOF_MANAGED
+    if [ "${#managed[@]}" -gt 0 ]; then
+      set -- env "${managed[@]}" "$@"
+    fi
+  fi
   mise_bin="$(project_mise_bin)" || true
   if [ -z "$mise_bin" ]; then
     asdf_bin="$(project_asdf_bin)" || true
@@ -1221,6 +1800,13 @@ run_database_setup() {
   local project_type="$1"
   local worktree_root="$2"
 
+  # Without a database of its own the worktree must not set up whichever
+  # database the application would fall back to.
+  if [ "${WERKSFEER_DB_UNCONFIGURED:-}" = "1" ]; then
+    log_warn "This worktree has no database of its own, skipping database setup"
+    return 0
+  fi
+
   case "$project_type" in
     rails)
       if [ -x "bin/rails" ]; then
@@ -1251,7 +1837,7 @@ run_database_setup() {
         log_step "Creating and migrating the private test database"
         run_in_project_environment env MIX_ENV=test mix ecto.create --quiet
         run_in_project_environment env MIX_ENV=test mix ecto.migrate --quiet
-      elif [ -z "${NEW_DEV_DB:-}" ]; then
+      elif [ -z "${NEW_DEV_DB:-}" ] || [ "${WERKSFEER_DB_PENDING:-}" = "1" ]; then
         log_step "Running mix ecto.setup"
         run_in_project_environment mix ecto.setup
       else
@@ -1301,6 +1887,263 @@ register_project() {
 }
 
 # ---------------------------------------------------------------------------
+# Database record (which databases werksfeer created for which worktree)
+# ---------------------------------------------------------------------------
+# File: ~/.local/share/werksfeer/databases
+# Format: project_path<TAB>worktree_path<TAB>role<TAB>database
+# One line per database; role is "dev" or "test". Cleanup and prune go by this
+# record instead of guessing from database names.
+
+TAB="$(printf '\t')"
+
+databases_file() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/databases"
+}
+
+# Print the record lines of a worktree path, optionally only for one project.
+recorded_lines() {
+  local file
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+  WF_WORKTREE="$1" WF_PROJECT="${2:-}" awk -F'\t' \
+    '$2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"])' "$file"
+}
+
+# Print the recorded database of one role for a worktree, or nothing.
+recorded_database() {
+  recorded_lines "$1" "${3:-}" | awk -F'\t' -v role="$2" '$3 == role { print $4; exit }'
+}
+
+# Record a database for a worktree, replacing an earlier one of the same role.
+# The file is rewritten through a temp file and a rename.
+record_database() {
+  local project="$1" worktree="$2" role="$3" database
+  local file tmp
+  database="$(pg_identifier "$4")"
+  file="$(databases_file)"
+
+  # Every step is checked: errexit does not apply inside a function that is
+  # called on the left of || or in an if, and a half-written record is worse
+  # than a failed one.
+  case "${project}${worktree}" in
+    *"$TAB"*|*$'\n'*)
+      log_warn "Cannot record $database: a tab or newline in a path cannot be stored"
+      return 1
+      ;;
+  esac
+
+  state_lock_acquire || return 1
+  tmp="${file}.tmp.$$"
+  mkdir -p "$(dirname "$file")" || { state_lock_release; return 1; }
+  : > "$tmp" || { state_lock_release; return 1; }
+  if [ -f "$file" ]; then
+    WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
+      '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp" ||
+      { rm -f "$tmp"; state_lock_release; return 1; }
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$project" "$worktree" "$role" "$database" >> "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
+  state_lock_release
+}
+
+# Remove the record line of one role of a worktree. Returns 1 when that failed.
+unrecord_database() {
+  local project="$1" worktree="$2" role="$3"
+  local file tmp
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  state_lock_acquire || return 1
+  tmp="${file}.tmp.$$"
+  WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
+    '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
+  if [ -s "$tmp" ]; then
+    mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
+  else
+    rm -f "$tmp" "$file" || { state_lock_release; return 1; }
+  fi
+  state_lock_release
+}
+
+# Remove every record line of a worktree path (of one project when given).
+forget_worktree_databases() {
+  local worktree="$1" project="${2:-}"
+  local file tmp
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  state_lock_acquire || return 1
+  tmp="${file}.tmp.$$"
+  WF_WORKTREE="$worktree" WF_PROJECT="$project" awk -F'\t' \
+    '!($2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"]))' "$file" > "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
+  state_lock_release
+}
+
+# Resolve a path the way git reports worktrees: absolute, symlinks resolved in
+# the part that exists (before any ".." is applied), no trailing slash.
+# Components that are already gone are kept as given.
+normalize_path() {
+  local path="$1" cur component missing=0
+
+  case "$path" in
+    /*) cur="/" ;;
+    *) cur="$(pwd -P)" ;;
+  esac
+
+  # Walk the components in order. Each one that exists is resolved on the
+  # spot (symlinks included), so ".." always applies to the real parent; what
+  # does not exist yet is kept as given.
+  while IFS= read -r component; do
+    case "$component" in
+      ""|.) ;;
+      ..)
+        cur="$(dirname "$cur")"
+        if [ -d "$cur" ]; then
+          cur="$(cd "$cur" && pwd -P)"
+          missing=0
+        fi
+        ;;
+      *)
+        if [ "$missing" -eq 0 ] && [ -d "${cur%/}/${component}" ]; then
+          cur="$(cd "${cur%/}/${component}" && pwd -P)"
+        else
+          missing=1
+          cur="${cur%/}/${component}"
+        fi
+        ;;
+    esac
+  done <<EOF_PARTS
+$(printf '%s\n' "$path" | tr '/' '\n')
+EOF_PARTS
+
+  printf '%s\n' "$cur"
+}
+
+# PostgreSQL cuts identifiers at 63 bytes without an error, so a longer name
+# is the same database as its first 63 bytes.
+pg_identifier() {
+  printf '%s' "$1" | LC_ALL=C cut -c1-63
+}
+
+registered_project_list() {
+  local reg
+  reg="$(registry_file)"
+  [ -f "$reg" ] && [ -r "$reg" ] || return 0
+  cat "$reg"
+}
+
+# Print "worktree_path<TAB>database" for the databases each existing worktree
+# of a project (a main checkout) claims: the ones recorded for it, and the
+# names it would have by the naming of 0.3.1 and earlier and by the current
+# naming. We cannot strip
+# _test to infer stems because the worktree name itself may end with _test
+# (e.g. wt-ragout-test).
+#
+# Returns 1 when the project cannot be inspected completely (the worktree list
+# fails, or the branch of a worktree that exists cannot be read). Callers must
+# not drop databases against an incomplete list. Paths come from the porcelain
+# output, so a path with spaces stays whole. A listed worktree whose directory
+# is gone claims nothing.
+project_worktree_claims() {
+  local project_dir="$1"
+  local listing wt_line wt_path wt_basename wt_branch recorded_line new_stem env_db
+
+  if ! (cd "$project_dir" && is_git_repo); then
+    # A checkout that git cannot read is not a project without worktrees.
+    [ -e "${project_dir}/.git" ] && return 1
+    return 0
+  fi
+
+  listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
+
+  while IFS= read -r wt_line; do
+    case "$wt_line" in
+      "worktree "*) wt_path="${wt_line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ -d "$wt_path" ] || continue
+    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
+    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || return 1
+    [ -n "$wt_branch" ] || return 1
+
+    printf '%s\t%s\n' \
+      "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}")" \
+      "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}_test")"
+
+    # The name this version would give it, in case its record is lost.
+    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename")" || return 1
+    printf '%s\t%s\n' \
+      "$wt_path" "$new_stem" \
+      "$wt_path" "${new_stem}_test"
+    # And the hashed form a name collision falls back to.
+    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename" hash)" || return 1
+    printf '%s\t%s\n' \
+      "$wt_path" "$new_stem" \
+      "$wt_path" "${new_stem}_test"
+
+    # What the worktree's own environment exports: after a branch switch it can
+    # still name a database that no name rule or record gives it any more.
+    while IFS= read -r env_db; do
+      [ -n "$env_db" ] || continue
+      printf '%s\t%s\n' "$wt_path" "$env_db"
+    done <<EOF_ENV
+$(worktree_env_databases "$wt_path")
+EOF_ENV
+
+    while IFS= read -r recorded_line; do
+      [ -n "$recorded_line" ] || continue
+      printf '%s\t%s\n' "$wt_path" "$(printf '%s' "$recorded_line" | cut -f4)"
+    done <<EOF_RECORDED
+$(recorded_lines "$wt_path")
+EOF_RECORDED
+  done <<EOF_LISTING
+$listing
+EOF_LISTING
+}
+
+# Print the databases that existing worktrees claim, one per line, leaving out
+# the worktree at path $1 (empty for none). $2 holds the main checkouts to
+# inspect, one per line; a checkout whose directory is gone claims nothing.
+# Recorded databases of any worktree that still exists count too.
+#
+# Returns 1 (after saying which project) when a project cannot be inspected.
+claimed_databases() {
+  local excluded="$1"
+  local projects="$2"
+  local project claims r_project r_path r_role r_db file
+
+  while IFS= read -r project || [ -n "$project" ]; do
+    [ -n "$project" ] || continue
+    [ -d "$project" ] || continue
+    if ! claims="$(project_worktree_claims "$project")"; then
+      log_warn "Cannot read the worktrees of $project"
+      return 1
+    fi
+    if [ -n "$claims" ]; then
+      printf '%s\n' "$claims" | WF_EXCLUDED="$excluded" awk -F'\t' '$1 != ENVIRON["WF_EXCLUDED"] { print $2 }'
+    fi
+  done <<EOF_PROJECTS
+$projects
+EOF_PROJECTS
+
+  file="$(databases_file)"
+  if [ -f "$file" ]; then
+    while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+      [ -n "$r_db" ] || continue
+      [ "$r_path" = "$excluded" ] && continue
+      if [ -d "$r_path" ]; then
+        printf '%s\n' "$r_db"
+      fi
+    done < "$file"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup (drop databases for a specific worktree)
 # ---------------------------------------------------------------------------
 
@@ -1324,9 +2167,92 @@ load_main_configuration() {
   load_project_configuration "$main_path"
 }
 
+# Print the main checkouts that have a record or an allocation for a worktree.
+# Used to find the project configuration once the worktree directory is gone.
+cleanup_projects_for_worktree() {
+  local worktree_path="$1"
+  local wt_name="$2"
+
+  local recorded_projects
+  recorded_projects="$(recorded_lines "$worktree_path" | cut -f1 | sort -u)"
+  # A record names the project of its worktree; the allocations, which only
+  # know a folder name, are for worktrees that have none.
+  if [ -n "$recorded_projects" ]; then
+    printf '%s\n' "$recorded_projects"
+  else
+    allocation_projects_for_worktree "$wt_name" | sort -u
+  fi
+}
+
+# Returns 0 when the project has an existing worktree named $2 besides the one
+# at path $3, 1 when it has none, and 2 when its worktrees cannot be listed.
+project_has_worktree_named() {
+  local project="$1"
+  local wt_name="$2"
+  local excluded="$3"
+  local listing wt_line wt_path
+
+  [ -d "$project" ] || return 1
+  if ! (cd "$project" && is_git_repo); then
+    [ -e "${project}/.git" ] && return 2
+    return 1
+  fi
+  listing="$(cd "$project" && git worktree list --porcelain 2>/dev/null)" || return 2
+
+  while IFS= read -r wt_line; do
+    case "$wt_line" in
+      "worktree "*) wt_path="${wt_line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ "$wt_path" = "$excluded" ] && continue
+    [ -d "$wt_path" ] || continue
+    if [ "$(basename "$wt_path")" = "$wt_name" ]; then
+      return 0
+    fi
+  done <<EOF_LISTING
+$listing
+EOF_LISTING
+  return 1
+}
+
+# Release the port/redis allocation of a worktree name in one project, unless
+# another worktree of that project still has that name (allocations are keyed
+# by project and name, so that one would lose its ports).
+release_worktree_allocation() {
+  local project="$1"
+  local wt_name="$2"
+  local worktree_path="$3"
+  local status=0
+
+  # Looking at the worktrees and releasing the allocation are one step.
+  state_lock_acquire || return 1
+  project_has_worktree_named "$project" "$wt_name" "$worktree_path" || status=$?
+  case "$status" in
+    0) log_info "Keeping the port/redis allocation for $wt_name in $project: another worktree has that name" ;;
+    2) log_warn "Cannot read the worktrees of $project, keeping its port/redis allocation for $wt_name" ;;
+    *)
+      deregister_allocation "$wt_name" "$project"
+      log_info "Released port/redis allocation"
+      ;;
+  esac
+  state_lock_release
+}
+
+# Drop the databases of one worktree, going by the record. The connection
+# settings must be loaded already; $3 is the main checkout they came from.
+#
+# - With a record: exactly the recorded databases, then the record goes.
+# - Without one, folder still there: the two names of 0.3.1 and earlier.
+# - Without one, folder gone: the databases whose name ends in the worktree
+#   name, but only those no existing worktree of any registered project uses
+#   and no record names. A name alone says nothing about which repo it is from.
+#
+# A database that another existing worktree also uses is never dropped. When
+# that cannot be told, nothing is dropped and `werksfeer --prune` is named.
 cleanup_worktree_databases() {
   local worktree_path="$1"
   local wt_name="$2"
+  local project="${3:-}"
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cleanup"
@@ -1340,40 +2266,123 @@ cleanup_worktree_databases() {
 
   wt_name="$(sanitize_name "$wt_name")"
 
-  # Try to get the branch from the worktree if it still exists
-  local wt_branch=""
-  if [ -d "$worktree_path" ]; then
-    wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")"
+  # A worktree that still exists is found by its path alone; once it is gone
+  # the record is read for the project whose configuration is loaded.
+  local record_project="$project"
+  [ -d "$worktree_path" ] && record_project=""
+
+  local recorded candidates="" from_record=false
+  recorded="$(recorded_lines "$worktree_path" "$record_project")"
+  if [ -n "$recorded" ]; then
+    from_record=true
+    candidates="$(printf '%s\n' "$recorded" | cut -f4)"
+  else
+    local wt_branch=""
+    if [ -d "$worktree_path" ]; then
+      wt_branch="$(cd "$worktree_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || wt_branch=""
+    fi
+
+    if [ -n "$wt_branch" ]; then
+      # On a server shared with other machines an old name may be another
+      # machine's database: only the worktree's own environment can vouch.
+      if ! shared_server_is_remote || env_names_database "$worktree_path" DATABASE_NAME "worktree_${wt_branch}_${wt_name}"; then
+        candidates="$(pg_identifier "worktree_${wt_branch}_${wt_name}")
+"
+      fi
+      if ! shared_server_is_remote || env_names_database "$worktree_path" TEST_DATABASE_NAME "worktree_${wt_branch}_${wt_name}_test"; then
+        candidates="${candidates}$(pg_identifier "worktree_${wt_branch}_${wt_name}_test")
+"
+      fi
+    elif shared_server_is_remote; then
+      log_warn "Not dropping databases of $wt_name: it has no record on this machine and the server $(shared_server_host) may be used by other machines"
+    elif [ -n "$wt_name" ]; then
+      log_debug "No record and the worktree directory is gone, looking for databases ending with _${wt_name}"
+      local all_wt_dbs recorded_dbs db
+      if ! all_wt_dbs="$(list_server_databases)"; then
+        log_warn "Cannot list the databases on the PostgreSQL server, skipping database cleanup"
+        return 0
+      fi
+      all_wt_dbs="$(printf '%s\n' "$all_wt_dbs" | grep '^worktree_' || true)"
+      recorded_dbs=""
+      [ -f "$(databases_file)" ] && recorded_dbs="$(cut -f4 "$(databases_file)")"
+      while IFS= read -r db; do
+        [ -n "$db" ] || continue
+        # The record names the databases of its own worktrees.
+        if printf '%s\n' "$recorded_dbs" | grep -qxF "$db"; then
+          continue
+        fi
+        if printf '%s\n' "$db" | grep -qE "_${wt_name}(_test)?$"; then
+          candidates="${candidates}${db}
+"
+        fi
+      done <<EOF_ALL
+$all_wt_dbs
+EOF_ALL
+    fi
   fi
 
-  if [ -n "$wt_branch" ]; then
-    # We know the exact DB names
-    local dev_db="worktree_${wt_branch}_${wt_name}"
-    local test_db="worktree_${wt_branch}_${wt_name}_test"
-    for db in "$dev_db" "$test_db"; do
-      if db_exists "$db"; then
-        log_info "Dropping $db"
-        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
-      fi
-    done
-  else
-    # Worktree already deleted — find DBs by suffix match on the worktree name
-    log_debug "Worktree directory gone, scanning for databases ending with _${wt_name}"
-    local all_wt_dbs
-    all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
-    echo "$all_wt_dbs" | while IFS= read -r db; do
-      [ -z "$db" ] && continue
-      # Match: worktree_{anything}_{wt_name} or worktree_{anything}_{wt_name}_test
-      if echo "$db" | grep -qE "_${wt_name}(_test)?$"; then
-        log_info "Dropping $db"
-        shared_pg dropdb --if-exists "$db" 2>/dev/null || log_warn "Failed to drop $db"
-      fi
-    done
+  [ -n "$candidates" ] || return 0
+
+  if [ -z "$project" ] && [ ! -d "$worktree_path" ] && is_git_repo; then
+    project="$(get_main_worktree_path)"
   fi
+
+  if [ -z "$project" ] && [ -z "$(registered_project_list)" ]; then
+    log_warn "Not dropping the databases of $wt_name: werksfeer does not know which project it belonged to"
+    log_warn "Run werksfeer --prune to remove them once they are orphaned"
+    return 0
+  fi
+
+  local claimed
+  if ! claimed="$(claimed_databases "$worktree_path" "${project}
+$(registered_project_list)")"; then
+    log_warn "Not dropping the databases of $wt_name: without the worktrees of that project werksfeer cannot tell whether another worktree uses them"
+    log_warn "Run werksfeer --prune to remove them once they are orphaned"
+    return 0
+  fi
+
+  local db failed=false
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    if printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$db")"; then
+      log_info "Keeping $db: another worktree uses it"
+    else
+      local exists=0
+      db_exists "$db" || exists=$?
+      case "$exists" in
+        0)
+          log_info "Dropping $db"
+          if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
+            log_warn "Failed to drop $db"
+            failed=true
+          fi
+          ;;
+        1) ;;
+        *)
+          # Could not ask is not the same as gone: keep the record.
+          log_warn "Cannot tell whether $db exists"
+          failed=true
+          ;;
+      esac
+    fi
+  done <<EOF_CANDIDATES
+$candidates
+EOF_CANDIDATES
+
+  # Keep the record while a database is left, so --prune can try again.
+  if [ "$from_record" = true ]; then
+    if [ "$failed" = false ]; then
+      forget_worktree_databases "$worktree_path" "$record_project"
+    else
+      log_warn "Keeping the record of $worktree_path; werksfeer --prune will try again"
+    fi
+  fi
+  return 0
 }
 
 cleanup_worktree() {
-  local worktree_path="$1"
+  local worktree_path
+  worktree_path="$(normalize_path "$1")"
   local wt_name
   wt_name="$(basename "$worktree_path")"
 
@@ -1396,32 +2405,46 @@ cleanup_worktree() {
     fi
   fi
 
-  # The worktree is gone (or no longer a git repo): its allocation still names
-  # the main checkout, which holds the configuration and the local settings
-  # (such as the database password). Look it up before releasing it.
+  # The worktree is gone (or no longer a git repo): the record and the
+  # allocation still name the main checkout, which holds the configuration and
+  # the local settings (such as the database password). Look it up before
+  # releasing anything.
   local lookup_mains=""
-  if [ "$configured" = false ] && [ -z "$main_path" ]; then
-    lookup_mains="$(allocation_projects_for_worktree "$wt_name")"
-    # No allocation left: fall back to the checkout the command runs from.
+  if [ -n "$main_path" ]; then
+    release_worktree_allocation "$main_path" "$wt_name" "$worktree_path"
+  else
+    lookup_mains="$(cleanup_projects_for_worktree "$worktree_path" "$wt_name")"
+    # Nothing known: fall back to the checkout the command runs from.
     if [ -z "$lookup_mains" ] && is_git_repo; then
       lookup_mains="$(get_main_worktree_path)"
     fi
-  fi
 
-  # Deregister port/redis allocation
-  deregister_allocation "$wt_name" "$main_path"
-  log_info "Released port/redis allocation"
+    # Only the projects that had this worktree release its allocation, and
+    # only when they have no existing worktree of that name left.
+    local lookup_main
+    while IFS= read -r lookup_main; do
+      [ -n "$lookup_main" ] || continue
+      release_worktree_allocation "$lookup_main" "$wt_name" "$worktree_path"
+    done <<EOF_RELEASE
+$lookup_mains
+EOF_RELEASE
+  fi
 
   if [ "$private_postgres" = true ]; then
     return 0
   fi
 
-  if [ "$configured" = true ] || [ -z "$lookup_mains" ]; then
-    cleanup_worktree_databases "$worktree_path" "$wt_name"
+  # A record names the project of its databases; the allocations are only a
+  # hint for worktrees that have none.
+  local database_mains
+  database_mains="$(recorded_lines "$worktree_path" | cut -f1 | sort -u)"
+  [ -n "$database_mains" ] || database_mains="$lookup_mains"
+
+  if [ "$configured" = true ] || [ -z "$database_mains" ]; then
+    cleanup_worktree_databases "$worktree_path" "$wt_name" "$main_path"
     return 0
   fi
 
-  local lookup_main
   while IFS= read -r lookup_main; do
     [ -z "$lookup_main" ] && continue
     if load_main_configuration "$lookup_main"; then
@@ -1430,49 +2453,15 @@ cleanup_worktree() {
         continue
       fi
     fi
-    cleanup_worktree_databases "$worktree_path" "$wt_name"
+    cleanup_worktree_databases "$worktree_path" "$wt_name" "$lookup_main"
   done <<EOF_MAINS
-$lookup_mains
+$database_mains
 EOF_MAINS
 }
 
 # ---------------------------------------------------------------------------
 # Prune
 # ---------------------------------------------------------------------------
-
-# Print the database names the active worktrees of a project own, one per line.
-# Each worktree produces two DBs: worktree_{branch}_{name} (dev) and
-# worktree_{branch}_{name}_test (test). We cannot strip _test to infer stems
-# because the worktree name itself may end with _test (e.g. wt-ragout-test).
-#
-# Returns 1 when the project cannot be inspected completely (the worktree list
-# fails, or the branch of a worktree that exists cannot be read). Callers must
-# not drop databases against an incomplete list. Paths come from the porcelain
-# output, so a path with spaces stays whole. A listed worktree whose directory
-# is gone is not active and contributes nothing.
-expected_worktree_databases() {
-  local project_dir="$1"
-  local listing wt_line wt_path wt_basename wt_branch
-
-  (cd "$project_dir" && is_git_repo) || return 0
-
-  listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
-
-  while IFS= read -r wt_line; do
-    case "$wt_line" in
-      "worktree "*) wt_path="${wt_line#worktree }" ;;
-      *) continue ;;
-    esac
-    [ -d "$wt_path" ] || continue
-    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
-    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || return 1
-    [ -n "$wt_branch" ] || return 1
-    printf 'worktree_%s_%s\nworktree_%s_%s_test\n' \
-      "$wt_branch" "$wt_basename" "$wt_branch" "$wt_basename"
-  done <<EOF_LISTING
-$listing
-EOF_LISTING
-}
 
 prune_project() {
   local project_dir="${1:-.}"
@@ -1486,23 +2475,37 @@ prune_project() {
   local alloc
   alloc="$(allocations_file)"
   if [ -f "$alloc" ]; then
-    local active_wt_names=""
-    while IFS= read -r wt_line; do
-      local wt_path
-      wt_path="$(echo "$wt_line" | awk '{print $1}')"
-      active_wt_names="${active_wt_names}$(basename "$wt_path")
-"
-    done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+    # Paths come from the porcelain output, so a path with spaces stays whole.
+    # When the list cannot be read, no allocation is released: an empty list
+    # would make every worktree of the project look gone.
+    local listing active_wt_names="" wt_line
+    # The list of worktrees and the rewrite are one step: a setup that registers
+    # its allocation in between must not lose it.
+    state_lock_acquire || return 1
+    if listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)"; then
+      while IFS= read -r wt_line; do
+        case "$wt_line" in
+          "worktree "*) active_wt_names="${active_wt_names}$(basename "${wt_line#worktree }")
+" ;;
+        esac
+      done <<EOF_ACTIVE
+$listing
+EOF_ACTIVE
 
-    local tmp="${alloc}.tmp"
-    while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
-      if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
-        log_info "Released allocation: port=$a_port redis_db=$a_redis (worktree: $a_wt)"
-      else
-        printf '%s\t%s\t%s\t%s\n' "$a_project" "$a_wt" "$a_port" "$a_redis"
-      fi
-    done < "$alloc" > "$tmp"
-    mv "$tmp" "$alloc"
+      local tmp="${alloc}.tmp"
+      while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
+        if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
+          log_info "Released allocation: port=$a_port redis_db=$a_redis (worktree: $a_wt)"
+        else
+          printf '%s\t%s\t%s\t%s\n' "$a_project" "$a_wt" "$a_port" "$a_redis"
+        fi
+      done < "$alloc" > "$tmp"
+      mv "$tmp" "$alloc"
+      state_lock_release
+    else
+      state_lock_release
+      log_warn "Cannot read the worktrees of $project_dir, keeping its port/redis allocations"
+    fi
   fi
 
   if ! has_psql; then
@@ -1522,10 +2525,16 @@ prune_project() {
 
   # Get all worktree_* databases
   local all_wt_dbs
-  all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  if ! all_wt_dbs="$(list_server_databases)"; then
+    log_warn "Cannot list the databases on the PostgreSQL server"
+    log_warn "Skipping database prune"
+    return 0
+  fi
+  all_wt_dbs="$(printf '%s\n' "$all_wt_dbs" | grep '^worktree_' || true)"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
+    prune_database_records "$project_dir" ""
     return 0
   fi
 
@@ -1544,28 +2553,30 @@ prune_project() {
 
   # The current project may not be registered yet; registered projects whose
   # directory is gone contribute nothing.
+  # Recorded databases of a worktree that still exists are active too.
   local active_dbs
-  if ! active_dbs="$(expected_worktree_databases "$project_dir")"; then
-    log_warn "Cannot read the worktrees of $project_dir"
+  if ! active_dbs="$(claimed_databases "" "${project_dir}
+$(registered_project_list)")"; then
     log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
     return 0
   fi
   active_dbs="${active_dbs}
 "
-  local registered_project registered_dbs
-  while IFS= read -r registered_project || [ -n "$registered_project" ]; do
-    [ -z "$registered_project" ] && continue
-    [ -d "$registered_project" ] || continue
-    if ! registered_dbs="$(expected_worktree_databases "$registered_project")"; then
-      log_warn "Cannot read the worktrees of $registered_project"
-      log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
-      return 0
-    fi
-    active_dbs="${active_dbs}${registered_dbs}
-"
-  done < "$reg"
 
-  echo "$all_wt_dbs" | while IFS= read -r db; do
+  # On a server another machine may use, only databases this machine recorded
+  # for a worktree of this project that is gone can be dropped: a database
+  # without a record here may belong to a worktree on another machine.
+  local drop_candidates="$all_wt_dbs"
+  if shared_server_is_remote; then
+    drop_candidates="$(recorded_gone_databases "$project_dir" "$all_wt_dbs")"
+    local unrecorded
+    unrecorded="$(unrecorded_databases "$all_wt_dbs")"
+    if [ -n "$unrecorded" ]; then
+      log_info "$(printf '%s\n' "$unrecorded" | wc -l | tr -d ' ') worktree databases on $(shared_server_host) have no record on this machine and were left: another machine may use them"
+    fi
+  fi
+
+  printf '%s\n' "$drop_candidates" | while IFS= read -r db; do
     [ -z "$db" ] && continue
 
     local found=false
@@ -1586,6 +2597,86 @@ EOF
       log_debug "Keeping active database: $db"
     fi
   done
+
+  prune_database_records "$project_dir" "$active_dbs"
+}
+
+# Print the databases of $2 (one per line) that the record names for a worktree
+# of project $1 whose folder is gone.
+recorded_gone_databases() {
+  local project_dir="$1"
+  local listed="$2"
+  local file r_project r_path r_role r_db
+
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+  while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+    [ -n "$r_db" ] || continue
+    [ "$r_project" = "$project_dir" ] || continue
+    [ ! -d "$r_path" ] || continue
+    if printf '%s\n' "$listed" | grep -qxF "$(pg_identifier "$r_db")"; then
+      pg_identifier "$r_db"
+      echo
+    fi
+  done < "$file"
+  return 0
+}
+
+# Print the databases of $1 (one per line) that no record line names.
+unrecorded_databases() {
+  local listed="$1"
+  local file recorded db
+
+  file="$(databases_file)"
+  recorded=""
+  [ -f "$file" ] && recorded="$(cut -f4 "$file")"
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    if ! printf '%s\n' "$recorded" | grep -qxF "$db"; then
+      printf '%s\n' "$db"
+    fi
+  done <<EOF_LISTED
+$listed
+EOF_LISTED
+  return 0
+}
+
+# Forget the recorded databases of this project's worktrees that are gone,
+# once their databases are gone from the server (dropped, or kept because
+# another existing worktree claims them). A database that is still there and
+# unclaimed keeps its record so the next prune tries again.
+prune_database_records() {
+  local project_dir="$1"
+  local active_dbs="$2"
+  local file tmp server_dbs r_project r_path r_role r_db keep
+
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  if ! server_dbs="$(list_server_databases)"; then
+    log_warn "Cannot list the databases, keeping the database record"
+    return 0
+  fi
+
+  state_lock_acquire || return 1
+  tmp="${file}.tmp.$$"
+  : > "$tmp"
+  while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+    [ -n "$r_db" ] || continue
+    keep=true
+    if [ "$r_project" = "$project_dir" ] && [ ! -d "$r_path" ]; then
+      if ! printf '%s\n' "$server_dbs" | grep -qxF "$(pg_identifier "$r_db")" ||
+          printf '%s\n' "$active_dbs" | grep -qxF "$(pg_identifier "$r_db")"; then
+        keep=false
+        log_debug "Forgetting $r_db (worktree: $r_path)"
+      fi
+    fi
+    if [ "$keep" = true ]; then
+      printf '%s\t%s\t%s\t%s\n' "$r_project" "$r_path" "$r_role" "$r_db" >> "$tmp"
+    fi
+  done < "$file"
+  mv "$tmp" "$file"
+  state_lock_release
 }
 
 prune_current() {
@@ -1680,6 +2771,11 @@ run_setup() {
   log_step "Copying build directories"
   copy_build_dirs "$build_cache_source" "$worktree_path" "$project_type"
 
+  # Steps 4 and 5 are one unit per worktree: a second setup of the same
+  # worktree waits here, so it never sees (and discards) the reservations of
+  # a run that is still cloning.
+  worktree_lock_acquire "$(pwd -P)" || return 1
+
   # Step 4: Provision databases/services
   log_step "Setting up databases"
   setup_databases "$project_type" "$worktree_path"
@@ -1687,6 +2783,7 @@ run_setup() {
   # Step 5: Write environment overrides (DB names, ports, Redis)
   log_step "Writing environment overrides"
   write_env_overrides "$project_type" "$worktree_path"
+  worktree_lock_release
 
   # Step 6: Run setup command
   log_step "Running setup"
