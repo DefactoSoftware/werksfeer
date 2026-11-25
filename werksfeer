@@ -1636,33 +1636,40 @@ forget_worktree_databases() {
 # the part that exists, no trailing slash. Components that are already gone are
 # kept as given.
 normalize_path() {
-  local path="$1" clean="" component rest="" existing
+  local path="$1" cur component missing=0
 
   case "$path" in
-    /*) ;;
-    *) path="${PWD}/${path}" ;;
+    /*) cur="/" ;;
+    *) cur="$(pwd -P)" ;;
   esac
 
-  # Drop "." and "..", empty parts and trailing slashes, as text.
+  # Walk the components in order. Each one that exists is resolved on the
+  # spot (symlinks included), so ".." always applies to the real parent; what
+  # does not exist yet is kept as given.
   while IFS= read -r component; do
     case "$component" in
       ""|.) ;;
-      ..) clean="${clean%/*}" ;;
-      *) clean="${clean}/${component}" ;;
+      ..)
+        cur="$(dirname "$cur")"
+        if [ -d "$cur" ]; then
+          cur="$(cd "$cur" && pwd -P)"
+          missing=0
+        fi
+        ;;
+      *)
+        if [ "$missing" -eq 0 ] && [ -d "${cur%/}/${component}" ]; then
+          cur="$(cd "${cur%/}/${component}" && pwd -P)"
+        else
+          missing=1
+          cur="${cur%/}/${component}"
+        fi
+        ;;
     esac
   done <<EOF_PARTS
 $(printf '%s\n' "$path" | tr '/' '\n')
 EOF_PARTS
-  [ -n "$clean" ] || clean="/"
 
-  # Resolve symlinks in the part that exists and keep the rest as it is.
-  existing="$clean"
-  while [ ! -d "$existing" ]; do
-    rest="/$(basename "$existing")${rest}"
-    existing="$(dirname "$existing")"
-  done
-  existing="$(cd "$existing" && pwd -P | sed 's|/$||')"
-  printf '%s\n' "${existing}${rest}" | sed 's|^$|/|'
+  printf '%s\n' "$cur"
 }
 
 # PostgreSQL cuts identifiers at 63 bytes without an error, so a longer name
