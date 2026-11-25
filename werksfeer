@@ -262,7 +262,7 @@ state_lock_acquire() {
   printf '%s\n' "$$" > "${dir}/pid"
   WERKSFEER_LOCK_DIR="$dir"
   WERKSFEER_LOCK_DEPTH=1
-  trap 'state_lock_release_all' EXIT
+  trap 'werksfeer_on_exit' EXIT
 }
 
 state_lock_release() {
@@ -973,6 +973,12 @@ worktree_env_databases() {
     LC_ALL=C cut -c1-63
 }
 
+# Print the value the file exports for variable $2, or nothing.
+env_export_value() {
+  [ -f "$1" ] || return 0
+  sed -n "s/^export ${2}=\"\(.*\)\"\$/\1/p" "$1" | head -n 1
+}
+
 # Returns 0 when the managed environment of the worktree sets $2 to $3.
 env_names_database() {
   grep -qxF "export ${2}=\"${3}\"" "${1}/.envrc" 2>/dev/null
@@ -1056,25 +1062,36 @@ choose_database_name() {
   printf '%s\tnew\n' "$name"
 }
 
-# Clone one database from its template and print the name to use ("" when there
-# is none). Arguments: role, template, name, origin (see choose_database_name),
-# project, worktree, branch, folder.
+# Clone one database from its template. Prints "name<TAB>state"; arguments are
+# role, template, name, origin (see choose_database_name), project, worktree,
+# branch, folder.
 #
 # A database is this worktree's only when the record said so before this run
 # (recorded), the pre-0.4.0 rule verified it (legacy), or this run's own
-# CREATE DATABASE succeeded. "Already exists, skipping" is only said for the
-# first two. A reserved name (new) that turns out to exist, whether it was
-# visible before the CREATE or the CREATE lost a race, is someone else's: the
-# machine-specific name is tried once, and if that is occupied too, the role
-# gets no database.
+# CREATE DATABASE succeeded. The state says what the caller may rely on:
 #
-# Returns 2 when the server could not be asked.
+# owned    the database exists and is this worktree's.
+# pending  the database does not exist yet (no template, or the clone failed
+#          and the server confirms it is absent). The name stays reserved; the
+#          framework's own setup may create it, and finalize_pending_databases
+#          keeps the record only if it did.
+# none     the name is occupied by a database that is not ours, and so is the
+#          machine-specific fallback. The role gets no database.
+#
+# A name this run only reserved ("new") that turns out to exist, whether it was
+# visible before the CREATE or lost in a race, is someone else's: the
+# machine-specific name is tried once. After any CREATE that did not succeed
+# the name is not this run's unless the server confirms it is absent.
+#
+# Returns 0 normally, 1 when the record could not be updated and 2 when the
+# server could not be asked. Nothing here relies on errexit.
 clone_one_database() {
   local role="$1" base="$2" name="$3" origin="$4" project="$5" worktree="$6" branch="$7" folder="$8"
-  local suffix="" attempt status hashed clone_error state template_state
+  local suffix="" attempt status hashed clone_error state template_state occupied
   [ "$role" = "test" ] && suffix="_test"
 
   for attempt in 1 2; do
+    occupied=false
     state=0
     db_exists "$name" || state=$?
     hashed="$(new_database_stem "$project" "$worktree" "$branch" "$folder" hash)${suffix}"
@@ -1083,72 +1100,136 @@ clone_one_database() {
       0)
         if [ "$origin" != "new" ]; then
           log_info "Database $name already exists, skipping" >&2
-          printf '%s\n' "$name"
+          printf '%s\towned\n' "$name"
           return 0
         fi
         # A database exists under a name this run only reserved.
-        if [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
-          log_warn "Database $name exists and is not this worktree's, trying $hashed" >&2
-          name="$hashed"
-          origin="new"
-          record_database "$project" "$worktree" "$role" "$name"
-          continue
-        fi
-        log_warn "Database $name exists and is not this worktree's: not using it, the $role database stays unconfigured" >&2
-        return 0
+        log_warn "Database $name exists and is not this worktree's" >&2
+        occupied=true
         ;;
-      1) ;;
-      *) return 2 ;;
-    esac
-
-    template_state=0
-    db_exists "$base" || template_state=$?
-    case "$template_state" in
-      0) ;;
       1)
-        log_warn "Template database $base not found, skipping $role DB clone" >&2
-        printf '%s\n' "$name"
-        return 0
+        template_state=0
+        db_exists "$base" || template_state=$?
+        case "$template_state" in
+          0) ;;
+          1)
+            log_warn "Template database $base not found, skipping $role DB clone" >&2
+            printf '%s\tpending\n' "$name"
+            return 0
+            ;;
+          *) return 2 ;;
+        esac
+
+        log_info "Cloning $base -> $name" >&2
+        shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+        status=0
+        # VERBOSITY=verbose puts the SQLSTATE in the error line in any language.
+        clone_error="$(shared_pg psql -d postgres -q -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -c "CREATE DATABASE \"${name}\" WITH TEMPLATE \"${base}\";" 2>&1 >/dev/null)" || status=$?
+        if [ "$status" -eq 0 ]; then
+          printf '%s\towned\n' "$name"
+          return 0
+        fi
+        printf '%s\n' "$clone_error" >&2
+
+        case "$clone_error" in
+          *"42P04"*)
+            # duplicate_database: someone else won the race for this name.
+            log_warn "Database $name was created by someone else in the meantime" >&2
+            occupied=true
+            ;;
+          *)
+            log_error "Failed to clone $base -> $name" >&2
+            # The failed CREATE says nothing about who owns the name: look.
+            state=0
+            db_exists "$name" || state=$?
+            case "$state" in
+              1)
+                printf '%s\tpending\n' "$name"
+                return 0
+                ;;
+              0) occupied=true ;;
+              *) return 2 ;;
+            esac
+            ;;
+        esac
         ;;
       *) return 2 ;;
     esac
 
-    log_info "Cloning $base -> $name" >&2
-    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
-    status=0
-    clone_error="$(shared_pg psql -d postgres -q -c "CREATE DATABASE \"${name}\" WITH TEMPLATE \"${base}\";" 2>&1 >/dev/null)" || status=$?
-    if [ "$status" -eq 0 ]; then
-      printf '%s\n' "$name"
-      return 0
+    if [ "$occupied" = true ] && [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
+      log_warn "Trying $hashed instead" >&2
+      # The record must stop naming the occupied database before anything else.
+      if ! record_database "$project" "$worktree" "$role" "$hashed"; then
+        unrecord_database "$project" "$worktree" "$role" || true
+        log_error "Cannot update the database record: stopping" >&2
+        return 1
+      fi
+      name="$hashed"
+      origin="new"
+      continue
     fi
-    printf '%s\n' "$clone_error" >&2
-
-    case "$clone_error" in
-      *"already exists"*)
-        # Someone else won the race for this name.
-        if [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
-          log_warn "Database $name was created by someone else in the meantime, trying $hashed" >&2
-          name="$hashed"
-          origin="new"
-          record_database "$project" "$worktree" "$role" "$name"
-          continue
-        fi
-        log_warn "Database $name exists and is not this worktree's: not using it, the $role database stays unconfigured" >&2
-        return 0
-        ;;
-    esac
-    log_error "Failed to clone $base -> $name" >&2
-    printf '%s\n' "$name"
+    log_warn "The $role database stays unconfigured: no database of this worktree's own was found or created" >&2
+    printf '\tnone\n'
     return 0
   done
+  return 2
+}
+
+# Databases the framework's own setup is expected to create under a reserved
+# name (the template does not exist yet). Set by clone_databases.
+WERKSFEER_PENDING_PROJECT=""
+WERKSFEER_PENDING_WORKTREE=""
+WERKSFEER_PENDING_DEV=""
+WERKSFEER_PENDING_TEST=""
+
+# After the framework step: a pending database that now exists was created by
+# it (it did not exist when the name was chosen), so its reservation stays as
+# the record. One that does not exist leaves no record. When the server cannot
+# be asked the record is dropped: a database left without a record is only
+# unused, one wrongly recorded could be dropped later.
+finalize_pending_databases() {
+  local role name state
+
+  for role in dev test; do
+    if [ "$role" = "dev" ]; then name="$WERKSFEER_PENDING_DEV"; else name="$WERKSFEER_PENDING_TEST"; fi
+    [ -n "$name" ] || continue
+    state=0
+    db_exists "$name" || state=$?
+    case "$state" in
+      0) log_info "Recorded $name: the setup created it" ;;
+      1) unrecord_database "$WERKSFEER_PENDING_PROJECT" "$WERKSFEER_PENDING_WORKTREE" "$role" || log_warn "Could not remove the reservation of $name from the record" ;;
+      *)
+        log_warn "Cannot tell whether $name exists, so it is not recorded"
+        unrecord_database "$WERKSFEER_PENDING_PROJECT" "$WERKSFEER_PENDING_WORKTREE" "$role" || log_warn "Could not remove the reservation of $name from the record"
+        ;;
+    esac
+  done
+  WERKSFEER_PENDING_DEV=""
+  WERKSFEER_PENDING_TEST=""
+  return 0
+}
+
+# Leave the role as it was before this run: remove the reservation this run made.
+release_reservation() {
+  local project="$1" worktree="$2" role="$3" origin="$4" state="$5"
+  # A recorded or verified legacy name, and a database this run created, stay.
+  if [ "$origin" = "new" ] && [ "$state" != "owned" ]; then
+    unrecord_database "$project" "$worktree" "$role" || log_warn "Could not remove the reservation of the $role database from the record"
+  fi
+  return 0
 }
 
 clone_databases() {
   local project_type="$1"
   WERKSFEER_DB_UNCONFIGURED=""
+  WERKSFEER_DB_PENDING=""
+  WERKSFEER_DB_SKIPPED=""
+  WERKSFEER_PENDING_DEV=""
+  WERKSFEER_PENDING_TEST=""
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cloning"
+    WERKSFEER_DB_SKIPPED=1
     return 0
   fi
 
@@ -1164,13 +1245,16 @@ clone_databases() {
 
   if ! shared_pg_reachable; then
     log_warn "Skipping database cloning"
+    WERKSFEER_DB_SKIPPED=1
     return 0
   fi
 
-  # Every catalog check below relies on being able to list the databases.
+  # Every catalog check below relies on being able to list the databases. A
+  # server that accepts the connection but cannot list them stops setup here,
+  # before the environment of an existing worktree is rewritten.
   if ! list_server_databases > /dev/null; then
-    log_warn "Cannot list the databases on the PostgreSQL server, skipping database cloning"
-    return 0
+    log_error "Cannot list the databases on the PostgreSQL server: stopping before the record and the environment files change"
+    return 1
   fi
 
   local record_project record_worktree clone_branch clone_folder
@@ -1182,9 +1266,10 @@ clone_databases() {
   # Choosing a name and reserving it in the record is one step under the lock:
   # another setup that picks next sees the record and takes a different name.
   # The lock is not held while the databases are cloned, which can take long.
-  # When the server cannot be asked, setup stops before it changes the record
-  # or the environment files.
+  # After any failure a role is either as it was before this run or fully this
+  # worktree's: owned databases stay recorded, unused reservations are removed.
   local dev_choice test_choice dev_origin test_origin status=0
+  local dev_state="" test_state=""
   state_lock_acquire || return 1
   dev_choice="$(choose_database_name dev "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
   if [ "$status" -eq 0 ]; then
@@ -1204,49 +1289,67 @@ clone_databases() {
     NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$clone_branch" "$clone_folder" hash)_test"
     test_origin="new"
   fi
-  record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
-  record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
+  if ! record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB" ||
+      ! record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"; then
+    release_reservation "$record_project" "$record_worktree" dev "$dev_origin" ""
+    release_reservation "$record_project" "$record_worktree" test "$test_origin" ""
+    state_lock_release
+    log_error "Cannot update the database record: stopping before the environment files change"
+    return 1
+  fi
   state_lock_release
 
   local dev_result test_result
   status=0
   dev_result="$(clone_one_database dev "$base_dev" "$NEW_DEV_DB" "$dev_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
   if [ "$status" -eq 0 ]; then
+    dev_state="${dev_result#*"$TAB"}"
     test_result="$(clone_one_database test "$base_test" "$NEW_TEST_DB" "$test_origin" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")" || status=$?
+    [ "$status" -ne 0 ] || test_state="${test_result#*"$TAB"}"
   fi
   if [ "$status" -ne 0 ]; then
-    # Take back the reservations this run made; what the record said before stays.
-    [ "$dev_origin" != "new" ] || unrecord_database "$record_project" "$record_worktree" dev
-    [ "$test_origin" != "new" ] || unrecord_database "$record_project" "$record_worktree" test
-    log_error "Cannot ask the PostgreSQL server which databases exist: stopping before the environment is written"
+    # What this run created stays recorded; unused reservations go.
+    release_reservation "$record_project" "$record_worktree" dev "$dev_origin" "$dev_state"
+    release_reservation "$record_project" "$record_worktree" test "$test_origin" "$test_state"
+    log_error "Stopping before the environment files change: the PostgreSQL server could not be asked, or the record could not be updated"
     return 1
   fi
-  NEW_DEV_DB="$dev_result"
-  NEW_TEST_DB="$test_result"
+  NEW_DEV_DB="${dev_result%%"$TAB"*}"
+  NEW_TEST_DB="${test_result%%"$TAB"*}"
 
-  # A role without a database leaves no record and no environment variable.
-  # A database that the server says does not exist (no template, or the clone
-  # failed) leaves no record behind either. When the server cannot be asked,
-  # the record stays and setup stops.
-  local role name state
+  local role state name
   for role in dev test; do
-    if [ "$role" = "dev" ]; then name="$NEW_DEV_DB"; else name="$NEW_TEST_DB"; fi
-    if [ -z "$name" ]; then
-      unrecord_database "$record_project" "$record_worktree" "$role"
-      WERKSFEER_DB_UNCONFIGURED=1
-      continue
+    if [ "$role" = "dev" ]; then
+      name="$NEW_DEV_DB"; state="$dev_state"
+    else
+      name="$NEW_TEST_DB"; state="$test_state"
     fi
-    state=0
-    db_exists "$name" || state=$?
     case "$state" in
-      0) ;;
-      1) unrecord_database "$record_project" "$record_worktree" "$role" ;;
+      owned) ;;
+      pending)
+        # No database yet: the reservation stays until the framework step ran.
+        WERKSFEER_PENDING_PROJECT="$record_project"
+        WERKSFEER_PENDING_WORKTREE="$record_worktree"
+        if [ "$role" = "dev" ]; then WERKSFEER_PENDING_DEV="$name"; WERKSFEER_DB_PENDING=1; else WERKSFEER_PENDING_TEST="$name"; fi
+        ;;
       *)
-        log_error "Cannot ask the PostgreSQL server whether $name exists: stopping before the environment is written"
-        return 1
+        # No database for this role: no record, no environment variable.
+        if ! unrecord_database "$record_project" "$record_worktree" "$role"; then
+          log_error "Cannot remove the reservation of the $role database from the record: stopping"
+          return 1
+        fi
+        WERKSFEER_DB_UNCONFIGURED=1
         ;;
     esac
   done
+  return 0
+}
+
+# The EXIT trap: a pending database is judged one last time, so an aborted
+# setup leaves no reservation behind, and the lock is released if we hold it.
+werksfeer_on_exit() {
+  finalize_pending_databases || true
+  state_lock_release_all
 }
 
 use_private_postgres_cluster() {
@@ -1414,6 +1517,12 @@ write_env_overrides() {
 
   local dev_db="${NEW_DEV_DB:-}"
   local test_db="${NEW_TEST_DB:-}"
+  # The database part was skipped because the server or psql was not available:
+  # an existing worktree keeps the database variables it already has.
+  if [ "${WERKSFEER_DB_SKIPPED:-}" = "1" ]; then
+    [ -n "$dev_db" ] || dev_db="$(env_export_value ".envrc" DATABASE_NAME)"
+    [ -n "$test_db" ] || test_db="$(env_export_value ".envrc" TEST_DATABASE_NAME)"
+  fi
   local service_env
   service_env="$(services_environment "$worktree_root")"
 
@@ -1675,7 +1784,7 @@ run_database_setup() {
         log_step "Creating and migrating the private test database"
         run_in_project_environment env MIX_ENV=test mix ecto.create --quiet
         run_in_project_environment env MIX_ENV=test mix ecto.migrate --quiet
-      elif [ -z "${NEW_DEV_DB:-}" ]; then
+      elif [ -z "${NEW_DEV_DB:-}" ] || [ "${WERKSFEER_DB_PENDING:-}" = "1" ]; then
         log_step "Running mix ecto.setup"
         run_in_project_environment mix ecto.setup
       else
@@ -1760,6 +1869,9 @@ record_database() {
   database="$(pg_identifier "$4")"
   file="$(databases_file)"
 
+  # Every step is checked: errexit does not apply inside a function that is
+  # called on the left of || or in an if, and a half-written record is worse
+  # than a failed one.
   case "${project}${worktree}" in
     *"$TAB"*|*$'\n'*)
       log_warn "Cannot record $database: a tab or newline in a path cannot be stored"
@@ -1872,9 +1984,6 @@ registered_project_list() {
 }
 
 # Print "worktree_path<TAB>database" for the databases each existing worktree
-  # Every step is checked: errexit does not apply inside a function that is
-  # called on the left of || or in an if, and a half-written record is worse
-  # than a failed one.
 # of a project (a main checkout) claims: the ones recorded for it, and the
 # names it would have by the naming of 0.3.1 and earlier and by the current
 # naming. We cannot strip
@@ -2614,6 +2723,9 @@ run_setup() {
   # Step 6: Run setup command
   log_step "Running setup"
   run_setup_command "$project_type" "$worktree_path"
+  # A database the framework step was to create must exist now, or its
+  # reservation goes (an aborted setup is judged by the EXIT trap).
+  finalize_pending_databases
 
   # Publish only a cleanly stopped, fully prepared database whose HEAD exactly
   # matches the configured remote template ref. Feature-branch state is never

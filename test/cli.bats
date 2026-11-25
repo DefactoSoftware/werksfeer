@@ -1140,7 +1140,9 @@ install_fake_pg() {
   PG_LIST_FAIL="${TEST_ROOT}/pg.listfail"
   PG_CREATE_RACE="${TEST_ROOT}/pg.createrace"
   PG_LIST_FAIL_AFTER="${TEST_ROOT}/pg.listfailafter"
-  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL PG_LIST_FAIL PG_CREATE_RACE PG_LIST_FAIL_AFTER
+  PG_CREATE_FAIL="${TEST_ROOT}/pg.createfail"
+  PG_HOLD_LOCK="${TEST_ROOT}/pg.holdlock"
+  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL PG_LIST_FAIL PG_CREATE_RACE PG_LIST_FAIL_AFTER PG_CREATE_FAIL PG_HOLD_LOCK
   mkdir -p "$FAKE_BIN"
   : > "$PG_LOG"
   printf '%s\n' example_dev example_test > "$PG_DBS"
@@ -1176,10 +1178,29 @@ case "$*" in
     name="$(printf '%s' "$*" | sed 's/.*CREATE DATABASE "\([^"]*\)".*/\1/')"
     # Another machine creates the database between the check and the CREATE.
     # The file holds a glob for the names it wins.
+    # A generic failure for the names in the glob; the database is created
+    # anyway when PG_CREATE_FAIL.creates exists (the server did the work, the
+    # client did not hear back).
+    if [ -e "$PG_CREATE_FAIL" ] && [[ "$name" == $(cat "$PG_CREATE_FAIL") ]]; then
+      [ -e "${PG_CREATE_FAIL}.creates" ] && printf '%s\n' "$name" >> "$PG_DBS"
+      printf 'ERROR:  XX000: something went wrong\n' >&2
+      exit 1
+    fi
     if [ -e "$PG_CREATE_RACE" ] && [[ "$name" == $(cat "$PG_CREATE_RACE") ]]; then
+      # The lock is held by the setup that called us, so the record cannot change.
+      if [ -e "$PG_HOLD_LOCK" ]; then
+        mkdir -p "$XDG_DATA_HOME/werksfeer/state.lock"
+        # The setup process that outlives the command substitution around us.
+        ps -o ppid= -p "$PPID" | tr -d ' ' > "$XDG_DATA_HOME/werksfeer/state.lock/pid"
+      fi
       printf '%s\n' "$name" >> "$PG_DBS"
       rm -f "$PG_CREATE_RACE"
-      printf 'ERROR:  database "%s" already exists\n' "$name" >&2
+      # With VERBOSITY=verbose the SQLSTATE is in the line, in any language.
+      if [ -n "${PG_LOCALIZED:-}" ]; then
+        printf 'ERROR:  42P04: la base de donn\303\251es \302\253 %s \302\273 existe d\303\251j\303\240\n' "$name" >&2
+      else
+        printf 'ERROR:  42P04: database "%s" already exists\n' "$name" >&2
+      fi
       exit 1
     fi
     # A real server cuts identifiers at 63 bytes without an error.
@@ -1197,8 +1218,9 @@ grep -vxF "$(printf '%s' "${!#}" | LC_ALL=C cut -c1-63)" "$PG_DBS" > "${PG_DBS}.
 mv "${PG_DBS}.new" "$PG_DBS"
 EOF_DROPDB
 
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "$PG_DBS"\n' > "${FAKE_BIN}/createdb"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${FAKE_BIN}/elixir"
-  chmod +x "${FAKE_BIN}/psql" "${FAKE_BIN}/dropdb" "${FAKE_BIN}/elixir"
+  chmod +x "${FAKE_BIN}/psql" "${FAKE_BIN}/dropdb" "${FAKE_BIN}/elixir" "${FAKE_BIN}/createdb"
 }
 
 run_in_worktree() {
@@ -2511,7 +2533,7 @@ ${snippet}"
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"exists and is not this worktree's"* ]]
+  [[ "$output" == *"was created by someone else in the meantime"* ]]
   run grep -q 'export DATABASE_NAME=' "${WORKTREE_ONE}/.envrc"
   [ "$status" -eq 1 ]
   run grep -qF "$(printf '\tdev\t')" "$(DB_RECORD)"
@@ -2604,15 +2626,18 @@ ${snippet}"
   [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
 }
 
-@test "setup does not clone or record anything when the databases cannot be listed" {
+@test "setup stops when the databases cannot be listed and leaves the record and the exports alone" {
   install_fake_pg
   write_shared_config
+  printf '\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="worktree_head_one"\n# <<< werksfeer managed environment <<<\n' > "${WORKTREE_ONE}/.envrc"
+  cp "${WORKTREE_ONE}/.envrc" "${TEST_ROOT}/envrc.before"
   touch "$PG_LIST_FAIL"
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
-  [ "$status" -eq 0 ]
+  [ "$status" -ne 0 ]
   [[ "$output" == *"Cannot list the databases"* ]]
   [ ! -e "$(DB_RECORD)" ]
+  cmp "${TEST_ROOT}/envrc.before" "${WORKTREE_ONE}/.envrc"
   run grep -q 'CREATE DATABASE' "$PG_LOG"
   [ "$status" -eq 1 ]
 }
@@ -2738,7 +2763,7 @@ ${snippet}"
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Cannot ask the PostgreSQL server"* ]]
+  [[ "$output" == *"Stopping before the environment files change"* ]]
   [ ! -e "$(DB_RECORD)" ]
   [ ! -e "${WORKTREE_ONE}/.envrc" ] || ! grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
   run grep -q 'CREATE DATABASE' "$PG_LOG"
@@ -2765,4 +2790,117 @@ ${snippet}"
   grep -qxF custom_dev "$PG_DBS"
   run grep -qxF "$(printf '%s\t%s\tdev\tcustom_dev' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
   [ "$status" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# Review round 4: every failure leaves a role as it was or fully this worktree's
+# ---------------------------------------------------------------------------
+
+@test "a duplicate-database error in another language is still a lost race" {
+  install_fake_pg
+  write_shared_config
+  printf '%s' 'worktree_example_head_one' > "$PG_CREATE_RACE"
+
+  run_in_worktree "$WORKTREE_ONE" env PG_LOCALIZED=1 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local dev
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  [[ "$dev" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+  grep -q 'VERBOSITY=verbose' "$PG_LOG"
+}
+
+@test "a failed CREATE that left no database is not recorded, and one that left a database is not claimed" {
+  install_fake_pg
+  write_shared_config
+  printf '%s' 'worktree_example_head_one' > "$PG_CREATE_FAIL"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Failed to clone example_dev -> worktree_example_head_one"* ]]
+  run grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+
+  # The server did create it before the error came back: not ours to claim.
+  rm -f "$(DB_RECORD)" "${WORKTREE_ONE}/.envrc"
+  printf '%s\n' example_dev example_test > "$PG_DBS"
+  : > "${PG_CREATE_FAIL}.creates"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local dev
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  [ "$dev" != "worktree_example_head_one" ]
+  run grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+  grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a record update that fails during a lost race clears the claim and stops setup" {
+  install_fake_pg
+  write_shared_config
+  printf '%s' 'worktree_example_head_one' > "$PG_CREATE_RACE"
+  : > "$PG_HOLD_LOCK"
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_LOCK_TIMEOUT=1 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot update the database record"* ]]
+  run grep -qF 'worktree_example_head_one' "$(DB_RECORD)" 2>/dev/null
+  [ "$status" -ne 0 ]
+  [ ! -e "${WORKTREE_ONE}/.envrc" ] || ! grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a database created by this run stays recorded when the test role fails afterwards" {
+  install_fake_pg
+  write_shared_config
+  # Calls: preflight, dev and test name checks (4), dev clone (2), then the test clone fails.
+  printf '7' > "$PG_LIST_FAIL_AFTER"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  grep -qxF worktree_example_head_one "$PG_DBS"
+  grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  run grep -q "$(printf '\ttest\t')" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+  [ ! -e "${WORKTREE_ONE}/.envrc" ] || ! grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a database the framework step creates under the chosen name is recorded afterwards" {
+  install_fake_pg
+  write_shared_config
+  # A fresh project: the template does not exist yet and the setup command
+  # creates the database the way a framework would.
+  printf '%s\n' unrelated > "$PG_DBS"
+  sed -i "s|^command = .*|command = '. ./.envrc \&\& createdb \$DATABASE_NAME'|" "${WORKTREE_ONE}/.worktree.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_example_head_one "$PG_DBS"
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  # The test database was never created, so it has no record.
+  run grep -q "$(printf '\ttest\t')" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+}
+
+@test "a setup that fails after reserving a name for a database that does not exist leaves no reservation" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' unrelated > "$PG_DBS"
+  sed -i "s|^command = .*|command = 'false'|" "${WORKTREE_ONE}/.worktree.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [ ! -e "$(DB_RECORD)" ]
+}
+
+@test "an unreachable server keeps the database variables a worktree already exports" {
+  install_fake_pg
+  write_shared_config
+  printf '\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="worktree_example_head_one"\nexport TEST_DATABASE_NAME="worktree_example_head_one_test"\n# <<< werksfeer managed environment <<<\n' > "${WORKTREE_ONE}/.envrc"
+  touch "$PG_DOWN"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  grep -q 'export TEST_DATABASE_NAME="worktree_example_head_one_test"' "${WORKTREE_ONE}/.envrc"
 }
