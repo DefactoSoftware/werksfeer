@@ -1762,26 +1762,27 @@ record_database() {
 
   case "${project}${worktree}" in
     *"$TAB"*|*$'\n'*)
-      log_warn "Not recording $database: a tab or newline in a path cannot be stored"
-      return 0
+      log_warn "Cannot record $database: a tab or newline in a path cannot be stored"
+      return 1
       ;;
   esac
 
   state_lock_acquire || return 1
-  mkdir -p "$(dirname "$file")"
   tmp="${file}.tmp.$$"
-  {
-    if [ -f "$file" ]; then
-      WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
-        '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file"
-    fi
-    printf '%s\t%s\t%s\t%s\n' "$project" "$worktree" "$role" "$database"
-  } > "$tmp"
-  mv "$tmp" "$file"
+  mkdir -p "$(dirname "$file")" || { state_lock_release; return 1; }
+  : > "$tmp" || { state_lock_release; return 1; }
+  if [ -f "$file" ]; then
+    WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
+      '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp" ||
+      { rm -f "$tmp"; state_lock_release; return 1; }
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$project" "$worktree" "$role" "$database" >> "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
   state_lock_release
 }
 
-# Remove the record line of one role of a worktree.
+# Remove the record line of one role of a worktree. Returns 1 when that failed.
 unrecord_database() {
   local project="$1" worktree="$2" role="$3"
   local file tmp
@@ -1791,11 +1792,12 @@ unrecord_database() {
   state_lock_acquire || return 1
   tmp="${file}.tmp.$$"
   WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
-    '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp"
+    '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
   if [ -s "$tmp" ]; then
-    mv "$tmp" "$file"
+    mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
   else
-    rm -f "$tmp" "$file"
+    rm -f "$tmp" "$file" || { state_lock_release; return 1; }
   fi
   state_lock_release
 }
@@ -1810,8 +1812,9 @@ forget_worktree_databases() {
   state_lock_acquire || return 1
   tmp="${file}.tmp.$$"
   WF_WORKTREE="$worktree" WF_PROJECT="$project" awk -F'\t' \
-    '!($2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"]))' "$file" > "$tmp"
-  mv "$tmp" "$file"
+    '!($2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"]))' "$file" > "$tmp" ||
+    { rm -f "$tmp"; state_lock_release; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; state_lock_release; return 1; }
   state_lock_release
 }
 
@@ -1869,6 +1872,9 @@ registered_project_list() {
 }
 
 # Print "worktree_path<TAB>database" for the databases each existing worktree
+  # Every step is checked: errexit does not apply inside a function that is
+  # called on the left of || or in an if, and a half-written record is worse
+  # than a failed one.
 # of a project (a main checkout) claims: the ones recorded for it, and the
 # names it would have by the naming of 0.3.1 and earlier and by the current
 # naming. We cannot strip
