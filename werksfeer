@@ -747,7 +747,8 @@ shared_pg_reachable() {
 }
 
 db_exists() {
-  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$1"
+  # The server cuts names at 63 bytes, so that is the name it lists.
+  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$(pg_identifier "$1")"
 }
 
 get_base_db_names() {
@@ -835,6 +836,17 @@ clone_databases() {
     fi
   fi
 
+  # Record what this worktree uses, so cleanup and prune go by the record.
+  # Databases that already existed are adopted into the record too.
+  local record_project record_worktree
+  record_project="$(get_main_worktree_path)"
+  record_worktree="$(pwd -P)"
+  if db_exists "$NEW_DEV_DB"; then
+    record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
+  fi
+  if db_exists "$NEW_TEST_DB"; then
+    record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
+  fi
 }
 
 use_private_postgres_cluster() {
@@ -1301,6 +1313,183 @@ register_project() {
 }
 
 # ---------------------------------------------------------------------------
+# Database record (which databases werksfeer created for which worktree)
+# ---------------------------------------------------------------------------
+# File: ~/.local/share/werksfeer/databases
+# Format: project_path<TAB>worktree_path<TAB>role<TAB>database
+# One line per database; role is "dev" or "test". Cleanup and prune go by this
+# record instead of guessing from database names.
+
+TAB="$(printf '\t')"
+
+databases_file() {
+  echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/databases"
+}
+
+# Print the record lines of a worktree path, optionally only for one project.
+recorded_lines() {
+  local file
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+  WF_WORKTREE="$1" WF_PROJECT="${2:-}" awk -F'\t' \
+    '$2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"])' "$file"
+}
+
+# Print the recorded database of one role for a worktree, or nothing.
+recorded_database() {
+  recorded_lines "$1" "${3:-}" | awk -F'\t' -v role="$2" '$3 == role { print $4; exit }'
+}
+
+# Record a database for a worktree, replacing an earlier one of the same role.
+# The file is rewritten through a temp file and a rename.
+record_database() {
+  local project="$1" worktree="$2" role="$3" database
+  local file tmp
+  database="$(pg_identifier "$4")"
+  file="$(databases_file)"
+
+  case "${project}${worktree}" in
+    *"$TAB"*|*$'\n'*)
+      log_warn "Not recording $database: a tab or newline in a path cannot be stored"
+      return 0
+      ;;
+  esac
+
+  mkdir -p "$(dirname "$file")"
+  tmp="${file}.tmp.$$"
+  {
+    if [ -f "$file" ]; then
+      WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
+        '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$project" "$worktree" "$role" "$database"
+  } > "$tmp"
+  mv "$tmp" "$file"
+}
+
+# Remove every record line of a worktree path (of one project when given).
+forget_worktree_databases() {
+  local worktree="$1" project="${2:-}"
+  local file tmp
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  tmp="${file}.tmp.$$"
+  WF_WORKTREE="$worktree" WF_PROJECT="$project" awk -F'\t' \
+    '!($2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"]))' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+# Resolve a path the way git reports worktrees (symlinks resolved, no trailing
+# slash). A path that is already gone keeps its last component as given.
+normalize_path() {
+  local path="${1%/}"
+  [ -n "$path" ] || path="/"
+  if [ -d "$path" ]; then
+    (cd "$path" && pwd -P)
+  elif [ -d "$(dirname "$path")" ]; then
+    printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+# PostgreSQL cuts identifiers at 63 bytes without an error, so a longer name
+# is the same database as its first 63 bytes.
+pg_identifier() {
+  printf '%s' "$1" | LC_ALL=C cut -c1-63
+}
+
+registered_project_list() {
+  local reg
+  reg="$(registry_file)"
+  [ -f "$reg" ] && [ -r "$reg" ] || return 0
+  cat "$reg"
+}
+
+# Print "worktree_path<TAB>database" for the databases each existing worktree
+# of a project (a main checkout) claims: the ones recorded for it, and the
+# names it would have by the naming of 0.3.1 and earlier. We cannot strip
+# _test to infer stems because the worktree name itself may end with _test
+# (e.g. wt-ragout-test).
+#
+# Returns 1 when the project cannot be inspected completely (the worktree list
+# fails, or the branch of a worktree that exists cannot be read). Callers must
+# not drop databases against an incomplete list. Paths come from the porcelain
+# output, so a path with spaces stays whole. A listed worktree whose directory
+# is gone claims nothing.
+project_worktree_claims() {
+  local project_dir="$1"
+  local listing wt_line wt_path wt_basename wt_branch recorded_line
+
+  (cd "$project_dir" && is_git_repo) || return 0
+
+  listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
+
+  while IFS= read -r wt_line; do
+    case "$wt_line" in
+      "worktree "*) wt_path="${wt_line#worktree }" ;;
+      *) continue ;;
+    esac
+    [ -d "$wt_path" ] || continue
+    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
+    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || return 1
+    [ -n "$wt_branch" ] || return 1
+
+    printf '%s\t%s\n' \
+      "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}")" \
+      "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}_test")"
+
+    while IFS= read -r recorded_line; do
+      [ -n "$recorded_line" ] || continue
+      printf '%s\t%s\n' "$wt_path" "$(printf '%s' "$recorded_line" | cut -f4)"
+    done <<EOF_RECORDED
+$(recorded_lines "$wt_path")
+EOF_RECORDED
+  done <<EOF_LISTING
+$listing
+EOF_LISTING
+}
+
+# Print the databases that existing worktrees claim, one per line, leaving out
+# the worktree at path $1 (empty for none). $2 holds the main checkouts to
+# inspect, one per line; a checkout whose directory is gone claims nothing.
+# Recorded databases of any worktree that still exists count too.
+#
+# Returns 1 (after saying which project) when a project cannot be inspected.
+claimed_databases() {
+  local excluded="$1"
+  local projects="$2"
+  local project claims r_project r_path r_role r_db file
+
+  while IFS= read -r project || [ -n "$project" ]; do
+    [ -n "$project" ] || continue
+    [ -d "$project" ] || continue
+    if ! claims="$(project_worktree_claims "$project")"; then
+      log_warn "Cannot read the worktrees of $project"
+      return 1
+    fi
+    if [ -n "$claims" ]; then
+      printf '%s\n' "$claims" | WF_EXCLUDED="$excluded" awk -F'\t' '$1 != ENVIRON["WF_EXCLUDED"] { print $2 }'
+    fi
+  done <<EOF_PROJECTS
+$projects
+EOF_PROJECTS
+
+  file="$(databases_file)"
+  if [ -f "$file" ]; then
+    while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+      [ -n "$r_db" ] || continue
+      [ "$r_path" = "$excluded" ] && continue
+      if [ -d "$r_path" ]; then
+        printf '%s\n' "$r_db"
+      fi
+    done < "$file"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup (drop databases for a specific worktree)
 # ---------------------------------------------------------------------------
 
@@ -1440,40 +1629,6 @@ EOF_MAINS
 # Prune
 # ---------------------------------------------------------------------------
 
-# Print the database names the active worktrees of a project own, one per line.
-# Each worktree produces two DBs: worktree_{branch}_{name} (dev) and
-# worktree_{branch}_{name}_test (test). We cannot strip _test to infer stems
-# because the worktree name itself may end with _test (e.g. wt-ragout-test).
-#
-# Returns 1 when the project cannot be inspected completely (the worktree list
-# fails, or the branch of a worktree that exists cannot be read). Callers must
-# not drop databases against an incomplete list. Paths come from the porcelain
-# output, so a path with spaces stays whole. A listed worktree whose directory
-# is gone is not active and contributes nothing.
-expected_worktree_databases() {
-  local project_dir="$1"
-  local listing wt_line wt_path wt_basename wt_branch
-
-  (cd "$project_dir" && is_git_repo) || return 0
-
-  listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
-
-  while IFS= read -r wt_line; do
-    case "$wt_line" in
-      "worktree "*) wt_path="${wt_line#worktree }" ;;
-      *) continue ;;
-    esac
-    [ -d "$wt_path" ] || continue
-    wt_basename="$(sanitize_name "$(basename "$wt_path")")"
-    wt_branch="$(cd "$wt_path" 2>/dev/null && sanitize_name "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)")" || return 1
-    [ -n "$wt_branch" ] || return 1
-    printf 'worktree_%s_%s\nworktree_%s_%s_test\n' \
-      "$wt_branch" "$wt_basename" "$wt_branch" "$wt_basename"
-  done <<EOF_LISTING
-$listing
-EOF_LISTING
-}
-
 prune_project() {
   local project_dir="${1:-.}"
 
@@ -1535,6 +1690,7 @@ EOF_ACTIVE
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
+    prune_database_records "$project_dir" ""
     return 0
   fi
 
@@ -1553,26 +1709,15 @@ EOF_ACTIVE
 
   # The current project may not be registered yet; registered projects whose
   # directory is gone contribute nothing.
+  # Recorded databases of a worktree that still exists are active too.
   local active_dbs
-  if ! active_dbs="$(expected_worktree_databases "$project_dir")"; then
-    log_warn "Cannot read the worktrees of $project_dir"
+  if ! active_dbs="$(claimed_databases "" "${project_dir}
+$(registered_project_list)")"; then
     log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
     return 0
   fi
   active_dbs="${active_dbs}
 "
-  local registered_project registered_dbs
-  while IFS= read -r registered_project || [ -n "$registered_project" ]; do
-    [ -z "$registered_project" ] && continue
-    [ -d "$registered_project" ] || continue
-    if ! registered_dbs="$(expected_worktree_databases "$registered_project")"; then
-      log_warn "Cannot read the worktrees of $registered_project"
-      log_warn "Skipping database prune: without them werksfeer cannot tell which databases are active"
-      return 0
-    fi
-    active_dbs="${active_dbs}${registered_dbs}
-"
-  done < "$reg"
 
   echo "$all_wt_dbs" | while IFS= read -r db; do
     [ -z "$db" ] && continue
@@ -1595,6 +1740,45 @@ EOF
       log_debug "Keeping active database: $db"
     fi
   done
+
+  prune_database_records "$project_dir" "$active_dbs"
+}
+
+# Forget the recorded databases of this project's worktrees that are gone,
+# once their databases are gone from the server (dropped, or kept because
+# another existing worktree claims them). A database that is still there and
+# unclaimed keeps its record so the next prune tries again.
+prune_database_records() {
+  local project_dir="$1"
+  local active_dbs="$2"
+  local file tmp server_dbs r_project r_path r_role r_db keep
+
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  if ! server_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null)"; then
+    log_warn "Cannot list the databases, keeping the database record"
+    return 0
+  fi
+  server_dbs="$(printf '%s\n' "$server_dbs" | awk '{print $1}')"
+
+  tmp="${file}.tmp.$$"
+  : > "$tmp"
+  while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+    [ -n "$r_db" ] || continue
+    keep=true
+    if [ "$r_project" = "$project_dir" ] && [ ! -d "$r_path" ]; then
+      if ! printf '%s\n' "$server_dbs" | grep -qxF "$(pg_identifier "$r_db")" ||
+          printf '%s\n' "$active_dbs" | grep -qxF "$(pg_identifier "$r_db")"; then
+        keep=false
+        log_debug "Forgetting $r_db (worktree: $r_path)"
+      fi
+    fi
+    if [ "$keep" = true ]; then
+      printf '%s\t%s\t%s\t%s\n' "$r_project" "$r_path" "$r_role" "$r_db" >> "$tmp"
+    fi
+  done < "$file"
+  mv "$tmp" "$file"
 }
 
 prune_current() {

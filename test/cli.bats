@@ -1136,7 +1136,8 @@ install_fake_pg() {
   PG_LOG="${TEST_ROOT}/pg.log"
   PG_DBS="${TEST_ROOT}/pg.dbs"
   PG_DOWN="${TEST_ROOT}/pg.down"
-  export PG_LOG PG_DBS PG_DOWN
+  PG_DROP_FAIL="${TEST_ROOT}/pg.dropfail"
+  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL
   mkdir -p "$FAKE_BIN"
   : > "$PG_LOG"
   printf '%s\n' example_dev example_test > "$PG_DBS"
@@ -1170,6 +1171,7 @@ EOF_PSQL
 #!/usr/bin/env bash
 printf 'dropdb PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
   "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
+[ -e "$PG_DROP_FAIL" ] && exit 1
 grep -vxF "${!#}" "$PG_DBS" > "${PG_DBS}.new" || true
 mv "${PG_DBS}.new" "$PG_DBS"
 EOF_DROPDB
@@ -1508,4 +1510,142 @@ EOF_GIT
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
   [[ "$output" == *"Cannot read the worktrees of ${MAIN_REPO}"* ]]
   grep -qF "$(printf '%s\t%s\t' "$MAIN_REPO" one)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+# ---------------------------------------------------------------------------
+# The record of databases werksfeer created
+# ---------------------------------------------------------------------------
+
+DB_RECORD() { echo "${XDG_DATA_HOME}/werksfeer/databases"; }
+
+# Appends one line to the database record: project, worktree, role, database.
+write_record() {
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$(DB_RECORD)"
+}
+
+@test "setup records the databases it created for the worktree" {
+  install_fake_pg
+  write_shared_config
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ -f "$(DB_RECORD)" ]
+  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_head_one)" "$(DB_RECORD)"
+  grep -qxF "$(printf '%s\t%s\ttest\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_head_one_test)" "$(DB_RECORD)"
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+  [ -z "$(ls "${XDG_DATA_HOME}/werksfeer" | grep '\.tmp')" ]
+}
+
+@test "setup records databases of a worktree whose path has a space" {
+  install_fake_pg
+  local spaced="${TEST_ROOT}/worktrees/my tree"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced" HEAD
+  write_shared_config
+  cp "${MAIN_REPO}/.worktree.toml" "${spaced}/.worktree.toml"
+
+  run_in_worktree "$spaced" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$spaced" worktree_head_my_tree)" "$(DB_RECORD)"
+}
+
+@test "setup does not record databases that were not created" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' unrelated > "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ ! -e "$(DB_RECORD)" ]
+}
+
+@test "running setup again keeps one record per worktree" {
+  install_fake_pg
+  write_shared_config
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+}
+
+@test "prune keeps recorded databases of a worktree that still exists" {
+  install_fake_pg
+  setup_second_project
+  printf '%s\n' example_dev custom_dev_for_one custom_test_for_one worktree_head_gone_a > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev custom_dev_for_one
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" test custom_test_for_one
+  printf '%s\n' worktree_custom_dev worktree_custom_test >> "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_TWO" dev worktree_custom_dev
+  write_record "$MAIN_REPO" "$WORKTREE_TWO" test worktree_custom_test
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_custom_dev "$PG_DBS"
+  grep -qxF worktree_custom_test "$PG_DBS"
+  run grep -E 'dropdb .*worktree_custom' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  grep -q 'dropdb .* --if-exists worktree_head_gone_a$' "$PG_LOG"
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 4 ]
+}
+
+@test "prune drops the recorded databases of a gone worktree and forgets them" {
+  install_fake_pg
+  setup_second_project
+  printf '%s\n' example_dev worktree_head_one worktree_head_one_test worktree_main_gone_wt worktree_main_gone_wt_test > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone wt" dev worktree_main_gone_wt
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone wt" test worktree_main_gone_wt_test
+  write_record "$OTHER_REPO" "$OTHER_WORKTREE" dev worktree_head_bone
+  printf '%s\n' worktree_head_bone >> "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  run grep -qE 'worktree_main_gone_wt' "$PG_DBS"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  grep -qF "$OTHER_WORKTREE" "$(DB_RECORD)"
+}
+
+@test "prune keeps the record of a gone worktree when its database cannot be dropped" {
+  install_fake_pg
+  setup_second_project
+  printf '%s\n' example_dev worktree_main_gone_wt > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_main_gone_wt
+  touch "$PG_DROP_FAIL"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Failed to drop worktree_main_gone_wt"* ]]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+}
+
+@test "prune never drops a database that an existing worktree also claims" {
+  install_fake_pg
+  setup_second_project
+  printf '%s\n' example_dev worktree_head_one worktree_head_one_test > "$PG_DBS"
+  # A worktree that is gone recorded the database an existing worktree uses by
+  # its 0.3.1 name (both had a worktree "one" on the same branch).
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone/one" dev worktree_head_one
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_head_one "$PG_DBS"
+  grep -qxF worktree_head_one_test "$PG_DBS"
+  [ ! -s "$(DB_RECORD)" ]
+}
+
+@test "prune leaves the record alone when the project cannot be inspected" {
+  install_fake_pg
+  setup_second_project
+  seed_two_project_server
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_head_gone_a
+  rm -f "${XDG_DATA_HOME}/werksfeer/projects"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Skipping database prune"* ]]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
 }
