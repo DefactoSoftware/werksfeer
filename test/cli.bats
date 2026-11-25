@@ -2441,17 +2441,17 @@ ${snippet}"
   mkdir -p "${TEST_ROOT}/lock"
   printf '%s\n' 4242 > "${TEST_ROOT}/lock/pid"
 
-  with_functions "state_lock_release state_lock_release_all" "WERKSFEER_LOCK_DEPTH=0; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all; state_lock_release"
+  with_functions "state_lock_release werksfeer_on_exit worktree_lock_release lock_drop" "WERKSFEER_WORKTREE_LOCK_DIR=; WERKSFEER_LOCK_DEPTH=0; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; werksfeer_on_exit; state_lock_release"
   [ "$status" -eq 0 ]
   [ -d "${TEST_ROOT}/lock" ]
 
   # Even with a depth left over, a lock owned by another process stays.
-  with_functions "state_lock_release state_lock_release_all" "WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all"
+  with_functions "state_lock_release werksfeer_on_exit worktree_lock_release lock_drop" "WERKSFEER_WORKTREE_LOCK_DIR=; WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; werksfeer_on_exit"
   [ "$status" -eq 0 ]
   [ -d "${TEST_ROOT}/lock" ]
 
   # Its own lock goes.
-  with_functions "state_lock_release state_lock_release_all" "printf '%s\n' \$\$ > '${TEST_ROOT}/lock/pid'; WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all"
+  with_functions "state_lock_release werksfeer_on_exit worktree_lock_release lock_drop" "WERKSFEER_WORKTREE_LOCK_DIR=; printf '%s\n' \$\$ > '${TEST_ROOT}/lock/pid'; WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; werksfeer_on_exit"
   [ "$status" -eq 0 ]
   [ ! -e "${TEST_ROOT}/lock" ]
 }
@@ -2982,4 +2982,119 @@ ${snippet}"
   with_functions "managed_env_assignments run_in_project_environment project_mise_bin project_asdf_bin" "cd '${TEST_ROOT}/proj'; PATH='${bin}'; run_in_project_environment sh -c 'echo \"\${DATABASE_NAME}:\${TEST_DATABASE_NAME}:\${PORT}:\${OUTSIDE:-unset}\"'"
   [ "$status" -eq 0 ]
   [ "$output" = "worktree_x:worktree_x_test:4001:unset" ]
+}
+
+# ---------------------------------------------------------------------------
+# Review round 6: exports, one setup per worktree, locks before lists
+# ---------------------------------------------------------------------------
+
+@test "the managed export wins, and outside the block the last export wins" {
+  printf 'export DATABASE_NAME="main_dev"\nexport DATABASE_NAME="later_dev"\n\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="worktree_x"\n# <<< werksfeer managed environment <<<\nexport TEST_DATABASE_NAME="a_test"\nexport TEST_DATABASE_NAME="b_test"\n' > "${TEST_ROOT}/envrc"
+
+  with_functions "env_export_value" "env_export_value '${TEST_ROOT}/envrc' DATABASE_NAME"
+  [ "$output" = "worktree_x" ]
+  with_functions "env_export_value" "env_export_value '${TEST_ROOT}/envrc' TEST_DATABASE_NAME"
+  [ "$output" = "b_test" ]
+  with_functions "env_export_value" "env_export_value '${TEST_ROOT}/envrc' MISSING"
+  [ -z "$output" ]
+}
+
+@test "an unreachable server keeps the managed database name, not a default exported before the block" {
+  install_fake_pg
+  write_shared_config
+  printf 'export DATABASE_NAME="example_development"\n\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="worktree_example_head_one"\n# <<< werksfeer managed environment <<<\n' > "${WORKTREE_ONE}/.envrc"
+  touch "$PG_DOWN"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run sed -n '/managed environment >>>/,/managed environment <<</p' "${WORKTREE_ONE}/.envrc"
+  [[ "$output" == *'export DATABASE_NAME="worktree_example_head_one"'* ]]
+  [[ "$output" != *'example_development'* ]]
+}
+
+# The lock directory werksfeer uses for a worktree path.
+worktree_lock_dir() {
+  local path key
+  path="$(cd "$1" && pwd -P)"
+  key="$(printf '%s' "$path" | sha256sum | cut -c1-24)"
+  echo "${XDG_DATA_HOME}/werksfeer/worktree-locks/${key}.lock"
+}
+
+@test "a second setup of the same worktree waits for the first and fails loudly after the timeout" {
+  install_fake_pg
+  write_shared_config
+  local lock
+  lock="$(worktree_lock_dir "$WORKTREE_ONE")"
+  mkdir -p "$lock"
+  sleep 30 &
+  local holder=$!
+  printf '%s\n' "$holder" > "${lock}/pid"
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_SETUP_LOCK_TIMEOUT=1 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not take the werksfeer lock"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+
+  # Another worktree is not held up by it.
+  run_in_worktree "$WORKTREE_TWO" env WERKSFEER_SETUP_LOCK_TIMEOUT=1 "$WERKSFEER"
+  kill "$holder" 2>/dev/null || true
+  [ "$status" -eq 0 ]
+}
+
+@test "two setups of the same worktree at the same time agree on one pair of databases" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  local i
+  for i in 1 2 3; do
+    rm -f "$(DB_RECORD)" "${WORKTREE_ONE}/.envrc"
+    printf '%s\n' example_dev example_test > "$PG_DBS"
+    (cd "$WORKTREE_ONE" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+    (cd "$WORKTREE_ONE" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+    wait
+    [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+    local dev
+    dev="$(recorded_database_of "$WORKTREE_ONE")"
+    grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+    grep -qxF "$dev" "$PG_DBS"
+    [ "$(grep -c '^worktree_' "$PG_DBS")" -eq 2 ]
+  done
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/state.lock" ]
+}
+
+# Puts a git in front that notes, for every "worktree list", whether the state
+# lock is held at that moment.
+install_lock_watching_git() {
+  local real_git
+  real_git="$(command -v git)"
+  cat > "${FAKE_BIN}/git" <<EOF_GIT
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "worktree list" ]; then
+  if [ -e "$XDG_DATA_HOME/werksfeer/state.lock" ]; then echo locked; else echo unlocked; fi >> "$TEST_ROOT/git.locks"
+fi
+exec "$real_git" "\$@"
+EOF_GIT
+  chmod +x "${FAKE_BIN}/git"
+}
+
+@test "prune takes the lock before it lists the worktrees for the allocations" {
+  install_fake_pg
+  write_shared_config
+  install_lock_watching_git
+  write_allocations "$MAIN_REPO" one 3001
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  # The first listing finds the main checkout, the second is the allocation prune.
+  [ "$(sed -n 2p "$TEST_ROOT/git.locks")" = "locked" ]
+}
+
+@test "cleanup looks at the worktrees under the lock that releases the allocation" {
+  install_fake_pg
+  write_shared_config
+  install_lock_watching_git
+  write_allocations "$MAIN_REPO" fix 3001
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  [ "$(sed -n 1p "$TEST_ROOT/git.locks")" = "locked" ]
 }
