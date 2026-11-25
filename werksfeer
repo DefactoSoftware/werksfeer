@@ -2224,6 +2224,8 @@ cleanup_worktree_databases() {
 
   if ! shared_pg_reachable; then
     log_warn "Skipping database cleanup"
+  # Looking at the worktrees and releasing the allocation are one step.
+  state_lock_acquire || return 1
     return 0
   fi
 
@@ -2233,6 +2235,7 @@ cleanup_worktree_databases() {
   # the record is read for the project whose configuration is loaded.
   local record_project="$project"
   [ -d "$worktree_path" ] && record_project=""
+  state_lock_release
 
   local recorded candidates="" from_record=false
   recorded="$(recorded_lines "$worktree_path" "$record_project")"
@@ -2452,7 +2455,6 @@ prune_project() {
 $listing
 EOF_ACTIVE
 
-      state_lock_acquire || return 1
       local tmp="${alloc}.tmp"
       while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
         if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
@@ -2476,6 +2478,9 @@ EOF_ACTIVE
   # Connection settings live in the project's configuration, which is not
   # loaded yet when pruning from outside a setup run (and differs per project
   # for --prune-all).
+    # The list of worktrees and the rewrite are one step: a setup that registers
+    # its allocation in between must not lose it.
+    state_lock_acquire || return 1
   load_main_configuration "$project_dir" || log_debug "No configuration loaded for $project_dir"
 
   if ! shared_pg_reachable; then
@@ -2498,6 +2503,7 @@ EOF_ACTIVE
     return 0
   fi
 
+      state_lock_release
   # A database is orphaned only when no registered project owns it: projects
   # can share one PostgreSQL server (or one local server), so the worktrees of
   # this project alone do not tell which databases are safe to drop. Without
