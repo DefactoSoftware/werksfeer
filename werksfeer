@@ -1770,8 +1770,18 @@ cleanup_worktree_databases() {
     fi
 
     if [ -n "$wt_branch" ]; then
-      candidates="$(pg_identifier "worktree_${wt_branch}_${wt_name}")
-$(pg_identifier "worktree_${wt_branch}_${wt_name}_test")"
+      # On a server shared with other machines an old name may be another
+      # machine's database: only the worktree's own environment can vouch.
+      if ! shared_server_is_remote || env_names_database "$worktree_path" DATABASE_NAME "worktree_${wt_branch}_${wt_name}"; then
+        candidates="$(pg_identifier "worktree_${wt_branch}_${wt_name}")
+"
+      fi
+      if ! shared_server_is_remote || env_names_database "$worktree_path" TEST_DATABASE_NAME "worktree_${wt_branch}_${wt_name}_test"; then
+        candidates="${candidates}$(pg_identifier "worktree_${wt_branch}_${wt_name}_test")
+"
+      fi
+    elif shared_server_is_remote; then
+      log_warn "Not dropping databases of $wt_name: it has no record on this machine and the server $(shared_server_host) may be used by other machines"
     elif [ -n "$wt_name" ]; then
       log_debug "No record and the worktree directory is gone, looking for databases ending with _${wt_name}"
       local all_wt_dbs recorded_dbs db
@@ -2014,7 +2024,20 @@ $(registered_project_list)")"; then
   active_dbs="${active_dbs}
 "
 
-  echo "$all_wt_dbs" | while IFS= read -r db; do
+  # On a server another machine may use, only databases this machine recorded
+  # for a worktree of this project that is gone can be dropped: a database
+  # without a record here may belong to a worktree on another machine.
+  local drop_candidates="$all_wt_dbs"
+  if shared_server_is_remote; then
+    drop_candidates="$(recorded_gone_databases "$project_dir" "$all_wt_dbs")"
+    local unrecorded
+    unrecorded="$(unrecorded_databases "$all_wt_dbs")"
+    if [ -n "$unrecorded" ]; then
+      log_info "$(printf '%s\n' "$unrecorded" | wc -l | tr -d ' ') worktree databases on $(shared_server_host) have no record on this machine and were left: another machine may use them"
+    fi
+  fi
+
+  printf '%s\n' "$drop_candidates" | while IFS= read -r db; do
     [ -z "$db" ] && continue
 
     local found=false
@@ -2037,6 +2060,46 @@ EOF
   done
 
   prune_database_records "$project_dir" "$active_dbs"
+}
+
+# Print the databases of $2 (one per line) that the record names for a worktree
+# of project $1 whose folder is gone.
+recorded_gone_databases() {
+  local project_dir="$1"
+  local listed="$2"
+  local file r_project r_path r_role r_db
+
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+  while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
+    [ -n "$r_db" ] || continue
+    [ "$r_project" = "$project_dir" ] || continue
+    [ ! -d "$r_path" ] || continue
+    if printf '%s\n' "$listed" | grep -qxF "$(pg_identifier "$r_db")"; then
+      pg_identifier "$r_db"
+      echo
+    fi
+  done < "$file"
+  return 0
+}
+
+# Print the databases of $1 (one per line) that no record line names.
+unrecorded_databases() {
+  local listed="$1"
+  local file recorded db
+
+  file="$(databases_file)"
+  recorded=""
+  [ -f "$file" ] && recorded="$(cut -f4 "$file")"
+  while IFS= read -r db; do
+    [ -n "$db" ] || continue
+    if ! printf '%s\n' "$recorded" | grep -qxF "$db"; then
+      printf '%s\n' "$db"
+    fi
+  done <<EOF_LISTED
+$listed
+EOF_LISTED
+  return 0
 }
 
 # Forget the recorded databases of this project's worktrees that are gone,

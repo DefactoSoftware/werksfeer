@@ -1235,6 +1235,8 @@ run_in_worktree() {
   install_fake_pg
   write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
   printf '%s\n' example_dev "worktree_head_one" "worktree_head_one_test" > "$PG_DBS"
+  # The server is remote: only a worktree's own environment vouches for old names.
+  printf 'export DATABASE_NAME="worktree_head_one"\nexport TEST_DATABASE_NAME="worktree_head_one_test"\n' > "${WORKTREE_ONE}/.envrc"
 
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
 
@@ -1250,6 +1252,8 @@ run_in_worktree() {
   printf '%s\n' example_dev "worktree_gone_branch_gone" > "$PG_DBS"
   mkdir -p "${XDG_DATA_HOME}/werksfeer"
   printf '%s\n' "$MAIN_REPO" > "${XDG_DATA_HOME}/werksfeer/projects"
+  # The server is remote: only databases recorded on this machine are dropped.
+  printf '%s\t%s\tdev\t%s\n' "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" worktree_gone_branch_gone > "${XDG_DATA_HOME}/werksfeer/databases"
 
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
   [ "$status" -eq 0 ]
@@ -1279,6 +1283,8 @@ run_in_worktree() {
   install_fake_pg
   write_shared_config 'host = "db.example"' 'user = "agent"' 'password = "file-pw"'
   printf '%s\n' example_dev "worktree_head_one" > "$PG_DBS"
+  # The server is remote: without a record nothing is dropped, so record it.
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev worktree_head_one
   git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
 
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
@@ -2056,4 +2062,175 @@ recorded_database_of() {
   run grep -q 'dropdb' "$PG_LOG"
   [ "$status" -eq 1 ]
   grep -qxF worktree_example_head_one "$PG_DBS"
+}
+
+# ---------------------------------------------------------------------------
+# A PostgreSQL server that other machines use too
+# ---------------------------------------------------------------------------
+
+@test "a server is remote unless it is local" {
+  local host
+  for host in "" "/var/run/postgresql" localhost LOCALHOST 127.0.0.1 ::1; do
+    write_shared_config ${host:+"host = \"$host\""}
+    run bash -c "unset PGHOST; cd \"$MAIN_REPO\" && source <(sed -n '/^shared_server_host()/,/^}/p;/^shared_server_is_remote()/,/^}/p' \"$WERKSFEER\") && toml_get() { [ \"\$2\" = host ] && echo \"$host\" || echo \"\$3\"; } && ! shared_server_is_remote"
+    [ "$status" -eq 0 ]
+  done
+  for host in db.example 10.0.0.5 pg.internal; do
+    run bash -c "unset PGHOST; source <(sed -n '/^shared_server_host()/,/^}/p;/^shared_server_is_remote()/,/^}/p' \"$WERKSFEER\") && toml_get() { [ \"\$2\" = host ] && echo \"$host\" || echo \"\$3\"; } && shared_server_is_remote"
+    [ "$status" -eq 0 ]
+  done
+  # Without [database] host, PGHOST decides.
+  run bash -c "source <(sed -n '/^shared_server_host()/,/^}/p;/^shared_server_is_remote()/,/^}/p' \"$WERKSFEER\") && toml_get() { echo \"\$3\"; } && PGHOST=db.example shared_server_is_remote"
+  [ "$status" -eq 0 ]
+  run bash -c "source <(sed -n '/^shared_server_host()/,/^}/p;/^shared_server_is_remote()/,/^}/p' \"$WERKSFEER\") && toml_get() { echo \"\$3\"; } && PGHOST=/tmp shared_server_is_remote"
+  [ "$status" -eq 1 ]
+}
+
+@test "prune on a remote server drops only recorded databases of gone worktrees" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  setup_second_project
+  printf '%s\n' example_dev worktree_example_head_one worktree_example_head_gone \
+    worktree_other_machine_head_x worktree_other_machine_head_y_test > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev worktree_example_head_one
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_example_head_gone
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_example_head_one worktree_other_machine_head_x worktree_other_machine_head_y_test)" ]
+  [[ "$output" == *"2 worktree databases on db.example have no record on this machine and were left: another machine may use them"* ]]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+}
+
+@test "prune drops a recorded database only on the server of its own project" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  setup_second_project
+  printf '%s\n' example_dev worktree_other_head_gone > "$PG_DBS"
+  write_record "$OTHER_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_other_head_gone
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_other_head_gone "$PG_DBS"
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+}
+
+@test "prune on a local server still drops every unclaimed worktree database" {
+  install_fake_pg
+  write_shared_config 'host = "localhost"'
+  setup_second_project
+  printf '%s\n' example_dev worktree_example_head_one worktree_nobody_head_x > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev worktree_example_head_one
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_example_head_one)" ]
+  [[ "$output" != *"were left"* ]]
+}
+
+@test "prune-all on a remote server keeps unrecorded databases too" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  setup_second_project
+  printf '[database]\nbase_name = "other"\nhost = "db.example"\n' > "${OTHER_REPO}/.worktree.toml"
+  seed_two_project_server
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_head_gone_a
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --prune-all
+  [ "$status" -eq 0 ]
+  run grep -qxF worktree_head_gone_a "$PG_DBS"
+  [ "$status" -eq 1 ]
+  grep -qxF worktree_head_gone_b "$PG_DBS"
+  grep -qxF worktree_head_gone_a_test "$PG_DBS"
+}
+
+@test "cleanup without a record on a remote server needs the environment file to name the databases" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  printf '%s\n' example_dev worktree_head_one worktree_head_one_test > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 3 ]
+
+  # Only the development database is vouched for by the environment.
+  printf 'export DATABASE_NAME="worktree_head_one"\n' > "${WORKTREE_TWO}/.envrc"
+  printf '%s\n' example_dev worktree_head_two worktree_head_two_test > "$PG_DBS"
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_TWO"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 3 ]
+}
+
+@test "cleanup of a gone worktree without a record drops nothing on a remote server" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  printf '%s\n' example_dev worktree_head_one worktree_head_one_test > "$PG_DBS"
+  git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no record on this machine"* ]]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "two machines with the same paths get different hashed database names" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  git -C "$WORKTREE_ONE" checkout -q -b "$LONG_BRANCH"
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_MACHINE_ID=machine-a XDG_DATA_HOME="${TEST_ROOT}/xdg-a" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_MACHINE_ID=machine-b XDG_DATA_HOME="${TEST_ROOT}/xdg-b" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local a b
+  a="$(awk -F'\t' '$3 == "dev" { print $4 }' "${TEST_ROOT}/xdg-a/werksfeer/databases")"
+  b="$(awk -F'\t' '$3 == "dev" { print $4 }' "${TEST_ROOT}/xdg-b/werksfeer/databases")"
+  [ -n "$a" ]
+  [ -n "$b" ]
+  [ "$a" != "$b" ]
+  grep -qxF "$a" "$PG_DBS"
+  grep -qxF "$b" "$PG_DBS"
+}
+
+@test "the same machine derives the same hashed name every time" {
+  install_fake_pg
+  write_shared_config
+  git -C "$WORKTREE_ONE" checkout -q -b "$LONG_BRANCH"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_MACHINE_ID=machine-a "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local first
+  first="$(recorded_database_of "$WORKTREE_ONE")"
+  rm -f "$(DB_RECORD)"
+  : > "$PG_LOG"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_MACHINE_ID=machine-a "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(recorded_database_of "$WORKTREE_ONE")" = "$first" ]
+}
+
+@test "a readable database name without a record is not reused" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  printf '%s\n' example_dev example_test worktree_example_head_one worktree_example_head_one_test > "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local dev
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  [ "$dev" != "worktree_example_head_one" ]
+  [[ "$dev" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  grep -q "CREATE DATABASE \"${dev}\" WITH TEMPLATE \"example_dev\"" "$PG_LOG"
+  grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+  [ "$(grep -c '^worktree_example_head_one$' "$PG_DBS")" -eq 1 ]
+}
+
+@test "on a remote server an allocation alone does not adopt an old database name" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  printf '%s\n' example_dev example_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+  write_allocations "$MAIN_REPO" one 3001
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
 }
