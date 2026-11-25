@@ -780,6 +780,104 @@ get_base_db_names() {
   echo "${project_name}${dev_suffix}" "${project_name}${test_suffix}"
 }
 
+# The database names of a worktree start with "worktree_", then the project
+# (the name of the main checkout), the branch and the worktree folder. PostgreSQL
+# cuts identifiers at 63 bytes without an error, and the test database adds
+# "_test", so a readable name over 58 bytes is cut to 47 bytes and ends with a
+# short hash of the project path and worktree path: "..._<10 hex digits>". That
+# stays unique and stable. Printing a name with "hash" as $5 forces that form,
+# which is what a name already taken by another worktree falls back to.
+new_database_stem() {
+  local project_path="$1"
+  local worktree_path="$2"
+  local branch="$3"
+  local folder="$4"
+  local force_hash="${5:-}"
+  local readable hash prefix
+
+  readable="worktree_$(sanitize_name "$(basename "$project_path")")_$(sanitize_name "$branch")_$(sanitize_name "$folder")"
+  readable="$(printf '%s' "$readable" | sed 's/__*/_/g')"
+  if [ "$force_hash" != "hash" ] && [ "${#readable}" -le 58 ]; then
+    printf '%s\n' "$readable"
+    return 0
+  fi
+
+  hash="$(printf '%s\t%s' "$project_path" "$worktree_path" | werksfeer_sha256 | cut -c1-10)" || return 1
+  prefix="$(printf '%s' "$readable" | cut -c1-47)"
+  while [ "${prefix%_}" != "$prefix" ]; do
+    prefix="${prefix%_}"
+  done
+  printf '%s_%s\n' "$prefix" "$hash"
+}
+
+# Returns 0 when an existing worktree other than the one at path $2 uses (or a
+# record of any other worktree names) database $1, or when that cannot be told.
+database_used_by_other_worktree() {
+  local database="$1"
+  local worktree_path="$2"
+  local project="$3"
+  local file claimed
+
+  file="$(databases_file)"
+  if [ -f "$file" ] && WF_DB="$(pg_identifier "$database")" WF_WORKTREE="$worktree_path" \
+      awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"; then
+    return 0
+  fi
+
+  claimed="$(claimed_databases "$worktree_path" "${project}
+$(registered_project_list)")" || return 0
+  printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$database")"
+}
+
+# Pick the database name of one role ("dev" or "test") for a worktree.
+#
+# 1. The name in the record: keep using it.
+# 2. A name of 0.3.1 and earlier (worktree_<branch>_<folder>) that this
+#    worktree was set up with, so running werksfeer again keeps its databases.
+#    It must exist, the worktree's own environment file must name it (or the
+#    worktree has an allocation and no other worktree uses it), because two
+#    projects could hold the same old name.
+# 3. The new name with the project in it.
+choose_database_name() {
+  local role="$1"
+  local project_path="$2"
+  local worktree_path="$3"
+  local branch="$4"
+  local folder="$5"
+  local suffix="" variable="DATABASE_NAME"
+  if [ "$role" = "test" ]; then
+    suffix="_test"
+    variable="TEST_DATABASE_NAME"
+  fi
+
+  local name
+  name="$(recorded_database "$worktree_path" "$role" "$project_path")"
+  if [ -n "$name" ]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+
+  local legacy
+  legacy="worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")${suffix}"
+  name="$(pg_identifier "$legacy")"
+  if db_exists "$name" &&
+      { [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; }; then
+    if grep -qxF "export ${variable}=\"${legacy}\"" "${worktree_path}/.envrc" 2>/dev/null ||
+        { [ -n "$(lookup_allocation "$project_path" "$folder")" ] &&
+          ! database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; }; then
+      log_info "Keeping the existing database $name for this worktree"
+      printf '%s\n' "$name"
+      return 0
+    fi
+  fi
+
+  name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
+  if db_exists "$name" && database_used_by_other_worktree "$name" "$worktree_path" "$project_path"; then
+    name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
+  fi
+  printf '%s\n' "$name"
+}
+
 clone_databases() {
   local project_type="$1"
 
@@ -803,12 +901,16 @@ clone_databases() {
     return 0
   fi
 
-  local wt_name wt_branch
-  wt_name="$(sanitize_name "$(get_worktree_name)")"
-  wt_branch="$(sanitize_name "$(get_worktree_branch)")"
+  local record_project record_worktree
+  record_project="$(get_main_worktree_path)"
+  record_worktree="$(pwd -P)"
 
-  NEW_DEV_DB="worktree_${wt_branch}_${wt_name}"
-  NEW_TEST_DB="worktree_${wt_branch}_${wt_name}_test"
+  NEW_DEV_DB="$(choose_database_name dev "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
+  NEW_TEST_DB="$(choose_database_name test "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
+  # Two names that end up as the same database would share its data.
+  if [ "$(pg_identifier "$NEW_TEST_DB")" = "$(pg_identifier "$NEW_DEV_DB")" ]; then
+    NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)" hash)_test"
+  fi
 
   # Clone dev database
   if db_exists "$NEW_DEV_DB"; then
@@ -838,9 +940,6 @@ clone_databases() {
 
   # Record what this worktree uses, so cleanup and prune go by the record.
   # Databases that already existed are adopted into the record too.
-  local record_project record_worktree
-  record_project="$(get_main_worktree_path)"
-  record_worktree="$(pwd -P)"
   if db_exists "$NEW_DEV_DB"; then
     record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
   fi
@@ -1409,7 +1508,8 @@ registered_project_list() {
 
 # Print "worktree_path<TAB>database" for the databases each existing worktree
 # of a project (a main checkout) claims: the ones recorded for it, and the
-# names it would have by the naming of 0.3.1 and earlier. We cannot strip
+# names it would have by the naming of 0.3.1 and earlier and by the current
+# naming. We cannot strip
 # _test to infer stems because the worktree name itself may end with _test
 # (e.g. wt-ragout-test).
 #
@@ -1420,7 +1520,7 @@ registered_project_list() {
 # is gone claims nothing.
 project_worktree_claims() {
   local project_dir="$1"
-  local listing wt_line wt_path wt_basename wt_branch recorded_line
+  local listing wt_line wt_path wt_basename wt_branch recorded_line new_stem
 
   (cd "$project_dir" && is_git_repo) || return 0
 
@@ -1439,6 +1539,12 @@ project_worktree_claims() {
     printf '%s\t%s\n' \
       "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}")" \
       "$wt_path" "$(pg_identifier "worktree_${wt_branch}_${wt_basename}_test")"
+
+    # The name this version would give it, in case its record is lost.
+    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename")" || return 1
+    printf '%s\t%s\n' \
+      "$wt_path" "$new_stem" \
+      "$wt_path" "${new_stem}_test"
 
     while IFS= read -r recorded_line; do
       [ -n "$recorded_line" ] || continue

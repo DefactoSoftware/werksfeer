@@ -1162,7 +1162,8 @@ case "$*" in
   *-lqt*) sed 's/$/ | owner | UTF8/' "$PG_DBS" ;;
   *"CREATE DATABASE"*)
     name="$(printf '%s' "$*" | sed 's/.*CREATE DATABASE "\([^"]*\)".*/\1/')"
-    printf '%s\n' "$name" >> "$PG_DBS" ;;
+    # A real server cuts identifiers at 63 bytes without an error.
+    printf '%s\n' "$name" | LC_ALL=C cut -c1-63 >> "$PG_DBS" ;;
 esac
 exit 0
 EOF_PSQL
@@ -1172,7 +1173,7 @@ EOF_PSQL
 printf 'dropdb PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
   "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
 [ -e "$PG_DROP_FAIL" ] && exit 1
-grep -vxF "${!#}" "$PG_DBS" > "${PG_DBS}.new" || true
+grep -vxF "$(printf '%s' "${!#}" | LC_ALL=C cut -c1-63)" "$PG_DBS" > "${PG_DBS}.new" || true
 mv "${PG_DBS}.new" "$PG_DBS"
 EOF_DROPDB
 
@@ -1262,15 +1263,15 @@ run_in_worktree() {
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -q 'worktree_head_one$' "$PG_DBS"
+  grep -q 'worktree_example_head_one$' "$PG_DBS"
   git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
   [ ! -d "$WORKTREE_ONE" ]
   : > "$PG_LOG"
 
   run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
   [ "$status" -eq 0 ]
-  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_head_one$' "$PG_LOG"
-  grep -q 'dropdb .* --if-exists worktree_head_one_test$' "$PG_LOG"
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_example_head_one$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_example_head_one_test$' "$PG_LOG"
   [ "$(cat "$PG_DBS")" = "$(printf 'example_dev\nexample_test')" ]
 }
 
@@ -1531,8 +1532,8 @@ write_record() {
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
   [ -f "$(DB_RECORD)" ]
-  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_head_one)" "$(DB_RECORD)"
-  grep -qxF "$(printf '%s\t%s\ttest\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_head_one_test)" "$(DB_RECORD)"
+  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_example_head_one)" "$(DB_RECORD)"
+  grep -qxF "$(printf '%s\t%s\ttest\t%s' "$MAIN_REPO" "$WORKTREE_ONE" worktree_example_head_one_test)" "$(DB_RECORD)"
   [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
   [ -z "$(ls "${XDG_DATA_HOME}/werksfeer" | grep '\.tmp')" ]
 }
@@ -1546,7 +1547,7 @@ write_record() {
 
   run_in_worktree "$spaced" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$spaced" worktree_head_my_tree)" "$(DB_RECORD)"
+  grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$spaced" worktree_example_head_my_tree)" "$(DB_RECORD)"
 }
 
 @test "setup does not record databases that were not created" {
@@ -1763,12 +1764,12 @@ write_allocations() {
   cp "${MAIN_REPO}/.worktree.toml" "${spaced}/.worktree.toml"
   run_in_worktree "$spaced" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -qxF worktree_head_my_tree "$PG_DBS"
+  grep -qxF worktree_example_head_my_tree "$PG_DBS"
   git -C "$MAIN_REPO" worktree remove --force "$spaced"
 
   run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$spaced"
   [ "$status" -eq 0 ]
-  run grep -q 'worktree_head_my_tree' "$PG_DBS"
+  run grep -q 'worktree_example_head_my_tree' "$PG_DBS"
   [ "$status" -eq 1 ]
   [ ! -s "$(DB_RECORD)" ]
 }
@@ -1848,4 +1849,211 @@ EOF_GIT
   [ "$status" -eq 0 ]
   [[ "$output" == *"werksfeer --prune"* ]]
   grep -qxF worktree_head_fix "$PG_DBS"
+}
+
+# ---------------------------------------------------------------------------
+# Database names carry the project
+# ---------------------------------------------------------------------------
+
+# Gives the second project a shared-server configuration and a worktree named
+# like the first project's "one", and seeds the server with both templates.
+prepare_two_projects_with_one() {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  cat > "${OTHER_REPO}/.worktree.toml" <<'EOF_OTHER'
+[cache]
+auto_warm = false
+
+[setup]
+command = "true"
+
+[database]
+base_name = "other"
+EOF_OTHER
+  git -C "$OTHER_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "${TEST_ROOT}/other-trees/one" HEAD
+  cp "${OTHER_REPO}/.worktree.toml" "${TEST_ROOT}/other-trees/one/.worktree.toml"
+  printf '%s\n' example_dev example_test other_dev other_test > "$PG_DBS"
+}
+
+LONG_BRANCH="feature/this-is-a-very-long-branch-name-to-overflow-the-identifier-limit"
+
+@test "two projects with the same branch and worktree name get different databases" {
+  prepare_two_projects_with_one
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "${TEST_ROOT}/other-trees/one" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev example_test other_dev other_test \
+    worktree_example_head_one worktree_example_head_one_test \
+    worktree_other_head_one worktree_other_head_one_test)" ]
+  grep -q 'CREATE DATABASE "worktree_other_head_one" WITH TEMPLATE "other_dev"' "$PG_LOG"
+  grep -q 'DATABASE_NAME="worktree_other_head_one"' "${TEST_ROOT}/other-trees/one/.envrc"
+  grep -q 'DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a database name another worktree already uses is never taken over" {
+  prepare_two_projects_with_one
+  # Same project name, branch and folder name in a different folder: the readable
+  # name is the same, so the second worktree must get another one.
+  local twin="${TEST_ROOT}/elsewhere/example/one"
+  mkdir -p "$(dirname "$twin")"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$twin" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${twin}/.worktree.toml"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$twin" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^worktree_' "$PG_DBS")" -eq 4 ]
+  [ "$(recorded_database_of "$twin")" != "worktree_example_head_one" ]
+  [ "$(recorded_database_of "$WORKTREE_ONE")" = "worktree_example_head_one" ]
+  [ "$(recorded_database_of "$twin" | wc -c)" -le 64 ]
+}
+
+# Prints the recorded dev database of a worktree path.
+recorded_database_of() {
+  awk -F'\t' -v wt="$1" '$2 == wt && $3 == "dev" { print $4 }' "$(DB_RECORD)"
+}
+
+@test "a worktree set up by 0.3.1 keeps its databases when setup runs again" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev example_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+  # What 0.3.1 left in the worktree: the managed environment block.
+  printf '\n# >>> werksfeer managed environment >>>\nexport PORT="3001"\nexport DATABASE_NAME="worktree_head_one"\nexport TEST_DATABASE_NAME="worktree_head_one_test"\n# <<< werksfeer managed environment <<<\n' > "${WORKTREE_ONE}/.envrc"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 4 ]
+  grep -q 'export DATABASE_NAME="worktree_head_one"' "${WORKTREE_ONE}/.envrc"
+  grep -q 'export TEST_DATABASE_NAME="worktree_head_one_test"' "${WORKTREE_ONE}/.envrc"
+  grep -qxF "$(printf '%s\t%s\tdev\tworktree_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  grep -qxF "$(printf '%s\t%s\ttest\tworktree_head_one_test' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+
+  # And again, now by the record.
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 4 ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+}
+
+@test "a worktree set up by 0.3.1 is found by its allocation when its environment file is gone" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev example_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+  write_allocations "$MAIN_REPO" one 3001
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  grep -q 'export DATABASE_NAME="worktree_head_one"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "an old database name from another project is not adopted by a new worktree" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev example_test worktree_head_one worktree_head_one_test > "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'CREATE DATABASE "worktree_example_head_one" WITH TEMPLATE "example_dev"' "$PG_LOG"
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  grep -qxF worktree_head_one "$PG_DBS"
+}
+
+@test "an old database that another existing worktree uses is not adopted through an allocation" {
+  prepare_two_projects_with_one
+  printf '%s\n' worktree_head_one worktree_head_one_test >> "$PG_DBS"
+  write_allocations "$MAIN_REPO" one 3001
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a database name over 63 bytes is shortened with a hash and stays stable" {
+  install_fake_pg
+  write_shared_config
+  git -C "$WORKTREE_ONE" checkout -q -b "$LONG_BRANCH"
+  git -C "$WORKTREE_TWO" checkout -q -b "${LONG_BRANCH}-two"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local dev test_db
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  test_db="$(awk -F'\t' -v wt="$WORKTREE_ONE" '$2 == wt && $3 == "test" { print $4 }' "$(DB_RECORD)")"
+  [ "${#dev}" -le 58 ]
+  [ "${#test_db}" -le 63 ]
+  [ "$test_db" = "${dev}_test" ]
+  [[ "$dev" =~ ^worktree_example_feature_this_is_a_very_long_.*_[0-9a-f]{10}$ ]]
+  grep -qxF "$dev" "$PG_DBS"
+  grep -qxF "$test_db" "$PG_DBS"
+  grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+
+  # Stable: a second run finds the same databases instead of cloning again.
+  : > "$PG_LOG"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Database $dev already exists, skipping"* ]]
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+
+  # Unique: a worktree whose branch only differs at the end gets another name.
+  run_in_worktree "$WORKTREE_TWO" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(recorded_database_of "$WORKTREE_TWO")" != "$dev" ]
+  [ "$(grep -c '^worktree_' "$PG_DBS")" -eq 4 ]
+
+  # Cleanup drops exactly what was recorded.
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  run grep -qxF "$dev" "$PG_DBS"
+  [ "$status" -eq 1 ]
+  [ "$(grep -c '^worktree_' "$PG_DBS")" -eq 2 ]
+}
+
+@test "a 0.3.1 database whose name the server cut at 63 bytes is adopted and kept by prune" {
+  install_fake_pg
+  write_shared_config
+  git -C "$WORKTREE_ONE" checkout -q -b "$LONG_BRANCH"
+  local old_dev="worktree_feature_this_is_a_very_long_branch_name_to_overflow_the_identifier_limit_one"
+  local cut_dev cut_test
+  cut_dev="$(printf '%s' "$old_dev" | cut -c1-63)"
+  cut_test="$(printf '%s' "${old_dev}_test" | cut -c1-63)"
+  [ "$cut_dev" = "$cut_test" ]
+  printf '%s\n' example_dev example_test "$cut_dev" > "$PG_DBS"
+  printf '\n# >>> werksfeer managed environment >>>\nexport DATABASE_NAME="%s"\nexport TEST_DATABASE_NAME="%s_test"\n# <<< werksfeer managed environment <<<\n' "$old_dev" "$old_dev" > "${WORKTREE_ONE}/.envrc"
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  printf '%s\n' "$MAIN_REPO" > "${XDG_DATA_HOME}/werksfeer/projects"
+
+  # Without a run in between, prune must not drop the cut name.
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF "$cut_dev" "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(recorded_database_of "$WORKTREE_ONE")" = "$cut_dev" ]
+  # The test database cannot be the old one (the server cut it to the same
+  # name as the development database), so it gets a new name.
+  [ "$(awk -F'\t' -v wt="$WORKTREE_ONE" '$2 == wt && $3 == "test" { print $4 }' "$(DB_RECORD)")" != "$cut_dev" ]
+  grep -qxF "$cut_dev" "$PG_DBS"
+}
+
+@test "a private PostgreSQL cluster writes no record and cleanup leaves the shared server alone" {
+  install_fake_pg
+  # The default fixture enables the private cluster.
+  printf '%s\n' example_dev worktree_example_head_one > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ ! -e "$(DB_RECORD)" ]
+  run grep -q 'dropdb' "$PG_LOG"
+  [ "$status" -eq 1 ]
+  grep -qxF worktree_example_head_one "$PG_DBS"
 }
