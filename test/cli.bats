@@ -2197,11 +2197,11 @@ recorded_database_of() {
   [ "$(wc -l < "$PG_DBS")" -eq 3 ]
 
   # Only the development database is vouched for by the environment.
-  printf 'export DATABASE_NAME="worktree_head_one"\n' > "${WORKTREE_TWO}/.envrc"
+  printf 'export DATABASE_NAME="worktree_head_two"\n' > "${WORKTREE_TWO}/.envrc"
   printf '%s\n' example_dev worktree_head_two worktree_head_two_test > "$PG_DBS"
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_TWO"
   [ "$status" -eq 0 ]
-  [ "$(wc -l < "$PG_DBS")" -eq 3 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev worktree_head_two_test)" ]
 }
 
 @test "cleanup of a gone worktree without a record drops nothing on a remote server" {
