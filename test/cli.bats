@@ -1137,7 +1137,9 @@ install_fake_pg() {
   PG_DBS="${TEST_ROOT}/pg.dbs"
   PG_DOWN="${TEST_ROOT}/pg.down"
   PG_DROP_FAIL="${TEST_ROOT}/pg.dropfail"
-  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL
+  PG_LIST_FAIL="${TEST_ROOT}/pg.listfail"
+  PG_CREATE_RACE="${TEST_ROOT}/pg.createrace"
+  export PG_LOG PG_DBS PG_DOWN PG_DROP_FAIL PG_LIST_FAIL PG_CREATE_RACE
   mkdir -p "$FAKE_BIN"
   : > "$PG_LOG"
   printf '%s\n' example_dev example_test > "$PG_DBS"
@@ -1159,9 +1161,20 @@ esac
 printf 'psql PGHOST=%s PGPORT=%s PGUSER=%s PGPASSWORD=%s %s\n' \
   "${PGHOST-<unset>}" "${PGPORT-<unset>}" "${PGUSER-<unset>}" "${PGPASSWORD-<unset>}" "$*" >> "$PG_LOG"
 case "$*" in
-  *-lqt*) sed 's/$/ | owner | UTF8/' "$PG_DBS" ;;
+  *-lqt*)
+    # Only the catalog listing fails, the way a dropped connection would.
+    [ -e "$PG_LIST_FAIL" ] && exit 2
+    sed 's/$/ | owner | UTF8/' "$PG_DBS" ;;
   *"CREATE DATABASE"*)
     name="$(printf '%s' "$*" | sed 's/.*CREATE DATABASE "\([^"]*\)".*/\1/')"
+    # Another machine creates the database between the check and the CREATE.
+    # The file holds a glob for the names it wins.
+    if [ -e "$PG_CREATE_RACE" ] && [[ "$name" == $(cat "$PG_CREATE_RACE") ]]; then
+      printf '%s\n' "$name" >> "$PG_DBS"
+      rm -f "$PG_CREATE_RACE"
+      printf 'ERROR:  database "%s" already exists\n' "$name" >&2
+      exit 1
+    fi
     # A real server cuts identifiers at 63 bytes without an error.
     printf '%s\n' "$name" | LC_ALL=C cut -c1-63 >> "$PG_DBS" ;;
 esac
@@ -1194,8 +1207,8 @@ run_in_worktree() {
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -q 'psql PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=s3cret-pw .*CREATE DATABASE "worktree_.*_one" WITH TEMPLATE "example_dev"' "$PG_LOG"
-  grep -q 'CREATE DATABASE "worktree_.*_one_test" WITH TEMPLATE "example_test"' "$PG_LOG"
+  grep -q 'psql PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=s3cret-pw .*CREATE DATABASE "worktree_.*_one_[0-9a-f]\{10\}" WITH TEMPLATE "example_dev"' "$PG_LOG"
+  grep -q 'CREATE DATABASE "worktree_.*_one_[0-9a-f]\{10\}_test" WITH TEMPLATE "example_test"' "$PG_LOG"
   run grep -qv 'PGHOST=db.example PGPORT=5433 PGUSER=agent PGPASSWORD=s3cret-pw' "$PG_LOG"
   [ "$status" -eq 1 ]
 }
@@ -1267,15 +1280,16 @@ run_in_worktree() {
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -q 'worktree_example_head_one$' "$PG_DBS"
+  # A remote server: the machine-specific name from the start.
+  grep -q 'worktree_example_head_one_[0-9a-f]\{10\}$' "$PG_DBS"
   git -C "$MAIN_REPO" worktree remove --force "$WORKTREE_ONE"
   [ ! -d "$WORKTREE_ONE" ]
   : > "$PG_LOG"
 
   run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
   [ "$status" -eq 0 ]
-  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_example_head_one$' "$PG_LOG"
-  grep -q 'dropdb .* --if-exists worktree_example_head_one_test$' "$PG_LOG"
+  grep -q 'dropdb PGHOST=db.example PGPORT=<unset> PGUSER=agent PGPASSWORD=file-pw --if-exists worktree_example_head_one_[0-9a-f]\{10\}$' "$PG_LOG"
+  grep -q 'dropdb .* --if-exists worktree_example_head_one_[0-9a-f]\{10\}_test$' "$PG_LOG"
   [ "$(cat "$PG_DBS")" = "$(printf 'example_dev\nexample_test')" ]
 }
 
@@ -2232,7 +2246,7 @@ recorded_database_of() {
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  grep -q 'export DATABASE_NAME="worktree_example_head_one_[0-9a-f]\{10\}"' "${WORKTREE_ONE}/.envrc"
 }
 
 # ---------------------------------------------------------------------------
@@ -2370,4 +2384,256 @@ recorded_database_of() {
   [ "$(wc -l < "${XDG_DATA_HOME}/werksfeer/allocations")" -eq 1 ]
   grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
   [[ "$output" != *"$OTHER_REPO"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Review round 2: locks, endpoints, races, canonical paths, failed catalog reads
+# ---------------------------------------------------------------------------
+
+# Runs a snippet with the named functions of werksfeer loaded and nothing else.
+with_functions() {
+  local names="$1" snippet="$2" script=""
+  local name
+  for name in $names; do
+    script="${script}$(sed -n "/^${name}() {/,/^}/p" "$WERKSFEER")
+"
+  done
+  run bash -c "set -euo pipefail; log_info() { :; }; log_warn() { :; }; log_error() { :; }; ${script}
+${snippet}"
+}
+
+@test "a process that holds no lock never removes one" {
+  mkdir -p "${TEST_ROOT}/lock"
+  printf '%s\n' 4242 > "${TEST_ROOT}/lock/pid"
+
+  with_functions "state_lock_release state_lock_release_all" "WERKSFEER_LOCK_DEPTH=0; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all; state_lock_release"
+  [ "$status" -eq 0 ]
+  [ -d "${TEST_ROOT}/lock" ]
+
+  # Even with a depth left over, a lock owned by another process stays.
+  with_functions "state_lock_release state_lock_release_all" "WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all"
+  [ "$status" -eq 0 ]
+  [ -d "${TEST_ROOT}/lock" ]
+
+  # Its own lock goes.
+  with_functions "state_lock_release state_lock_release_all" "printf '%s\n' \$\$ > '${TEST_ROOT}/lock/pid'; WERKSFEER_LOCK_DEPTH=1; WERKSFEER_LOCK_DIR='${TEST_ROOT}/lock'; state_lock_release_all"
+  [ "$status" -eq 0 ]
+  [ ! -e "${TEST_ROOT}/lock" ]
+}
+
+@test "everything that can redirect the connection counts, and what cannot be classified is remote" {
+  local snippet='toml_get() { echo "${TOML_HOST:-}"; }; shared_server_is_remote'
+  local fns="shared_server_host shared_server_is_remote"
+
+  with_functions "$fns" "unset PGHOST PGHOSTADDR PGSERVICE; $snippet"
+  [ "$status" -eq 1 ]
+  with_functions "$fns" "unset PGHOST PGSERVICE; PGHOSTADDR=10.1.2.3; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGSERVICE; PGHOST=localhost; PGHOSTADDR=10.1.2.3; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGHOST PGSERVICE; PGHOSTADDR=127.0.0.1; $snippet"
+  [ "$status" -eq 1 ]
+  with_functions "$fns" "unset PGHOST PGHOSTADDR; PGSERVICE=prod; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGHOSTADDR PGSERVICE; PGHOST=localhost,db.example; $snippet"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "unset PGHOSTADDR PGSERVICE; PGHOST=/var/run/postgresql; $snippet"
+  [ "$status" -eq 1 ]
+  with_functions "$fns" "unset PGHOST PGHOSTADDR PGSERVICE; TOML_HOST=db.example; $snippet"
+  [ "$status" -eq 0 ]
+}
+
+@test "prune leaves unrecorded databases alone when PGHOSTADDR points to another machine" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev worktree_nobody_head_x > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" env PGHOSTADDR=10.9.8.7 "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_nobody_head_x "$PG_DBS"
+  [[ "$output" == *"1 worktree databases on 10.9.8.7 have no record on this machine"* ]]
+}
+
+@test "a service can redirect the connection, so a database server behind one counts as remote" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev worktree_nobody_head_x > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" env PGSERVICE=prod "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_nobody_head_x "$PG_DBS"
+}
+
+@test "on a remote server even a free readable name gets the machine-specific name" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$(recorded_database_of "$WORKTREE_ONE")" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  run grep -qxF worktree_example_head_one "$PG_DBS"
+  [ "$status" -eq 1 ]
+}
+
+@test "a CREATE DATABASE that loses the race never leaves this worktree using the winner's database" {
+  install_fake_pg
+  write_shared_config
+  printf '%s' 'worktree_example_head_one' > "$PG_CREATE_RACE"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"was created by someone else in the meantime"* ]]
+  local dev
+  dev="$(recorded_database_of "$WORKTREE_ONE")"
+  [[ "$dev" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  grep -q "export DATABASE_NAME=\"${dev}\"" "${WORKTREE_ONE}/.envrc"
+  grep -qxF "$dev" "$PG_DBS"
+  # The other database is still there and not recorded for this worktree.
+  grep -qxF worktree_example_head_one "$PG_DBS"
+  run grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+}
+
+@test "when the machine-specific name is taken in a race too, no database is used or recorded" {
+  install_fake_pg
+  write_shared_config 'host = "db.example"'
+  printf '%s' 'worktree_example_head_one_*' > "$PG_CREATE_RACE"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"exists and is not this worktree's"* ]]
+  run grep -q 'export DATABASE_NAME=' "${WORKTREE_ONE}/.envrc"
+  [ "$status" -eq 1 ]
+  run grep -qF "$(printf '\tdev\t')" "$(DB_RECORD)"
+  [ "$status" -eq 1 ]
+}
+
+@test "cleanup resolves symbolic links before it applies .." {
+  install_fake_pg
+  write_shared_config
+  local root
+  root="$(cd "$TEST_ROOT" && pwd -P)"
+  mkdir -p "${root}/srv/nested"
+  ln -s "${root}/srv/nested" "${root}/link"
+  printf '%s\n' example_dev db_target db_other > "$PG_DBS"
+  write_record "$MAIN_REPO" "${root}/srv/fix" dev db_target
+  write_record "$MAIN_REPO" "${root}/fix" dev db_other
+
+  run_in_worktree "$root" "$WERKSFEER" --cleanup "${root}/link/../fix"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "$(printf '%s\n' example_dev db_other)" ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  grep -qF "${root}/fix" "$(DB_RECORD)"
+}
+
+@test "a database that an existing worktree still exports is claimed without a record" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev worktree_old_branch_one worktree_nobody_head_x > "$PG_DBS"
+  # After a branch switch the environment still names the old database.
+  printf 'export DATABASE_NAME="worktree_old_branch_one"\n' > "${WORKTREE_ONE}/.envrc"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_old_branch_one "$PG_DBS"
+  run grep -qxF worktree_nobody_head_x "$PG_DBS"
+  [ "$status" -eq 1 ]
+}
+
+@test "cleanup keeps a recorded database that another worktree's environment exports" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev shared_db > "$PG_DBS"
+  printf 'export TEST_DATABASE_NAME="shared_db"\n' > "${WORKTREE_TWO}/.envrc"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev shared_db
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/gone"
+  [ "$status" -eq 0 ]
+  grep -qxF shared_db "$PG_DBS"
+}
+
+@test "db_exists tells a failed question from a no" {
+  local fns="db_exists list_server_databases pg_identifier"
+  with_functions "$fns" "shared_pg() { printf ' present | owner\n other | owner\n'; }; db_exists present"
+  [ "$status" -eq 0 ]
+  with_functions "$fns" "shared_pg() { printf ' present | owner\n'; }; db_exists absent"
+  [ "$status" -eq 1 ]
+  with_functions "$fns" "shared_pg() { return 2; }; set +e; db_exists present; echo \$?"
+  [ "$output" = "2" ]
+}
+
+@test "cleanup keeps the record when the databases cannot be listed" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev custom_gone > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev custom_gone
+  touch "$PG_LIST_FAIL"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/gone"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot tell whether custom_gone exists"* ]]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "prune skips and keeps the record when the databases cannot be listed" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev custom_gone > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev custom_gone
+  touch "$PG_LIST_FAIL"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot list the databases"* ]]
+  [[ "$output" == *"Skipping database prune"* ]]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+}
+
+@test "setup does not clone or record anything when the databases cannot be listed" {
+  install_fake_pg
+  write_shared_config
+  touch "$PG_LIST_FAIL"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot list the databases"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "a registered project that git cannot read keeps every database alive" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  seed_two_project_server
+  printf 'garbage\n' > "${OTHER_REPO}/.git/HEAD"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Cannot read the worktrees of ${OTHER_REPO}"* ]]
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+  [ "$(wc -l < "$PG_DBS")" -eq 9 ]
+}
+
+@test "cleanup keeps an allocation when the project of the worktree cannot be read" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  write_allocations "$OTHER_REPO" fix 3001
+  write_record "$OTHER_REPO" "${TEST_ROOT}/worktrees/gone/fix" dev some_db
+  printf '%s\n' example_dev some_db > "$PG_DBS"
+  printf 'garbage\n' > "${OTHER_REPO}/.git/HEAD"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/gone/fix"
+  [ "$status" -eq 0 ]
+  grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
 }

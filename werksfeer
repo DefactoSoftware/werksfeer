@@ -814,14 +814,22 @@ shared_pg_reachable() {
 # PGHOST, else empty (the default local socket).
 shared_server_host() {
   local host
-  host="$(toml_get "database" "host" "")"
+  # A service file can set any host and wins over the environment.
+  if [ -n "${PGSERVICE:-}" ]; then
+    printf 'PGSERVICE=%s\n' "$PGSERVICE"
+    return 0
+  fi
+  # PGHOSTADDR is the address libpq connects to when it is set.
+  host="${PGHOSTADDR:-}"
+  [ -n "$host" ] || host="$(toml_get "database" "host" "")"
   [ -n "$host" ] || host="${PGHOST:-}"
   printf '%s\n' "$host"
 }
 
 # Returns 0 when the shared server is on another machine, so that other
 # machines may have worktrees there that this machine knows nothing about.
-# Local: no host, a socket directory, localhost, 127.0.0.1 or ::1.
+# Local: no host, a socket directory, localhost, 127.0.0.1 or ::1. A service,
+# a list of hosts or anything else that cannot be classified counts as remote.
 shared_server_is_remote() {
   local host
   host="$(shared_server_host | tr '[:upper:]' '[:lower:]')"
@@ -831,9 +839,22 @@ shared_server_is_remote() {
   return 0
 }
 
+# Print the names of the databases on the shared server. Fails when the server
+# cannot be asked: "could not ask" is never "does not exist".
+list_server_databases() {
+  local output
+  output="$(shared_pg psql -d postgres -lqt 2>/dev/null)" || return 1
+  printf '%s\n' "$output" | awk 'NF { print $1 }'
+}
+
+# Returns 0 when the database exists, 1 when the server says it does not, and 2
+# when the server could not be asked. Callers that remove a record or drop a
+# database must tell 1 from 2.
 db_exists() {
+  local listing
+  listing="$(list_server_databases)" || return 2
   # The server cuts names at 63 bytes, so that is the name it lists.
-  shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep -qxF "$(pg_identifier "$1")"
+  printf '%s\n' "$listing" | grep -qxF "$(pg_identifier "$1")"
 }
 
 get_base_db_names() {
@@ -936,6 +957,16 @@ $(registered_project_list)")" || return 0
   printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$database")"
 }
 
+# Print the database names the managed environment of a worktree exports as
+# DATABASE_NAME and TEST_DATABASE_NAME, as the server lists them.
+worktree_env_databases() {
+  [ -f "${1}/.envrc" ] || return 0
+  sed -n \
+    -e 's/^export DATABASE_NAME="\(.*\)"$/\1/p' \
+    -e 's/^export TEST_DATABASE_NAME="\(.*\)"$/\1/p' "${1}/.envrc" |
+    LC_ALL=C cut -c1-63
+}
+
 # Returns 0 when the managed environment of the worktree sets $2 to $3.
 env_names_database() {
   grep -qxF "export ${2}=\"${3}\"" "${1}/.envrc" 2>/dev/null
@@ -957,16 +988,6 @@ choose_database_name() {
   local worktree_path="$3"
   local branch="$4"
   local folder="$5"
-# Print the database names the managed environment of a worktree exports as
-# DATABASE_NAME and TEST_DATABASE_NAME, as the server lists them.
-worktree_env_databases() {
-  [ -f "${1}/.envrc" ] || return 0
-  sed -n \
-    -e 's/^export DATABASE_NAME="\(.*\)"$/\1/p' \
-    -e 's/^export TEST_DATABASE_NAME="\(.*\)"$/\1/p' "${1}/.envrc" |
-    LC_ALL=C cut -c1-63
-}
-
   local suffix="" variable="DATABASE_NAME"
   if [ "$role" = "test" ]; then
     suffix="_test"
@@ -1000,10 +1021,63 @@ worktree_env_databases() {
   # Without a record, a database with the readable name is not ours: another
   # worktree or another machine made it, or it is a leftover. Never reuse it.
   name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
-  if db_exists "$name" || database_recorded_for_other_worktree "$name" "$worktree_path"; then
+  # On a server other machines use, two of them can see the same readable name
+  # as free at the same time, so the machine-specific name is used from the
+  # start there.
+  if shared_server_is_remote || db_exists "$name" || database_recorded_for_other_worktree "$name" "$worktree_path"; then
     name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
   fi
   printf '%s\n' "$name"
+}
+
+# Clone one database from its template and print the name to use ("" when there
+# is none). The name was reserved in the record. When the server says the name
+# exists already although it looked free (another machine or setup created it
+# in between), that database is not ours: take the machine-specific name once,
+# and if that is taken too, use no database.
+clone_one_database() {
+  local role="$1" base="$2" name="$3" project="$4" worktree="$5" branch="$6" folder="$7"
+  local suffix="" attempt status hashed clone_error
+  [ "$role" = "test" ] && suffix="_test"
+
+  for attempt in 1 2; do
+    if db_exists "$name"; then
+      log_info "Database $name already exists, skipping" >&2
+      printf '%s\n' "$name"
+      return 0
+    elif ! db_exists "$base"; then
+      log_warn "Template database $base not found, skipping $role DB clone" >&2
+      printf '%s\n' "$name"
+      return 0
+    fi
+
+    log_info "Cloning $base -> $name" >&2
+    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    status=0
+    clone_error="$(shared_pg psql -d postgres -q -c "CREATE DATABASE \"${name}\" WITH TEMPLATE \"${base}\";" 2>&1 >/dev/null)" || status=$?
+    if [ "$status" -eq 0 ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    printf '%s\n' "$clone_error" >&2
+
+    case "$clone_error" in
+      *"already exists"*)
+        hashed="$(new_database_stem "$project" "$worktree" "$branch" "$folder" hash)${suffix}"
+        if [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
+          log_warn "Database $name was created by someone else in the meantime, using $hashed" >&2
+          name="$hashed"
+          record_database "$project" "$worktree" "$role" "$name"
+          continue
+        fi
+        log_error "Database $name exists and is not this worktree's, not using it" >&2
+        return 0
+        ;;
+    esac
+    log_error "Failed to clone $base -> $name" >&2
+    printf '%s\n' "$name"
+    return 0
+  done
 }
 
 clone_databases() {
@@ -1029,56 +1103,47 @@ clone_databases() {
     return 0
   fi
 
-  local record_project record_worktree
+  # Every catalog check below relies on being able to list the databases.
+  if ! list_server_databases > /dev/null; then
+    log_warn "Cannot list the databases on the PostgreSQL server, skipping database cloning"
+    return 0
+  fi
+
+  local record_project record_worktree clone_branch clone_folder
   record_project="$(get_main_worktree_path)"
   record_worktree="$(pwd -P)"
+  clone_branch="$(get_worktree_branch)"
+  clone_folder="$(get_worktree_name)"
 
   # Choosing a name and reserving it in the record is one step under the lock:
   # another setup that picks next sees the record and takes a different name.
   # The lock is not held while the databases are cloned, which can take long.
   state_lock_acquire || return 1
-  NEW_DEV_DB="$(choose_database_name dev "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
-  NEW_TEST_DB="$(choose_database_name test "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
+  NEW_DEV_DB="$(choose_database_name dev "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
+  NEW_TEST_DB="$(choose_database_name test "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
   # Two names that end up as the same database would share its data.
   if [ "$(pg_identifier "$NEW_TEST_DB")" = "$(pg_identifier "$NEW_DEV_DB")" ]; then
-    NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)" hash)_test"
+    NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$clone_branch" "$clone_folder" hash)_test"
   fi
   record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
   record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
   state_lock_release
 
-  # Clone dev database
-  if db_exists "$NEW_DEV_DB"; then
-    log_info "Database $NEW_DEV_DB already exists, skipping"
-  elif ! db_exists "$base_dev"; then
-    log_warn "Template database $base_dev not found, skipping dev DB clone"
-  else
-    log_info "Cloning $base_dev -> $NEW_DEV_DB"
-    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_dev}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_DEV_DB}\" WITH TEMPLATE \"${base_dev}\";"; then
-      log_error "Failed to clone $base_dev -> $NEW_DEV_DB"
-    fi
-  fi
+  NEW_DEV_DB="$(clone_one_database dev "$base_dev" "$NEW_DEV_DB" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
+  NEW_TEST_DB="$(clone_one_database test "$base_test" "$NEW_TEST_DB" "$record_project" "$record_worktree" "$clone_branch" "$clone_folder")"
 
-  # Clone test database
-  if db_exists "$NEW_TEST_DB"; then
-    log_info "Database $NEW_TEST_DB already exists, skipping"
-  elif ! db_exists "$base_test"; then
-    log_warn "Template database $base_test not found, skipping test DB clone"
-  else
-    log_info "Cloning $base_test -> $NEW_TEST_DB"
-    shared_pg psql -d postgres -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${base_test}' AND pid <> pg_backend_pid();" 2>/dev/null || true
-    if ! shared_pg psql -d postgres -q -c "CREATE DATABASE \"${NEW_TEST_DB}\" WITH TEMPLATE \"${base_test}\";"; then
-      log_error "Failed to clone $base_test -> $NEW_TEST_DB"
-    fi
-  fi
-
-  # The names were reserved in the record above. A database that does not exist
-  # (no template, or the clone failed) leaves no record behind.
-  if ! db_exists "$NEW_DEV_DB"; then
+  # The names were reserved in the record above. A database that the server
+  # says does not exist (no template, or the clone failed) leaves no record
+  # behind. When the server cannot be asked, the record stays.
+  local state
+  state=0
+  [ -z "$NEW_DEV_DB" ] || db_exists "$NEW_DEV_DB" || state=$?
+  if [ -z "$NEW_DEV_DB" ] || [ "$state" -eq 1 ]; then
     unrecord_database "$record_project" "$record_worktree" dev
   fi
-  if ! db_exists "$NEW_TEST_DB"; then
+  state=0
+  [ -z "$NEW_TEST_DB" ] || db_exists "$NEW_TEST_DB" || state=$?
+  if [ -z "$NEW_TEST_DB" ] || [ "$state" -eq 1 ]; then
     unrecord_database "$record_project" "$record_worktree" test
   fi
 }
@@ -1643,8 +1708,8 @@ forget_worktree_databases() {
 }
 
 # Resolve a path the way git reports worktrees: absolute, symlinks resolved in
-# the part that exists, no trailing slash. Components that are already gone are
-# kept as given.
+# the part that exists (before any ".." is applied), no trailing slash.
+# Components that are already gone are kept as given.
 normalize_path() {
   local path="$1" cur component missing=0
 
@@ -1744,6 +1809,15 @@ project_worktree_claims() {
       "$wt_path" "$new_stem" \
       "$wt_path" "${new_stem}_test"
 
+    # What the worktree's own environment exports: after a branch switch it can
+    # still name a database that no name rule or record gives it any more.
+    while IFS= read -r env_db; do
+      [ -n "$env_db" ] || continue
+      printf '%s\t%s\n' "$wt_path" "$env_db"
+    done <<EOF_ENV
+$(worktree_env_databases "$wt_path")
+EOF_ENV
+
     while IFS= read -r recorded_line; do
       [ -n "$recorded_line" ] || continue
       printf '%s\t%s\n' "$wt_path" "$(printf '%s' "$recorded_line" | cut -f4)"
@@ -1809,15 +1883,6 @@ allocation_projects_for_worktree() {
 }
 
 # Load the project configuration (including the main checkout's
-    # What the worktree's own environment exports: after a branch switch it can
-    # still name a database that no name rule or record gives it any more.
-    while IFS= read -r env_db; do
-      [ -n "$env_db" ] || continue
-      printf '%s\t%s\n' "$wt_path" "$env_db"
-    done <<EOF_ENV
-$(worktree_env_databases "$wt_path")
-EOF_ENV
-
 # .worktree.local.toml) from a main checkout, starting from a clean slate.
 load_main_configuration() {
   local main_path="$1"
@@ -1954,7 +2019,11 @@ cleanup_worktree_databases() {
     elif [ -n "$wt_name" ]; then
       log_debug "No record and the worktree directory is gone, looking for databases ending with _${wt_name}"
       local all_wt_dbs recorded_dbs db
-      all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+      if ! all_wt_dbs="$(list_server_databases)"; then
+        log_warn "Cannot list the databases on the PostgreSQL server, skipping database cleanup"
+        return 0
+      fi
+      all_wt_dbs="$(printf '%s\n' "$all_wt_dbs" | grep '^worktree_' || true)"
       recorded_dbs=""
       [ -f "$(databases_file)" ] && recorded_dbs="$(cut -f4 "$(databases_file)")"
       while IFS= read -r db; do
@@ -1998,10 +2067,18 @@ $(registered_project_list)")"; then
     [ -n "$db" ] || continue
     if printf '%s\n' "$claimed" | grep -qxF "$(pg_identifier "$db")"; then
       log_info "Keeping $db: another worktree uses it"
-    elif db_exists "$db"; then
-      log_info "Dropping $db"
-      if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
-        log_warn "Failed to drop $db"
+    else
+      local exists=0
+      db_exists "$db" || exists=$?
+      if [ "$exists" -eq 0 ]; then
+        log_info "Dropping $db"
+        if ! shared_pg dropdb --if-exists "$db" 2>/dev/null; then
+          log_warn "Failed to drop $db"
+          failed=true
+        fi
+      elif [ "$exists" -eq 2 ]; then
+        # Could not ask is not the same as gone: keep the record.
+        log_warn "Cannot tell whether $db exists"
         failed=true
       fi
     fi
@@ -2162,7 +2239,12 @@ EOF_ACTIVE
 
   # Get all worktree_* databases
   local all_wt_dbs
-  all_wt_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null | awk '{print $1}' | grep '^worktree_' || true)"
+  if ! all_wt_dbs="$(list_server_databases)"; then
+    log_warn "Cannot list the databases on the PostgreSQL server"
+    log_warn "Skipping database prune"
+    return 0
+  fi
+  all_wt_dbs="$(printf '%s\n' "$all_wt_dbs" | grep '^worktree_' || true)"
 
   if [ -z "$all_wt_dbs" ]; then
     log_info "No worktree databases found"
@@ -2285,11 +2367,10 @@ prune_database_records() {
   file="$(databases_file)"
   [ -f "$file" ] || return 0
 
-  if ! server_dbs="$(shared_pg psql -d postgres -lqt 2>/dev/null)"; then
+  if ! server_dbs="$(list_server_databases)"; then
     log_warn "Cannot list the databases, keeping the database record"
     return 0
   fi
-  server_dbs="$(printf '%s\n' "$server_dbs" | awk '{print $1}')"
 
   state_lock_acquire || return 1
   tmp="${file}.tmp.$$"
