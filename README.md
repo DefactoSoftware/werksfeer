@@ -43,7 +43,7 @@ wt switch -c my-feature
 [werksfeer] ==> Setting up worktree
 [werksfeer] Copied .env
 [werksfeer] Symlinked node_modules -> /path/to/main/node_modules
-[werksfeer] Cloning myapp_development -> worktree_feature_branch_my_feature
+[werksfeer] Cloning myapp_development -> worktree_myapp_feature_branch_my_feature
 [werksfeer] ==> Worktree setup complete!
 ```
 
@@ -261,7 +261,7 @@ If your agent supports post-worktree hooks or setup scripts, point them at `werk
 
 ### Cleanup on worktree removal
 
-When a worktree is removed, `--cleanup` drops its cloned databases and releases its port/redis allocations. You can run this manually from inside a worktree before deleting it, or pass a path.
+When a worktree is removed, `--cleanup` drops the databases werksfeer recorded for it and releases its port/redis allocation. You can run this manually from inside a worktree before deleting it, or pass a path. It works the same when the folder is already gone; see [Database names and the record](#database-names-and-the-record).
 
 Most tools either lack removal hooks entirely (Cursor, Codex, Claude Desktop) or don't fire them reliably (Claude Code CLI). Use `werksfeer --prune` periodically to clean up orphaned databases and stale allocations from deleted worktrees — this is the most reliable approach.
 
@@ -568,6 +568,23 @@ when the worktree directory is already gone.
 Werksfeer checks the connection once before it clones, cleans up or prunes. If
 the server cannot be reached, it warns with the first line of the `psql` error
 and skips the database part. The rest of the run goes on.
+
+## Database names and the record
+
+On a shared server each worktree gets two databases, cloned from the project's development and test databases. They are named `worktree_<project>_<branch>_<folder>` and the same with `_test`. `<project>` is the folder name of the main checkout and `<folder>` the folder name of the worktree, each lowercase with other characters turned into `_`. PostgreSQL cuts names at 63 bytes without an error. Werksfeer shortens a name longer than 58 bytes to 47 bytes and ends it with a ten-character hash of the project and worktree paths, for example `worktree_myapp_feature_a_very_long_branch_3f9a1c07de`. The name is the same on every run.
+
+Werksfeer records every database it creates or finds for a worktree in `~/.local/share/werksfeer/databases`, next to the `allocations` and `projects` files. It has one tab-separated line per database: the main checkout path, the worktree path, `dev` or `test`, and the database name. `--cleanup` and `--prune` go by this record, never by how a name ends.
+
+- `--cleanup <path>` drops exactly the databases recorded for that worktree path, whether or not the folder still exists, and removes that worktree's lines from the record. A database that another existing worktree also uses stays. The port/redis allocation is released only in the worktree's own project, and only when that project has no other worktree of the same name.
+- `--prune` counts the recorded databases of a worktree that still exists as active. It drops those of worktrees that are gone and removes their records. As before, it drops nothing when a project cannot be inspected or the registry is missing.
+
+### Worktrees set up before 0.4.0
+
+Before 0.4.0 the names had no project (`worktree_<branch>_<folder>`) and nothing was recorded. A worktree set up that way keeps working without changes. Running `werksfeer` in it again keeps using its databases and adds them to the record, as long as its `.envrc` names those databases, or the worktree has an allocation and no other worktree uses those databases.
+
+`--cleanup` on a worktree without a record drops the two databases with the old names while the folder exists. Once the folder is gone, it drops only databases that end in the worktree name and that no existing worktree of any registered project uses. When it cannot tell whether an existing worktree still uses them, it drops nothing and leaves the databases for `werksfeer --prune`.
+
+Two repositories with a worktree of the same branch and folder name shared one database before 0.4.0: the second `werksfeer` run found the database and silently used it. Werksfeer does not try to repair this. It never drops such a database while either worktree exists. A new worktree no longer shares a database that way, because its database names include the project.
 
 ## Pruning orphaned databases
 
