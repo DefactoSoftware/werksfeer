@@ -269,12 +269,17 @@ state_lock_release() {
   [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ] || return 0
   WERKSFEER_LOCK_DEPTH=$(( WERKSFEER_LOCK_DEPTH - 1 ))
   if [ "$WERKSFEER_LOCK_DEPTH" -eq 0 ]; then
-    rm -f "${WERKSFEER_LOCK_DIR}/pid"
-    rmdir "$WERKSFEER_LOCK_DIR" 2>/dev/null || true
+    # Only a lock this process owns is removed.
+    if [ "$(cat "${WERKSFEER_LOCK_DIR}/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "${WERKSFEER_LOCK_DIR}/pid"
+      rmdir "$WERKSFEER_LOCK_DIR" 2>/dev/null || true
+    fi
   fi
 }
 
+# The EXIT trap: release only when this process still holds the lock.
 state_lock_release_all() {
+  [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ] || return 0
   WERKSFEER_LOCK_DEPTH=1
   state_lock_release
 }
