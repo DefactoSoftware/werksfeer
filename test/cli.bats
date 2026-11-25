@@ -1468,3 +1468,44 @@ EOF_GIT
   [ "$status" -eq 1 ]
   [ "$(wc -l < "$PG_DBS")" -eq 9 ]
 }
+
+@test "prune keeps the allocation of a worktree whose path has a space" {
+  install_fake_pg
+  setup_second_project
+  local spaced="${TEST_ROOT}/worktrees/my tree"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$spaced" HEAD
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$MAIN_REPO" "my tree" 3001 1 6380 \
+    "$MAIN_REPO" "gone" 3002 2 6381 \
+    "$OTHER_REPO" "gone" 3003 1 6382 > "${XDG_DATA_HOME}/werksfeer/allocations"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qF "$(printf '%s\t%s\t%s\t%s\t%s' "$MAIN_REPO" "my tree" 3001 1 6380)" "${XDG_DATA_HOME}/werksfeer/allocations"
+  run grep -F "$(printf '%s\t%s\t' "$MAIN_REPO" gone)" "${XDG_DATA_HOME}/werksfeer/allocations"
+  [ "$status" -eq 1 ]
+  grep -qF "$(printf '%s\t%s\t%s\t%s\t%s' "$OTHER_REPO" gone 3003 1 6382)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+@test "prune keeps every allocation when the worktree list cannot be read" {
+  install_fake_pg
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$MAIN_REPO" "one" 3001 1 6380 > "${XDG_DATA_HOME}/werksfeer/allocations"
+  local real_git
+  real_git="$(command -v git)"
+  cat > "${FAKE_BIN}/git" <<EOF_GIT
+#!/usr/bin/env bash
+# The first call finds the main checkout; the listing that follows fails.
+if [ "\$1 \$2" = "worktree list" ] && [ -e "$TEST_ROOT/git.first" ]; then
+  echo "fatal: worktree metadata unreadable" >&2
+  exit 128
+fi
+[ "\$1 \$2" = "worktree list" ] && : > "$TEST_ROOT/git.first"
+exec "$real_git" "\$@"
+EOF_GIT
+  chmod +x "${FAKE_BIN}/git"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [[ "$output" == *"Cannot read the worktrees of ${MAIN_REPO}"* ]]
+  grep -qF "$(printf '%s\t%s\t' "$MAIN_REPO" one)" "${XDG_DATA_HOME}/werksfeer/allocations"
+}

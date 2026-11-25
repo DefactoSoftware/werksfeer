@@ -1486,23 +1486,32 @@ prune_project() {
   local alloc
   alloc="$(allocations_file)"
   if [ -f "$alloc" ]; then
-    local active_wt_names=""
-    while IFS= read -r wt_line; do
-      local wt_path
-      wt_path="$(echo "$wt_line" | awk '{print $1}')"
-      active_wt_names="${active_wt_names}$(basename "$wt_path")
-"
-    done < <(cd "$project_dir" && git worktree list 2>/dev/null)
+    # Paths come from the porcelain output, so a path with spaces stays whole.
+    # When the list cannot be read, no allocation is released: an empty list
+    # would make every worktree of the project look gone.
+    local listing active_wt_names="" wt_line
+    if listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)"; then
+      while IFS= read -r wt_line; do
+        case "$wt_line" in
+          "worktree "*) active_wt_names="${active_wt_names}$(basename "${wt_line#worktree }")
+" ;;
+        esac
+      done <<EOF_ACTIVE
+$listing
+EOF_ACTIVE
 
-    local tmp="${alloc}.tmp"
-    while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
-      if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
-        log_info "Released allocation: port=$a_port redis_db=$a_redis (worktree: $a_wt)"
-      else
-        printf '%s\t%s\t%s\t%s\n' "$a_project" "$a_wt" "$a_port" "$a_redis"
-      fi
-    done < "$alloc" > "$tmp"
-    mv "$tmp" "$alloc"
+      local tmp="${alloc}.tmp"
+      while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
+        if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
+          log_info "Released allocation: port=$a_port redis_db=$a_redis (worktree: $a_wt)"
+        else
+          printf '%s\t%s\t%s\t%s\n' "$a_project" "$a_wt" "$a_port" "$a_redis"
+        fi
+      done < "$alloc" > "$tmp"
+      mv "$tmp" "$alloc"
+    else
+      log_warn "Cannot read the worktrees of $project_dir, keeping its port/redis allocations"
+    fi
   fi
 
   if ! has_psql; then
