@@ -1599,14 +1599,19 @@ write_record() {
   grep -qxF "$(printf '%s\t%s\tdev\t%s' "$MAIN_REPO" "$spaced" worktree_example_head_my_tree)" "$(DB_RECORD)"
 }
 
-@test "setup does not record databases that were not created" {
+@test "setup records and exports the names of databases that do not exist yet" {
   install_fake_pg
   write_shared_config
   printf '%s\n' unrelated > "$PG_DBS"
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
-  [ ! -e "$(DB_RECORD)" ]
+  # The project's own tools create them later under these names.
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+  grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  run grep -q 'CREATE DATABASE' "$PG_LOG"
+  [ "$status" -eq 1 ]
 }
 
 @test "running setup again keeps one record per worktree" {
@@ -2810,7 +2815,7 @@ ${snippet}"
   grep -q 'VERBOSITY=verbose' "$PG_LOG"
 }
 
-@test "a failed CREATE that left no database is not recorded, and one that left a database is not claimed" {
+@test "a failed CREATE that left no database keeps its name reserved, and one that left a database is not claimed" {
   install_fake_pg
   write_shared_config
   printf '%s' 'worktree_example_head_one' > "$PG_CREATE_FAIL"
@@ -2818,8 +2823,8 @@ ${snippet}"
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -eq 0 ]
   [[ "$output" == *"Failed to clone example_dev -> worktree_example_head_one"* ]]
-  run grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
-  [ "$status" -eq 1 ]
+  grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
 
   # The server did create it before the error came back: not ours to claim.
   rm -f "$(DB_RECORD)" "${WORKTREE_ONE}/.envrc"
@@ -2877,12 +2882,11 @@ ${snippet}"
   grep -qxF worktree_example_head_one "$PG_DBS"
   grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
   grep -qxF "$(printf '%s\t%s\tdev\tworktree_example_head_one' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
-  # The test database was never created, so it has no record.
-  run grep -q "$(printf '\ttest\t')" "$(DB_RECORD)"
-  [ "$status" -eq 1 ]
+  # The test name is exported too, so it is recorded although nothing created it.
+  grep -qxF "$(printf '%s\t%s\ttest\tworktree_example_head_one_test' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
 }
 
-@test "a setup that fails after reserving a name for a database that does not exist leaves no reservation" {
+@test "a setup that fails after its names were exported keeps them recorded" {
   install_fake_pg
   write_shared_config
   printf '%s\n' unrelated > "$PG_DBS"
@@ -2890,7 +2894,9 @@ ${snippet}"
 
   run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
   [ "$status" -ne 0 ]
-  [ ! -e "$(DB_RECORD)" ]
+  # Exported implies recorded, whether or not the database exists.
+  grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
 }
 
 @test "an unreachable server keeps the database variables a worktree already exports" {
@@ -2903,4 +2909,77 @@ ${snippet}"
   [ "$status" -eq 0 ]
   grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
   grep -q 'export TEST_DATABASE_NAME="worktree_example_head_one_test"' "${WORKTREE_ONE}/.envrc"
+}
+
+# ---------------------------------------------------------------------------
+# Review round 5: what is exported is recorded
+# ---------------------------------------------------------------------------
+
+@test "a missing test database keeps its exported name reserved until the project creates it" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev > "$PG_DBS"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -qxF worktree_example_head_one "$PG_DBS"
+  run grep -qxF worktree_example_head_one_test "$PG_DBS"
+  [ "$status" -eq 1 ]
+  grep -q 'export TEST_DATABASE_NAME="worktree_example_head_one_test"' "${WORKTREE_ONE}/.envrc"
+  grep -qxF "$(printf '%s\t%s\ttest\tworktree_example_head_one_test' "$MAIN_REPO" "$WORKTREE_ONE")" "$(DB_RECORD)"
+
+  # The project's own test alias creates it under the exported name.
+  PATH="$FAKE_BIN:$PATH" createdb worktree_example_head_one_test
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  grep -q 'export TEST_DATABASE_NAME="worktree_example_head_one_test"' "${WORKTREE_ONE}/.envrc"
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 2 ]
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "example_dev" ]
+  [ ! -s "$(DB_RECORD)" ]
+}
+
+@test "a recorded name whose database does not exist is not an error for cleanup or prune" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  printf '%s\n' example_dev > "$PG_DBS"
+  write_record "$MAIN_REPO" "$WORKTREE_ONE" dev worktree_example_head_one
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/gone" dev worktree_example_head_gone
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 1 ]
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "$WORKTREE_ONE"
+  [ "$status" -eq 0 ]
+  [ ! -s "$(DB_RECORD)" ]
+  [[ "$output" != *"WARNING"* ]]
+}
+
+@test "a fallback reservation is taken back when the server cannot be asked about the fallback" {
+  install_fake_pg
+  write_shared_config
+  printf '%s' 'worktree_example_head_one' > "$PG_CREATE_RACE"
+  # Calls: preflight, name checks for both roles (4), dev clone (2), then the fallback check fails.
+  printf '7' > "$PG_LIST_FAIL_AFTER"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [ ! -s "$(DB_RECORD)" ] || ! grep -q "$(printf '\tdev\t')" "$(DB_RECORD)"
+  [ ! -e "${WORKTREE_ONE}/.envrc" ] || ! grep -q 'DATABASE_NAME' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "the managed variables reach a command without direnv" {
+  local bin="${TEST_ROOT}/minbin" tool
+  mkdir -p "$bin" "${TEST_ROOT}/proj"
+  for tool in env sed head cat git dirname basename awk tr sh bash; do
+    ln -s "$(command -v "$tool")" "${bin}/${tool}"
+  done
+  printf 'export OUTSIDE="no"\n\n# >>> werksfeer managed environment >>>\nexport PORT="4001"\nexport DATABASE_NAME="worktree_x"\nexport TEST_DATABASE_NAME="worktree_x_test"\n# <<< werksfeer managed environment <<<\n' > "${TEST_ROOT}/proj/.envrc"
+
+  with_functions "managed_env_assignments run_in_project_environment project_mise_bin project_asdf_bin" "cd '${TEST_ROOT}/proj'; PATH='${bin}'; run_in_project_environment sh -c 'echo \"\${DATABASE_NAME}:\${TEST_DATABASE_NAME}:\${PORT}:\${OUTSIDE:-unset}\"'"
+  [ "$status" -eq 0 ]
+  [ "$output" = "worktree_x:worktree_x_test:4001:unset" ]
 }

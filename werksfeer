@@ -262,7 +262,7 @@ state_lock_acquire() {
   printf '%s\n' "$$" > "${dir}/pid"
   WERKSFEER_LOCK_DIR="$dir"
   WERKSFEER_LOCK_DEPTH=1
-  trap 'werksfeer_on_exit' EXIT
+  trap 'state_lock_release_all' EXIT
 }
 
 state_lock_release() {
@@ -1072,9 +1072,10 @@ choose_database_name() {
 #
 # owned    the database exists and is this worktree's.
 # pending  the database does not exist yet (no template, or the clone failed
-#          and the server confirms it is absent). The name stays reserved; the
-#          framework's own setup may create it, and finalize_pending_databases
-#          keeps the record only if it did.
+#          and the server confirms it is absent). The name is reserved in the
+#          record and exported to the worktree; the project's own tools create
+#          the database under it later. A name that is exported stays recorded,
+#          whether or not the database exists yet.
 # none     the name is occupied by a database that is not ours, and so is the
 #          machine-specific fallback. The role gets no database.
 #
@@ -1089,6 +1090,12 @@ clone_one_database() {
   local role="$1" base="$2" name="$3" origin="$4" project="$5" worktree="$6" branch="$7" folder="$8"
   local suffix="" attempt status hashed clone_error state template_state occupied
   [ "$role" = "test" ] && suffix="_test"
+  # After the switch to the fallback name its reservation is unused until this
+  # function reports a database for it, so failing takes it back.
+  fallback_failed() {
+    [ "$attempt" -eq 2 ] && { unrecord_database "$project" "$worktree" "$role" || true; }
+    return "$1"
+  }
 
   for attempt in 1 2; do
     occupied=false
@@ -1117,7 +1124,7 @@ clone_one_database() {
             printf '%s\tpending\n' "$name"
             return 0
             ;;
-          *) return 2 ;;
+          *) fallback_failed 2; return ;;
         esac
 
         log_info "Cloning $base -> $name" >&2
@@ -1148,12 +1155,12 @@ clone_one_database() {
                 return 0
                 ;;
               0) occupied=true ;;
-              *) return 2 ;;
+              *) fallback_failed 2; return ;;
             esac
             ;;
         esac
         ;;
-      *) return 2 ;;
+      *) fallback_failed 2; return ;;
     esac
 
     if [ "$occupied" = true ] && [ "$attempt" -eq 1 ] && [ "$hashed" != "$name" ]; then
@@ -1175,40 +1182,6 @@ clone_one_database() {
   return 2
 }
 
-# Databases the framework's own setup is expected to create under a reserved
-# name (the template does not exist yet). Set by clone_databases.
-WERKSFEER_PENDING_PROJECT=""
-WERKSFEER_PENDING_WORKTREE=""
-WERKSFEER_PENDING_DEV=""
-WERKSFEER_PENDING_TEST=""
-
-# After the framework step: a pending database that now exists was created by
-# it (it did not exist when the name was chosen), so its reservation stays as
-# the record. One that does not exist leaves no record. When the server cannot
-# be asked the record is dropped: a database left without a record is only
-# unused, one wrongly recorded could be dropped later.
-finalize_pending_databases() {
-  local role name state
-
-  for role in dev test; do
-    if [ "$role" = "dev" ]; then name="$WERKSFEER_PENDING_DEV"; else name="$WERKSFEER_PENDING_TEST"; fi
-    [ -n "$name" ] || continue
-    state=0
-    db_exists "$name" || state=$?
-    case "$state" in
-      0) log_info "Recorded $name: the setup created it" ;;
-      1) unrecord_database "$WERKSFEER_PENDING_PROJECT" "$WERKSFEER_PENDING_WORKTREE" "$role" || log_warn "Could not remove the reservation of $name from the record" ;;
-      *)
-        log_warn "Cannot tell whether $name exists, so it is not recorded"
-        unrecord_database "$WERKSFEER_PENDING_PROJECT" "$WERKSFEER_PENDING_WORKTREE" "$role" || log_warn "Could not remove the reservation of $name from the record"
-        ;;
-    esac
-  done
-  WERKSFEER_PENDING_DEV=""
-  WERKSFEER_PENDING_TEST=""
-  return 0
-}
-
 # Leave the role as it was before this run: remove the reservation this run made.
 release_reservation() {
   local project="$1" worktree="$2" role="$3" origin="$4" state="$5"
@@ -1224,8 +1197,6 @@ clone_databases() {
   WERKSFEER_DB_UNCONFIGURED=""
   WERKSFEER_DB_PENDING=""
   WERKSFEER_DB_SKIPPED=""
-  WERKSFEER_PENDING_DEV=""
-  WERKSFEER_PENDING_TEST=""
 
   if ! has_psql; then
     log_warn "psql not found, skipping database cloning"
@@ -1317,6 +1288,11 @@ clone_databases() {
   NEW_DEV_DB="${dev_result%%"$TAB"*}"
   NEW_TEST_DB="${test_result%%"$TAB"*}"
 
+  # What is exported is recorded, and what is not recorded is not exported:
+  # - owned and pending names stay in the record. A pending database does not
+  #   exist yet; the project's own tools create it under the exported name
+  #   later, so its absence now says nothing about ownership.
+  # - a role without a database has no record and no variable.
   local role state name
   for role in dev test; do
     if [ "$role" = "dev" ]; then
@@ -1326,14 +1302,8 @@ clone_databases() {
     fi
     case "$state" in
       owned) ;;
-      pending)
-        # No database yet: the reservation stays until the framework step ran.
-        WERKSFEER_PENDING_PROJECT="$record_project"
-        WERKSFEER_PENDING_WORKTREE="$record_worktree"
-        if [ "$role" = "dev" ]; then WERKSFEER_PENDING_DEV="$name"; WERKSFEER_DB_PENDING=1; else WERKSFEER_PENDING_TEST="$name"; fi
-        ;;
+      pending) [ "$role" != "dev" ] || WERKSFEER_DB_PENDING=1 ;;
       *)
-        # No database for this role: no record, no environment variable.
         if ! unrecord_database "$record_project" "$record_worktree" "$role"; then
           log_error "Cannot remove the reservation of the $role database from the record: stopping"
           return 1
@@ -1341,15 +1311,19 @@ clone_databases() {
         WERKSFEER_DB_UNCONFIGURED=1
         ;;
     esac
+    # Check the invariant before the environment is written.
+    local recorded
+    recorded="$(recorded_database "$record_worktree" "$role" "$record_project")"
+    if [ -n "$name" ] && [ "$recorded" != "$(pg_identifier "$name")" ]; then
+      log_error "The $role database $name would be exported without a record: stopping"
+      return 1
+    fi
+    if [ -z "$name" ] && [ -n "$recorded" ]; then
+      log_error "The $role database has no name but is still recorded as $recorded: stopping"
+      return 1
+    fi
   done
   return 0
-}
-
-# The EXIT trap: a pending database is judged one last time, so an aborted
-# setup leaves no reservation behind, and the lock is released if we hold it.
-werksfeer_on_exit() {
-  finalize_pending_databases || true
-  state_lock_release_all
 }
 
 use_private_postgres_cluster() {
@@ -1614,40 +1588,9 @@ run_with_mise() {
     else
       bin_paths="$bin_path"
     fi
-# Print the NAME=value pairs of the managed environment block of an .envrc, so
-# that they can be passed to a command without direnv. Only plain
-# `export NAME="value"` lines inside the block are read; nothing is sourced.
-managed_env_assignments() {
-  [ -f "$1" ] || return 0
-  awk '
-    $0 == "# >>> werksfeer managed environment >>>" { inside = 1; next }
-    $0 == "# <<< werksfeer managed environment <<<" { inside = 0; next }
-    inside && /^export [A-Za-z_][A-Za-z0-9_]*=".*"$/ {
-      line = substr($0, 8)
-      name = line; sub(/=.*/, "", name)
-      value = line; sub(/^[^=]*="/, "", value); sub(/"$/, "", value)
-      print name "=" value
-    }' "$1"
-}
-
   done <<< "$("$mise_bin" bin-paths)"
 
   if [ -n "$bin_paths" ]; then
-  local -a managed=()
-  local assignment
-
-  # Without direnv nothing loads the .envrc, so the managed variables (the
-  # database names, the port) are passed in the command's environment.
-  if ! { command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; }; then
-    while IFS= read -r assignment; do
-      [ -n "$assignment" ] && managed+=("$assignment")
-    done <<EOF_MANAGED
-$(managed_env_assignments ".envrc")
-EOF_MANAGED
-    if [ "${#managed[@]}" -gt 0 ]; then
-      set -- env "${managed[@]}" "$@"
-    fi
-  fi
     # Some GUI harnesses prepend system paths after shell activation. Keep the
     # repository-pinned binaries first even in that inherited environment.
     "$mise_bin" exec -- env PATH="${bin_paths}:${PATH}" "$@"
@@ -1671,9 +1614,40 @@ run_with_asdf() {
   fi
 }
 
+# Print the NAME=value pairs of the managed environment block of an .envrc, so
+# that they can be passed to a command without direnv. Only plain
+# `export NAME="value"` lines inside the block are read; nothing is sourced.
+managed_env_assignments() {
+  [ -f "$1" ] || return 0
+  awk '
+    $0 == "# >>> werksfeer managed environment >>>" { inside = 1; next }
+    $0 == "# <<< werksfeer managed environment <<<" { inside = 0; next }
+    inside && /^export [A-Za-z_][A-Za-z0-9_]*=".*"$/ {
+      line = substr($0, 8)
+      name = line; sub(/=.*/, "", name)
+      value = line; sub(/^[^=]*="/, "", value); sub(/"$/, "", value)
+      print name "=" value
+    }' "$1"
+}
+
 run_in_project_environment() {
   local mise_bin=""
   local asdf_bin=""
+  local -a managed=()
+  local assignment
+
+  # Without direnv nothing loads the .envrc, so the managed variables (the
+  # database names, the port) are passed in the command's environment.
+  if ! { command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; }; then
+    while IFS= read -r assignment; do
+      [ -n "$assignment" ] && managed+=("$assignment")
+    done <<EOF_MANAGED
+$(managed_env_assignments ".envrc")
+EOF_MANAGED
+    if [ "${#managed[@]}" -gt 0 ]; then
+      set -- env "${managed[@]}" "$@"
+    fi
+  fi
   mise_bin="$(project_mise_bin)" || true
   if [ -z "$mise_bin" ]; then
     asdf_bin="$(project_asdf_bin)" || true
@@ -2754,9 +2728,6 @@ run_setup() {
   # Step 6: Run setup command
   log_step "Running setup"
   run_setup_command "$project_type" "$worktree_path"
-  # A database the framework step was to create must exist now, or its
-  # reservation goes (an aborted setup is judged by the EXIT trap).
-  finalize_pending_databases
 
   # Publish only a cleanly stopped, fully prepared database whose HEAD exactly
   # matches the configured remote template ref. Feature-branch state is never
