@@ -957,6 +957,16 @@ choose_database_name() {
   local worktree_path="$3"
   local branch="$4"
   local folder="$5"
+# Print the database names the managed environment of a worktree exports as
+# DATABASE_NAME and TEST_DATABASE_NAME, as the server lists them.
+worktree_env_databases() {
+  [ -f "${1}/.envrc" ] || return 0
+  sed -n \
+    -e 's/^export DATABASE_NAME="\(.*\)"$/\1/p' \
+    -e 's/^export TEST_DATABASE_NAME="\(.*\)"$/\1/p' "${1}/.envrc" |
+    LC_ALL=C cut -c1-63
+}
+
   local suffix="" variable="DATABASE_NAME"
   if [ "$role" = "test" ]; then
     suffix="_test"
@@ -1699,9 +1709,13 @@ registered_project_list() {
 # is gone claims nothing.
 project_worktree_claims() {
   local project_dir="$1"
-  local listing wt_line wt_path wt_basename wt_branch recorded_line new_stem
+  local listing wt_line wt_path wt_basename wt_branch recorded_line new_stem env_db
 
-  (cd "$project_dir" && is_git_repo) || return 0
+  if ! (cd "$project_dir" && is_git_repo); then
+    # A checkout that git cannot read is not a project without worktrees.
+    [ -e "${project_dir}/.git" ] && return 1
+    return 0
+  fi
 
   listing="$(cd "$project_dir" && git worktree list --porcelain 2>/dev/null)" || return 1
 
@@ -1795,6 +1809,15 @@ allocation_projects_for_worktree() {
 }
 
 # Load the project configuration (including the main checkout's
+    # What the worktree's own environment exports: after a branch switch it can
+    # still name a database that no name rule or record gives it any more.
+    while IFS= read -r env_db; do
+      [ -n "$env_db" ] || continue
+      printf '%s\t%s\n' "$wt_path" "$env_db"
+    done <<EOF_ENV
+$(worktree_env_databases "$wt_path")
+EOF_ENV
+
 # .worktree.local.toml) from a main checkout, starting from a clean slate.
 load_main_configuration() {
   local main_path="$1"
@@ -1829,7 +1852,10 @@ project_has_worktree_named() {
   local listing wt_line wt_path
 
   [ -d "$project" ] || return 1
-  (cd "$project" && is_git_repo) || return 1
+  if ! (cd "$project" && is_git_repo); then
+    [ -e "${project}/.git" ] && return 2
+    return 1
+  fi
   listing="$(cd "$project" && git worktree list --porcelain 2>/dev/null)" || return 2
 
   while IFS= read -r wt_line; do
