@@ -1614,9 +1614,40 @@ run_with_mise() {
     else
       bin_paths="$bin_path"
     fi
+# Print the NAME=value pairs of the managed environment block of an .envrc, so
+# that they can be passed to a command without direnv. Only plain
+# `export NAME="value"` lines inside the block are read; nothing is sourced.
+managed_env_assignments() {
+  [ -f "$1" ] || return 0
+  awk '
+    $0 == "# >>> werksfeer managed environment >>>" { inside = 1; next }
+    $0 == "# <<< werksfeer managed environment <<<" { inside = 0; next }
+    inside && /^export [A-Za-z_][A-Za-z0-9_]*=".*"$/ {
+      line = substr($0, 8)
+      name = line; sub(/=.*/, "", name)
+      value = line; sub(/^[^=]*="/, "", value); sub(/"$/, "", value)
+      print name "=" value
+    }' "$1"
+}
+
   done <<< "$("$mise_bin" bin-paths)"
 
   if [ -n "$bin_paths" ]; then
+  local -a managed=()
+  local assignment
+
+  # Without direnv nothing loads the .envrc, so the managed variables (the
+  # database names, the port) are passed in the command's environment.
+  if ! { command -v direnv >/dev/null 2>&1 && [ -f ".envrc" ]; }; then
+    while IFS= read -r assignment; do
+      [ -n "$assignment" ] && managed+=("$assignment")
+    done <<EOF_MANAGED
+$(managed_env_assignments ".envrc")
+EOF_MANAGED
+    if [ "${#managed[@]}" -gt 0 ]; then
+      set -- env "${managed[@]}" "$@"
+    fi
+  fi
     # Some GUI harnesses prepend system paths after shell activation. Keep the
     # repository-pinned binaries first even in that inherited environment.
     "$mise_bin" exec -- env PATH="${bin_paths}:${PATH}" "$@"
