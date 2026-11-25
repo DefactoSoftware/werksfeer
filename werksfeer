@@ -831,7 +831,13 @@ shared_server_host() {
 # Local: no host, a socket directory, localhost, 127.0.0.1 or ::1. A service,
 # a list of hosts or anything else that cannot be classified counts as remote.
 shared_server_is_remote() {
-  local host
+  local host candidate
+  # A comma anywhere means a list of hosts: libpq may fall back to any of them.
+  for candidate in "${PGHOSTADDR:-}" "$(toml_get "database" "host" "")" "${PGHOST:-}"; do
+    case "$candidate" in
+      *,*) return 0 ;;
+    esac
+  done
   host="$(shared_server_host | tr '[:upper:]' '[:lower:]')"
   case "$host" in
     ""|/*|localhost|127.0.0.1|::1|"[::1]") return 1 ;;
