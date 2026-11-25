@@ -222,6 +222,63 @@ allocate_redis_port() {
   done
 }
 
+# One lock for the files under werksfeer/ that are read, changed and renamed
+# (allocations and the database record). mkdir is atomic on Linux and macOS,
+# which have no common flock. The owner's pid is stored in the lock; a lock whose
+# owner is gone is stale and removed. A lock that cannot be taken within
+# WERKSFEER_LOCK_TIMEOUT seconds (default 30) fails loudly: the caller must not
+# go on unlocked. Taking it again in the same process only counts.
+WERKSFEER_LOCK_DEPTH=0
+WERKSFEER_LOCK_DIR=""
+
+state_lock_acquire() {
+  local dir ticks=0 limit owner
+
+  if [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ]; then
+    WERKSFEER_LOCK_DEPTH=$(( WERKSFEER_LOCK_DEPTH + 1 ))
+    return 0
+  fi
+
+  dir="$(dirname "$(allocations_file)")/state.lock"
+  limit=$(( ${WERKSFEER_LOCK_TIMEOUT:-30} * 10 ))
+  mkdir -p "$(dirname "$dir")"
+
+  until mkdir "$dir" 2>/dev/null; do
+    owner="$(cat "${dir}/pid" 2>/dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      log_warn "Removing stale werksfeer lock of process $owner"
+      rm -f "${dir}/pid"
+      rmdir "$dir" 2>/dev/null || true
+      continue
+    fi
+    ticks=$(( ticks + 1 ))
+    if [ "$ticks" -gt "$limit" ]; then
+      log_error "Could not take the werksfeer lock $dir in ${WERKSFEER_LOCK_TIMEOUT:-30}s (held by process ${owner:-unknown}). If no werksfeer is running, remove that directory."
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "${dir}/pid"
+  WERKSFEER_LOCK_DIR="$dir"
+  WERKSFEER_LOCK_DEPTH=1
+  trap 'state_lock_release_all' EXIT
+}
+
+state_lock_release() {
+  [ "$WERKSFEER_LOCK_DEPTH" -gt 0 ] || return 0
+  WERKSFEER_LOCK_DEPTH=$(( WERKSFEER_LOCK_DEPTH - 1 ))
+  if [ "$WERKSFEER_LOCK_DEPTH" -eq 0 ]; then
+    rm -f "${WERKSFEER_LOCK_DIR}/pid"
+    rmdir "$WERKSFEER_LOCK_DIR" 2>/dev/null || true
+  fi
+}
+
+state_lock_release_all() {
+  WERKSFEER_LOCK_DEPTH=1
+  state_lock_release
+}
+
 # Register an allocation
 register_allocation() {
   local project="$1"
@@ -244,6 +301,7 @@ deregister_allocation() {
   alloc="$(allocations_file)"
   [ ! -f "$alloc" ] && return 0
 
+  state_lock_acquire || return 1
   local tmp="${alloc}.tmp"
   if [ -n "$project" ]; then
     awk -F'\t' -v p="$project" -v w="$wt_name" '!($1 == p && $2 == w)' "$alloc" > "$tmp"
@@ -251,6 +309,7 @@ deregister_allocation() {
     awk -F'\t' -v w="$wt_name" '$2 != w' "$alloc" > "$tmp"
   fi
   mv "$tmp" "$alloc"
+  state_lock_release
 }
 
 # Look up existing allocation for a worktree. Prints "port<TAB>redis_db<TAB>redis_port" or empty.
@@ -845,6 +904,16 @@ new_database_stem() {
   printf '%s_%s\n' "$prefix" "$hash"
 }
 
+# Returns 0 when the record names database $1 for a worktree other than the one
+# at path $2, whether or not that worktree or database exists right now.
+database_recorded_for_other_worktree() {
+  local file
+  file="$(databases_file)"
+  [ -f "$file" ] || return 1
+  WF_DB="$(pg_identifier "$1")" WF_WORKTREE="$2" \
+    awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"
+}
+
 # Returns 0 when an existing worktree other than the one at path $2 uses (or a
 # record of any other worktree names) database $1, or when that cannot be told.
 database_used_by_other_worktree() {
@@ -902,16 +971,6 @@ choose_database_name() {
   if db_exists "$name" &&
       { [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; }; then
     # On a server shared with other machines an allocation says nothing about
-# Returns 0 when the record names database $1 for a worktree other than the one
-# at path $2, whether or not that worktree or database exists right now.
-database_recorded_for_other_worktree() {
-  local file
-  file="$(databases_file)"
-  [ -f "$file" ] || return 1
-  WF_DB="$(pg_identifier "$1")" WF_WORKTREE="$2" \
-    awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"
-}
-
     # who made the database, so only the worktree's own environment counts.
     if env_names_database "$worktree_path" "$variable" "$legacy" ||
         { ! shared_server_is_remote &&
@@ -959,12 +1018,19 @@ clone_databases() {
   record_project="$(get_main_worktree_path)"
   record_worktree="$(pwd -P)"
 
+  # Choosing a name and reserving it in the record is one step under the lock:
+  # another setup that picks next sees the record and takes a different name.
+  # The lock is not held while the databases are cloned, which can take long.
+  state_lock_acquire || return 1
   NEW_DEV_DB="$(choose_database_name dev "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
   NEW_TEST_DB="$(choose_database_name test "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)")"
   # Two names that end up as the same database would share its data.
   if [ "$(pg_identifier "$NEW_TEST_DB")" = "$(pg_identifier "$NEW_DEV_DB")" ]; then
     NEW_TEST_DB="$(new_database_stem "$record_project" "$record_worktree" "$(get_worktree_branch)" "$(get_worktree_name)" hash)_test"
   fi
+  record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
+  record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
+  state_lock_release
 
   # Clone dev database
   if db_exists "$NEW_DEV_DB"; then
@@ -992,13 +1058,13 @@ clone_databases() {
     fi
   fi
 
-  # Record what this worktree uses, so cleanup and prune go by the record.
-  # Databases that already existed are adopted into the record too.
-  if db_exists "$NEW_DEV_DB"; then
-    record_database "$record_project" "$record_worktree" dev "$NEW_DEV_DB"
+  # The names were reserved in the record above. A database that does not exist
+  # (no template, or the clone failed) leaves no record behind.
+  if ! db_exists "$NEW_DEV_DB"; then
+    unrecord_database "$record_project" "$record_worktree" dev
   fi
-  if db_exists "$NEW_TEST_DB"; then
-    record_database "$record_project" "$record_worktree" test "$NEW_TEST_DB"
+  if ! db_exists "$NEW_TEST_DB"; then
+    unrecord_database "$record_project" "$record_worktree" test
   fi
 }
 
@@ -1125,6 +1191,10 @@ write_env_overrides() {
   existing="$(lookup_allocation "$project_root" "$wt_name")"
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
 
+  # Choosing free ports and registering them must not interleave with another
+  # setup, or two worktrees could get the same port.
+  state_lock_acquire || return 1
+  existing="$(lookup_allocation "$project_root" "$wt_name")"
   local wt_port redis_db redis_port=""
   if [ -n "$existing" ]; then
     wt_port="$(echo "$existing" | cut -f1)"
@@ -1148,6 +1218,7 @@ write_env_overrides() {
   if [ -z "$existing" ]; then
     register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
   fi
+  state_lock_release
 
   local wt_redis=""
   if [ -n "$base_redis" ]; then
@@ -1508,6 +1579,7 @@ record_database() {
       ;;
   esac
 
+  state_lock_acquire || return 1
   mkdir -p "$(dirname "$file")"
   tmp="${file}.tmp.$$"
   {
@@ -1518,6 +1590,26 @@ record_database() {
     printf '%s\t%s\t%s\t%s\n' "$project" "$worktree" "$role" "$database"
   } > "$tmp"
   mv "$tmp" "$file"
+  state_lock_release
+}
+
+# Remove the record line of one role of a worktree.
+unrecord_database() {
+  local project="$1" worktree="$2" role="$3"
+  local file tmp
+  file="$(databases_file)"
+  [ -f "$file" ] || return 0
+
+  state_lock_acquire || return 1
+  tmp="${file}.tmp.$$"
+  WF_PROJECT="$project" WF_WORKTREE="$worktree" WF_ROLE="$role" awk -F'\t' \
+    '!($1 == ENVIRON["WF_PROJECT"] && $2 == ENVIRON["WF_WORKTREE"] && $3 == ENVIRON["WF_ROLE"])' "$file" > "$tmp"
+  if [ -s "$tmp" ]; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp" "$file"
+  fi
+  state_lock_release
 }
 
 # Remove every record line of a worktree path (of one project when given).
@@ -1527,14 +1619,17 @@ forget_worktree_databases() {
   file="$(databases_file)"
   [ -f "$file" ] || return 0
 
+  state_lock_acquire || return 1
   tmp="${file}.tmp.$$"
   WF_WORKTREE="$worktree" WF_PROJECT="$project" awk -F'\t' \
     '!($2 == ENVIRON["WF_WORKTREE"] && (ENVIRON["WF_PROJECT"] == "" || $1 == ENVIRON["WF_PROJECT"]))' "$file" > "$tmp"
   mv "$tmp" "$file"
+  state_lock_release
 }
 
-# Resolve a path the way git reports worktrees (symlinks resolved, no trailing
-# slash). A path that is already gone keeps its last component as given.
+# Resolve a path the way git reports worktrees: absolute, symlinks resolved in
+# the part that exists, no trailing slash. Components that are already gone are
+# kept as given.
 normalize_path() {
   local path="$1" clean="" component rest="" existing
 
@@ -1614,6 +1709,11 @@ project_worktree_claims() {
 
     # The name this version would give it, in case its record is lost.
     new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename")" || return 1
+    printf '%s\t%s\n' \
+      "$wt_path" "$new_stem" \
+      "$wt_path" "${new_stem}_test"
+    # And the hashed form a name collision falls back to.
+    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename" hash)" || return 1
     printf '%s\t%s\n' \
       "$wt_path" "$new_stem" \
       "$wt_path" "${new_stem}_test"
@@ -1714,11 +1814,6 @@ project_has_worktree_named() {
   local project="$1"
   local wt_name="$2"
   local excluded="$3"
-    printf '%s\t%s\n' \
-      "$wt_path" "$new_stem" \
-      "$wt_path" "${new_stem}_test"
-    # And the hashed form a name collision falls back to.
-    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename" hash)" || return 1
   local listing wt_line wt_path
 
   [ -d "$project" ] || return 1
@@ -1996,6 +2091,7 @@ prune_project() {
 $listing
 EOF_ACTIVE
 
+      state_lock_acquire || return 1
       local tmp="${alloc}.tmp"
       while IFS="$(printf '\t')" read -r a_project a_wt a_port a_redis; do
         if [ "$a_project" = "$project_dir" ] && ! echo "$active_wt_names" | grep -qxF "$a_wt"; then
@@ -2005,6 +2101,7 @@ EOF_ACTIVE
         fi
       done < "$alloc" > "$tmp"
       mv "$tmp" "$alloc"
+      state_lock_release
     else
       log_warn "Cannot read the worktrees of $project_dir, keeping its port/redis allocations"
     fi
@@ -2156,6 +2253,7 @@ prune_database_records() {
   fi
   server_dbs="$(printf '%s\n' "$server_dbs" | awk '{print $1}')"
 
+  state_lock_acquire || return 1
   tmp="${file}.tmp.$$"
   : > "$tmp"
   while IFS="$TAB" read -r r_project r_path r_role r_db || [ -n "$r_db" ]; do
@@ -2173,6 +2271,7 @@ prune_database_records() {
     fi
   done < "$file"
   mv "$tmp" "$file"
+  state_lock_release
 }
 
 prune_current() {

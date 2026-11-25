@@ -2234,3 +2234,140 @@ recorded_database_of() {
   [ "$status" -eq 0 ]
   grep -q 'export DATABASE_NAME="worktree_example_head_one"' "${WORKTREE_ONE}/.envrc"
 }
+
+# ---------------------------------------------------------------------------
+# Review round: ownership, locking and paths
+# ---------------------------------------------------------------------------
+
+@test "a readable name that another worktree records is not taken while its database is absent" {
+  install_fake_pg
+  write_shared_config
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/elsewhere/one" dev worktree_example_head_one
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/elsewhere/one" test worktree_example_head_one_test
+  [ "$(grep -c '^worktree_' "$PG_DBS")" -eq 0 ]
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$(recorded_database_of "$WORKTREE_ONE")" =~ ^worktree_example_head_one_[0-9a-f]{10}$ ]]
+  grep -q "export DATABASE_NAME=\"$(recorded_database_of "$WORKTREE_ONE")\"" "${WORKTREE_ONE}/.envrc"
+}
+
+@test "concurrent setups of worktrees that would share a readable name get different databases" {
+  install_fake_pg
+  write_shared_config
+  local twin="${TEST_ROOT}/elsewhere/example/one"
+  mkdir -p "$(dirname "$twin")"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$twin" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${twin}/.worktree.toml"
+
+  local i
+  for i in 1 2 3; do
+    : > "$(DB_RECORD)" 2>/dev/null || { mkdir -p "${XDG_DATA_HOME}/werksfeer"; : > "$(DB_RECORD)"; }
+    printf '%s\n' example_dev example_test > "$PG_DBS"
+    rm -f "${WORKTREE_ONE}/.envrc" "${twin}/.envrc"
+    (cd "$WORKTREE_ONE" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+    (cd "$twin" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+    wait
+    [ "$(wc -l < "$(DB_RECORD)")" -eq 4 ]
+    [ "$(recorded_database_of "$WORKTREE_ONE")" != "$(recorded_database_of "$twin")" ]
+  done
+}
+
+@test "concurrent setups lose no record lines and give every worktree its own ports" {
+  install_fake_pg
+  write_shared_config
+  local one_more="${TEST_ROOT}/worktrees/three" i
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$one_more" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${one_more}/.worktree.toml"
+
+  (cd "$WORKTREE_ONE" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+  (cd "$WORKTREE_TWO" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+  (cd "$one_more" && PATH="$FAKE_BIN:$PATH" "$WERKSFEER" > /dev/null 2>&1) &
+  wait
+  [ "$(wc -l < "$(DB_RECORD)")" -eq 6 ]
+  [ "$(cut -f3 "${XDG_DATA_HOME}/werksfeer/allocations" | sort -u | wc -l)" -eq 3 ]
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/state.lock" ]
+}
+
+@test "a lock held by a running process makes setup fail loudly" {
+  install_fake_pg
+  write_shared_config
+  mkdir -p "${XDG_DATA_HOME}/werksfeer/state.lock"
+  sleep 30 &
+  local holder=$!
+  printf '%s\n' "$holder" > "${XDG_DATA_HOME}/werksfeer/state.lock/pid"
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_LOCK_TIMEOUT=1 "$WERKSFEER"
+  kill "$holder" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not take the werksfeer lock"* ]]
+  [ ! -e "$(DB_RECORD)" ]
+}
+
+@test "a lock left by a process that is gone is removed" {
+  install_fake_pg
+  write_shared_config
+  mkdir -p "${XDG_DATA_HOME}/werksfeer/state.lock"
+  sleep 0 &
+  local gone=$!
+  wait "$gone"
+  printf '%s\n' "$gone" > "${XDG_DATA_HOME}/werksfeer/state.lock/pid"
+
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Removing stale werksfeer lock"* ]]
+  [ -f "$(DB_RECORD)" ]
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/state.lock" ]
+}
+
+@test "prune keeps a collision-hashed database when the record is lost" {
+  install_fake_pg
+  write_shared_config
+  local twin="${TEST_ROOT}/elsewhere/example/one"
+  mkdir -p "$(dirname "$twin")"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$twin" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${twin}/.worktree.toml"
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$twin" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  local hashed
+  hashed="$(recorded_database_of "$twin")"
+  [[ "$hashed" =~ _[0-9a-f]{10}$ ]]
+  rm -f "$(DB_RECORD)"
+  : > "$PG_LOG"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --prune
+  [ "$status" -eq 0 ]
+  grep -qxF "$hashed" "$PG_DBS"
+  grep -qxF "${hashed}_test" "$PG_DBS"
+  run grep -q dropdb "$PG_LOG"
+  [ "$status" -eq 1 ]
+}
+
+@test "cleanup with a relative path finds the record when the folder and its parent are gone" {
+  install_fake_pg
+  write_shared_config
+  printf '%s\n' example_dev custom_gone > "$PG_DBS"
+  write_record "$MAIN_REPO" "${TEST_ROOT}/vanished/parent/fix" dev custom_gone
+
+  run_in_worktree "$TEST_ROOT" "$WERKSFEER" --cleanup "vanished/./parent/../parent/fix/"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PG_DBS")" = "example_dev" ]
+  [ ! -s "$(DB_RECORD)" ]
+}
+
+@test "cleanup with a record releases the allocation of the recorded project only" {
+  install_fake_pg
+  write_shared_config
+  setup_second_project
+  write_allocations "$MAIN_REPO" fix 3001 "$OTHER_REPO" fix 3002
+  write_record "$MAIN_REPO" "${TEST_ROOT}/worktrees/fix" dev worktree_example_head_fix
+  printf '%s\n' example_dev worktree_example_head_fix > "$PG_DBS"
+
+  run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "${XDG_DATA_HOME}/werksfeer/allocations")" -eq 1 ]
+  grep -qF "$(printf '%s\t%s\t' "$OTHER_REPO" fix)" "${XDG_DATA_HOME}/werksfeer/allocations"
+  [[ "$output" != *"$OTHER_REPO"* ]]
+}
