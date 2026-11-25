@@ -578,6 +578,10 @@ Werksfeer records every database it creates or finds for a worktree in `~/.local
 - `--cleanup <path>` drops exactly the databases recorded for that worktree path, whether or not the folder still exists, and removes that worktree's lines from the record. A database that another existing worktree also uses stays. The port/redis allocation is released only in the worktree's own project, and only when that project has no other worktree of the same name.
 - `--prune` counts the recorded databases of a worktree that still exists as active. It drops those of worktrees that are gone and removes their records. As before, it drops nothing when a project cannot be inspected or the registry is missing.
 
+### A server shared between machines
+
+The record, the allocations and the registry are files on one machine. When `[database] host` (or `PGHOST`) points at a server on another machine, that is, any value other than a socket directory, `localhost`, `127.0.0.1` or `::1`, other machines may have worktrees on the same server that this machine knows nothing about. In that case, `--prune` drops only databases this machine recorded for worktrees that are gone, and reports how many `worktree_*` databases it left in place because it has no record of them. `--cleanup` for a worktree that has no record drops nothing once the folder is gone. While the folder exists, it drops an old-style name only if the worktree's own `.envrc` names that database. Names carry a hash of the machine identity (`/etc/machine-id`, else the host name), so two machines that use the same paths never derive the same name. A database that already has the readable name and is not in the record is never reused. Databases left by a machine that no longer exists have to be dropped by hand.
+
 ### Worktrees set up before 0.4.0
 
 Before 0.4.0 the names had no project (`worktree_<branch>_<folder>`) and nothing was recorded. A worktree set up that way keeps working without changes. Running `werksfeer` in it again keeps using its databases and adds them to the record, as long as its `.envrc` names those databases, or the worktree has an allocation and no other worktree uses those databases.
