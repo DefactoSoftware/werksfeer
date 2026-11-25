@@ -851,11 +851,9 @@ database_used_by_other_worktree() {
   local database="$1"
   local worktree_path="$2"
   local project="$3"
-  local file claimed
+  local claimed
 
-  file="$(databases_file)"
-  if [ -f "$file" ] && WF_DB="$(pg_identifier "$database")" WF_WORKTREE="$worktree_path" \
-      awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"; then
+  if database_recorded_for_other_worktree "$database" "$worktree_path"; then
     return 0
   fi
 
@@ -904,6 +902,16 @@ choose_database_name() {
   if db_exists "$name" &&
       { [ "$role" = "dev" ] || [ "$name" != "$(pg_identifier "worktree_$(sanitize_name "$branch")_$(sanitize_name "$folder")")" ]; }; then
     # On a server shared with other machines an allocation says nothing about
+# Returns 0 when the record names database $1 for a worktree other than the one
+# at path $2, whether or not that worktree or database exists right now.
+database_recorded_for_other_worktree() {
+  local file
+  file="$(databases_file)"
+  [ -f "$file" ] || return 1
+  WF_DB="$(pg_identifier "$1")" WF_WORKTREE="$2" \
+    awk -F'\t' '$4 == ENVIRON["WF_DB"] && $2 != ENVIRON["WF_WORKTREE"] { found = 1 } END { exit !found }' "$file"
+}
+
     # who made the database, so only the worktree's own environment counts.
     if env_names_database "$worktree_path" "$variable" "$legacy" ||
         { ! shared_server_is_remote &&
@@ -918,7 +926,7 @@ choose_database_name() {
   # Without a record, a database with the readable name is not ours: another
   # worktree or another machine made it, or it is a leftover. Never reuse it.
   name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder")${suffix}"
-  if db_exists "$name"; then
+  if db_exists "$name" || database_recorded_for_other_worktree "$name" "$worktree_path"; then
     name="$(new_database_stem "$project_path" "$worktree_path" "$branch" "$folder" hash)${suffix}"
   fi
   printf '%s\n' "$name"
@@ -1528,15 +1536,33 @@ forget_worktree_databases() {
 # Resolve a path the way git reports worktrees (symlinks resolved, no trailing
 # slash). A path that is already gone keeps its last component as given.
 normalize_path() {
-  local path="${1%/}"
-  [ -n "$path" ] || path="/"
-  if [ -d "$path" ]; then
-    (cd "$path" && pwd -P)
-  elif [ -d "$(dirname "$path")" ]; then
-    printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd -P)" "$(basename "$path")"
-  else
-    printf '%s\n' "$path"
-  fi
+  local path="$1" clean="" component rest="" existing
+
+  case "$path" in
+    /*) ;;
+    *) path="${PWD}/${path}" ;;
+  esac
+
+  # Drop "." and "..", empty parts and trailing slashes, as text.
+  while IFS= read -r component; do
+    case "$component" in
+      ""|.) ;;
+      ..) clean="${clean%/*}" ;;
+      *) clean="${clean}/${component}" ;;
+    esac
+  done <<EOF_PARTS
+$(printf '%s\n' "$path" | tr '/' '\n')
+EOF_PARTS
+  [ -n "$clean" ] || clean="/"
+
+  # Resolve symlinks in the part that exists and keep the rest as it is.
+  existing="$clean"
+  while [ ! -d "$existing" ]; do
+    rest="/$(basename "$existing")${rest}"
+    existing="$(dirname "$existing")"
+  done
+  existing="$(cd "$existing" && pwd -P | sed 's|/$||')"
+  printf '%s\n' "${existing}${rest}" | sed 's|^$|/|'
 }
 
 # PostgreSQL cuts identifiers at 63 bytes without an error, so a longer name
@@ -1671,10 +1697,15 @@ cleanup_projects_for_worktree() {
   local worktree_path="$1"
   local wt_name="$2"
 
-  {
-    recorded_lines "$worktree_path" | cut -f1
-    allocation_projects_for_worktree "$wt_name"
-  } | sort -u
+  local recorded_projects
+  recorded_projects="$(recorded_lines "$worktree_path" | cut -f1 | sort -u)"
+  # A record names the project of its worktree; the allocations, which only
+  # know a folder name, are for worktrees that have none.
+  if [ -n "$recorded_projects" ]; then
+    printf '%s\n' "$recorded_projects"
+  else
+    allocation_projects_for_worktree "$wt_name" | sort -u
+  fi
 }
 
 # Returns 0 when the project has an existing worktree named $2 besides the one
@@ -1683,6 +1714,11 @@ project_has_worktree_named() {
   local project="$1"
   local wt_name="$2"
   local excluded="$3"
+    printf '%s\t%s\n' \
+      "$wt_path" "$new_stem" \
+      "$wt_path" "${new_stem}_test"
+    # And the hashed form a name collision falls back to.
+    new_stem="$(new_database_stem "$project_dir" "$wt_path" "$wt_branch" "$wt_basename" hash)" || return 1
   local listing wt_line wt_path
 
   [ -d "$project" ] || return 1
