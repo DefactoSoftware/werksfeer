@@ -186,6 +186,90 @@ allocate_port() {
   done
 }
 
+# WERKSFEER_PORT_RANGE=<first>-<last> limits every web port to one range (a
+# machine where only that range is reachable for others). Sets
+# PORT_RANGE_FIRST and PORT_RANGE_LAST, both empty when the variable is unset
+# or empty. Returns 1 with an error for any other value.
+port_range_load() {
+  PORT_RANGE_FIRST=""
+  PORT_RANGE_LAST=""
+  local value="${WERKSFEER_PORT_RANGE:-}"
+  [ -n "$value" ] || return 0
+
+  if ! [[ "$value" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+    log_error "WERKSFEER_PORT_RANGE must look like <first>-<last>, for example 7500-7579 (got '$value')"
+    return 1
+  fi
+  local first=$(( 10#${BASH_REMATCH[1]} )) last=$(( 10#${BASH_REMATCH[2]} ))
+  if [ "$first" -lt 1024 ] || [ "$last" -gt 65535 ]; then
+    log_error "WERKSFEER_PORT_RANGE must lie within 1024-65535 (got '$value')"
+    return 1
+  fi
+  if [ "$first" -gt "$last" ]; then
+    log_error "WERKSFEER_PORT_RANGE must have first <= last (got '$value')"
+    return 1
+  fi
+  PORT_RANGE_FIRST="$first"
+  PORT_RANGE_LAST="$last"
+}
+
+port_in_range() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge "$PORT_RANGE_FIRST" ] && [ "$1" -le "$PORT_RANGE_LAST" ]
+}
+
+# Print the lowest port of the range that is not in the registry. Returns 1
+# when the range is full.
+allocate_port_in_range() {
+  local alloc port
+  alloc="$(allocations_file)"
+  port="$PORT_RANGE_FIRST"
+  while [ "$port" -le "$PORT_RANGE_LAST" ]; do
+    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $3}' "$alloc" | grep -qxF "$port"; then
+      echo "$port"
+      return 0
+    fi
+    port=$(( port + 1 ))
+  done
+  return 1
+}
+
+port_range_full_error() {
+  log_error "No free port left in WERKSFEER_PORT_RANGE ${PORT_RANGE_FIRST}-${PORT_RANGE_LAST}. Free ports with 'werksfeer --prune' (or --cleanup for a worktree you no longer use), or widen the range."
+}
+
+# Before anything is changed: stop when this worktree needs a port from the
+# range and the range is full. write_env_overrides checks again under the lock.
+port_range_preflight() {
+  [ -n "$PORT_RANGE_FIRST" ] || return 0
+  local project_root wt_name existing port
+  project_root="$(get_main_worktree_path)"
+  wt_name="$(get_worktree_name)"
+  state_lock_acquire || return 1
+  existing="$(lookup_allocation "$project_root" "$wt_name" | cut -f1)"
+  if port_in_range "$existing" || allocate_port_in_range >/dev/null; then
+    state_lock_release
+    return 0
+  fi
+  state_lock_release
+  port_range_full_error
+  return 1
+}
+
+# Give a worktree whose registered port lies outside the range a new one.
+# Prints the new port; keeps the Redis fields of the registry line.
+move_allocation_port() {
+  local project="$1" wt_name="$2" port="$3"
+  local alloc tmp
+  alloc="$(allocations_file)"
+  tmp="${alloc}.tmp"
+  awk -F'\t' -v OFS='\t' -v p="$project" -v w="$wt_name" -v n="$port" \
+    '$1 == p && $2 == w { $3 = n } { print }' "$alloc" > "$tmp" || return 1
+  mv "$tmp" "$alloc"
+}
+
 # Find the next available Redis DB (1-15) for a given project, skipping any in use.
 allocate_redis_db() {
   local project="$1"
@@ -1502,15 +1586,41 @@ write_env_overrides() {
   state_lock_acquire || return 1
   existing="$(lookup_allocation "$project_root" "$wt_name")"
   local wt_port redis_db redis_port=""
+  if ! port_range_load; then
+    state_lock_release
+    return 1
+  fi
   if [ -n "$existing" ]; then
     wt_port="$(echo "$existing" | cut -f1)"
     redis_db="$(echo "$existing" | cut -f2)"
     redis_port="$(echo "$existing" | cut -f3)"
     log_debug "Reusing allocation: port=$wt_port redis_db=$redis_db redis_port=$redis_port"
+    if [ -n "$PORT_RANGE_FIRST" ] && ! port_in_range "$wt_port"; then
+      local old_port="$wt_port"
+      if ! wt_port="$(allocate_port_in_range)"; then
+        state_lock_release
+        port_range_full_error
+        return 1
+      fi
+      if ! move_allocation_port "$project_root" "$wt_name" "$wt_port"; then
+        state_lock_release
+        log_error "Could not update the allocation of $wt_name"
+        return 1
+      fi
+      log_info "Port ${old_port} is outside WERKSFEER_PORT_RANGE ${PORT_RANGE_FIRST}-${PORT_RANGE_LAST}, moved to ${wt_port}"
+    fi
   else
-    local base_port
-    base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
-    wt_port="$(allocate_port "$base_port")"
+    if [ -n "$PORT_RANGE_FIRST" ]; then
+      if ! wt_port="$(allocate_port_in_range)"; then
+        state_lock_release
+        port_range_full_error
+        return 1
+      fi
+    else
+      local base_port
+      base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
+      wt_port="$(allocate_port "$base_port")"
+    fi
     redis_db="$(allocate_redis_db "$project_root")"
   fi
 
@@ -2724,6 +2834,10 @@ run_setup() {
   log_info "Main:     $main_path"
   log_info "Worktree: $worktree_path"
 
+  # A bad or full port range stops the setup before anything is changed.
+  port_range_load || return 1
+  port_range_preflight || return 1
+
   load_project_configuration "$worktree_path"
 
   # Detect project type
@@ -2835,6 +2949,7 @@ Usage:
 Environment:
   WERKSFEER_DEBUG=1         Enable debug logging
   WERKSFEER_POSTGRES=false Disable private PostgreSQL for this shell
+  WERKSFEER_PORT_RANGE=FIRST-LAST Take every web port from this range (e.g. 7500-7579)
   WERKSFEER_CACHE_AUTO_WARM=true|false Override automatic cache warming
   WERKSFEER_CACHE_RETENTION_DAYS=N Override unused-cache retention (0 disables)
   WERKSFEER_LIB_DIR=PATH    Override the service module directory
