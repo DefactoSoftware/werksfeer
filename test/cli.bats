@@ -61,14 +61,14 @@ teardown() {
   run "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.4.0" ]
+  [ "$output" = "werksfeer 0.5.0" ]
 }
 
 @test "runs with the system Bash used by macOS" {
   run env PATH="/usr/bin:/bin" "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.4.0" ]
+  [ "$output" = "werksfeer 0.5.0" ]
 }
 
 @test "derives a stable short socket path for each worktree" {
@@ -3097,4 +3097,259 @@ EOF_GIT
   run_in_worktree "$MAIN_REPO" "$WERKSFEER" --cleanup "${TEST_ROOT}/worktrees/fix"
   [ "$status" -eq 0 ]
   [ "$(sed -n 1p "$TEST_ROOT/git.locks")" = "locked" ]
+}
+
+# ---------------------------------------------------------------------------
+# WERKSFEER_PORT_RANGE
+# ---------------------------------------------------------------------------
+
+registered_port_of() {
+  awk -F'\t' -v p="$1" -v w="$2" '$1 == p && $2 == w {print $3}' "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+managed_port_of() {
+  sed -n 's/^export PORT="\([0-9]*\)"$/\1/p' "$1/.envrc"
+}
+
+@test "without a port range the port counts up from the project's base port" {
+  install_fake_pg
+  write_shared_config
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 4001 ]
+  [ "$(managed_port_of "$WORKTREE_ONE")" = 4001 ]
+
+  printf '[port]\nbase = 5100\n' >> "${WORKTREE_TWO}/.worktree.toml"
+  run_in_worktree "$WORKTREE_TWO" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" two)" = 5101 ]
+}
+
+@test "an empty port range changes nothing" {
+  install_fake_pg
+  write_shared_config
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE= "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 4001 ]
+}
+
+@test "a port range gives each worktree the lowest free port of the range" {
+  install_fake_pg
+  write_shared_config
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$WORKTREE_TWO" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 7500 ]
+  [ "$(registered_port_of "$MAIN_REPO" two)" = 7501 ]
+  [ "$(managed_port_of "$WORKTREE_ONE")" = 7500 ]
+  [ "$(managed_port_of "$WORKTREE_TWO")" = 7501 ]
+}
+
+@test "a port range ignores the base port and skips ports in use by any project" {
+  install_fake_pg
+  write_shared_config
+  printf '[port]\nbase = 9000\n' >> "${MAIN_REPO}/.worktree.toml"
+  setup_second_project
+  printf '[cache]\nauto_warm = false\n[setup]\ncommand = "true"\n[port]\nbase = 3000\n' >> "${OTHER_REPO}/.worktree.toml"
+  cp "${OTHER_REPO}/.worktree.toml" "${OTHER_WORKTREE}/.worktree.toml"
+  cp "${MAIN_REPO}/.worktree.toml" "${WORKTREE_ONE}/.worktree.toml"
+  write_allocations "$OTHER_REPO" elsewhere 7500
+
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  run_in_worktree "$OTHER_WORKTREE" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 7501 ]
+  [ "$(registered_port_of "$OTHER_REPO" bone)" = 7502 ]
+}
+
+@test "a port range keeps a port the worktree already has inside the range" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 7510
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 7510 ]
+  [ "$(managed_port_of "$WORKTREE_ONE")" = 7510 ]
+  [[ "$output" != *"is outside WERKSFEER_PORT_RANGE"* ]]
+}
+
+@test "a port range moves a worktree whose port lies outside it" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 7500 ]
+  [ "$(managed_port_of "$WORKTREE_ONE")" = 7500 ]
+  [ "$(wc -l < "${XDG_DATA_HOME}/werksfeer/allocations")" -eq 1 ]
+  # The Redis fields of the line stay.
+  [ "$(cut -f4,5 "${XDG_DATA_HOME}/werksfeer/allocations")" = "$(printf '1\t10001')" ]
+  [ "$(grep -c 'Port 4001 is outside WERKSFEER_PORT_RANGE 7500-7579, moved to 7500' <<< "$output")" -eq 1 ]
+  grep -qF 'export PORT="7500"' "${WORKTREE_ONE}/.envrc"
+  ! grep -qF '4001' "${WORKTREE_ONE}/.envrc"
+}
+
+@test "a full port range stops setup, names the range and changes nothing" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$OTHER_REPO" a 7500 "$OTHER_REPO" b 7501
+  cp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"WERKSFEER_PORT_RANGE 7500-7501"* ]]
+  [[ "$output" == *"werksfeer --prune"* ]]
+  cmp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+  [ ! -e "${WORKTREE_ONE}/.envrc" ]
+  [ ! -s "$PG_LOG" ]
+}
+
+@test "a full port range does not move a worktree to a port outside it" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001 "$OTHER_REPO" a 7500
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7500 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 4001 ]
+}
+
+@test "an invalid port range is an error that names the variable and changes nothing" {
+  install_fake_pg
+  write_shared_config
+  local value
+  for value in abc 7500 7500- -7500 7500-7500-7600 75a0-7600 7600-7500 1000-2000 7500-70000 80-9000 "7500 - 7600"; do
+    run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE="$value" "$WERKSFEER"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"WERKSFEER_PORT_RANGE"* ]]
+    [ ! -e "${XDG_DATA_HOME}/werksfeer/allocations" ]
+    [ ! -e "${WORKTREE_ONE}/.envrc" ]
+    [ ! -s "$PG_LOG" ]
+  done
+}
+
+@test "the boundaries 1024 and 65535 are valid port range values" {
+  install_fake_pg
+  write_shared_config
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=65535-65535 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 65535 ]
+  run_in_worktree "$WORKTREE_TWO" env WERKSFEER_PORT_RANGE=1024-1030 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" two)" = 1024 ]
+}
+
+@test "concurrent setups with a port range never share a port" {
+  install_fake_pg
+  write_shared_config
+  local one_more="${TEST_ROOT}/worktrees/three"
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$one_more" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${one_more}/.worktree.toml"
+  local dir
+  for dir in "$WORKTREE_ONE" "$WORKTREE_TWO" "$one_more"; do
+    (cd "$dir" && PATH="$FAKE_BIN:$PATH" WERKSFEER_PORT_RANGE=7500-7579 "$WERKSFEER" > /dev/null 2>&1) &
+  done
+  wait
+  [ "$(cut -f3 "${XDG_DATA_HOME}/werksfeer/allocations" | sort -u | tr '\n' ' ')" = "7500 7501 7502 " ]
+}
+
+# A registry so long that grep quits before awk has written everything: a
+# pipe into "grep -q" fails under pipefail then and a taken port looks free.
+write_long_registry() {
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  {
+    printf '%s\t%s\t%s\t%s\t%s\n' "$OTHER_REPO" first "$1" 1 6000
+    awk -v repo="$OTHER_REPO" 'BEGIN { for (i = 1; i <= 30000; i++) printf "%s\tw%d\t%d\t1\t%d\n", repo, i, 20000 + i, 30000 + i }'
+  } > "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+@test "a port range with its only port taken is full however long the registry is" {
+  install_fake_pg
+  write_shared_config
+  OTHER_REPO="${TEST_ROOT}/other"
+  write_long_registry 7500
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7500 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"No free port left in WERKSFEER_PORT_RANGE 7500-7500"* ]]
+  [ -z "$(registered_port_of "$MAIN_REPO" one)" ]
+}
+
+@test "without a port range a taken base port stays taken however long the registry is" {
+  install_fake_pg
+  write_shared_config
+  OTHER_REPO="${TEST_ROOT}/other"
+  write_long_registry 4001
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 4002 ]
+}
+
+@test "setups at the same moment cannot take more ports than the range has" {
+  install_fake_pg
+  write_shared_config
+  local three="${TEST_ROOT}/worktrees/three" dir pid i=0
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$three" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${three}/.worktree.toml"
+
+  local -a dirs=("$WORKTREE_ONE" "$WORKTREE_TWO" "$three") pids=()
+  for dir in "${dirs[@]}"; do
+    (cd "$dir" && PATH="$FAKE_BIN:$PATH" WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER" > "${TEST_ROOT}/out.$i" 2>&1) &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  local ok=0 failed=""
+  for i in 0 1 2; do
+    if wait "${pids[$i]}"; then
+      ok=$((ok + 1))
+      [ -f "${dirs[$i]}/.envrc" ]
+    else
+      failed="$i"
+    fi
+  done
+  [ "$ok" -eq 2 ]
+  [ -n "$failed" ]
+  grep -q 'No free port left in WERKSFEER_PORT_RANGE 7500-7501' "${TEST_ROOT}/out.${failed}"
+
+  [ "$(cut -f3 "${XDG_DATA_HOME}/werksfeer/allocations" | sort | tr '\n' ' ')" = "7500 7501 " ]
+  [ ! -e "${dirs[$failed]}/.envrc" ]
+  [ -z "$(registered_port_of "$MAIN_REPO" "$(basename "${dirs[$failed]}")")" ]
+  # The loser never reached the database step.
+  [ "$(grep -c 'CREATE DATABASE' "$PG_LOG")" -eq 4 ]
+}
+
+@test "a setup that fails after reserving its port gives the port back" {
+  install_fake_pg
+  write_shared_config
+  touch "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [ ! -e "${WORKTREE_ONE}/.envrc" ]
+  [ -z "$(registered_port_of "$MAIN_REPO" one)" ]
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/state.lock" ]
+
+  rm -f "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_TWO" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" two)" = 7500 ]
+}
+
+@test "a setup that fails after moving a port restores the line the worktree had" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001
+  cp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+  touch "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  cmp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+}
+
+@test "a setup that finishes keeps its reserved port and the Redis fields of the line" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(cut -f3,4,5 "${XDG_DATA_HOME}/werksfeer/allocations")" = "$(printf '7500\t1\t10001')" ]
+  [ "$(grep -c 'moved to 7500' <<< "$output")" -eq 1 ]
 }

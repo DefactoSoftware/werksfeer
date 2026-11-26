@@ -424,6 +424,7 @@ Each worktree gets a unique port, Redis port, and Redis database number, so you 
 - **Ports** are allocated sequentially starting from the base port + 1 (e.g. 3001, 3002, ... for Rails). Ports are globally unique across all projects.
 - **Redis ports** are allocated sequentially starting from 6380. Each worktree runs its own Redis instance.
 - **Redis databases** are allocated per-project from 1–15 for extra isolation.
+- On a machine where only one range of ports is reachable from other machines (a shared dev server, say), set `WERKSFEER_PORT_RANGE=<first>-<last>`, for example `WERKSFEER_PORT_RANGE=7500-7579`. Every web port then comes from that range, ignoring `[port] base`. A newly assigned port is the lowest one in the range that is not in the registry. A worktree that already has a port in the range keeps it. A worktree whose port is outside the range gets a new port from the range on its next setup run, and Werksfeer logs the old and the new port. Redis ports and databases are not affected. When the range is full, setup stops with an error and changes nothing for that worktree. Free ports with `werksfeer --prune` or `werksfeer --cleanup`, or widen the range. The value must be `<first>-<last>` with both ends inside 1024-65535; any other value is an error too.
 - Allocations are tracked in a registry at `~/.local/share/werksfeer/allocations` and released on `--cleanup` or `--prune`.
 
 Your project needs to read the `PORT` environment variable for this to work. Examples:
