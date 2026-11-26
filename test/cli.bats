@@ -61,14 +61,14 @@ teardown() {
   run "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.4.0" ]
+  [ "$output" = "werksfeer 0.5.0" ]
 }
 
 @test "runs with the system Bash used by macOS" {
   run env PATH="/usr/bin:/bin" "$WERKSFEER" --version
 
   [ "$status" -eq 0 ]
-  [ "$output" = "werksfeer 0.4.0" ]
+  [ "$output" = "werksfeer 0.5.0" ]
 }
 
 @test "derives a stable short socket path for each worktree" {
