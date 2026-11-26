@@ -3273,3 +3273,13 @@ write_long_registry() {
   [[ "$output" == *"No free port left in WERKSFEER_PORT_RANGE 7500-7500"* ]]
   [ -z "$(registered_port_of "$MAIN_REPO" one)" ]
 }
+
+@test "without a port range a taken base port stays taken however long the registry is" {
+  install_fake_pg
+  write_shared_config
+  OTHER_REPO="${TEST_ROOT}/other"
+  write_long_registry 4001
+  run_in_worktree "$WORKTREE_ONE" "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" one)" = 4002 ]
+}

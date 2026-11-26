@@ -188,12 +188,10 @@ registry_has() {
 # Find the next available port starting from base+1, skipping any already in the registry.
 allocate_port() {
   local base_port="$1"
-  local alloc
-  alloc="$(allocations_file)"
   local port=$(( base_port + 1 ))
 
   while true; do
-    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $3}' "$alloc" | grep -qxF "$port"; then
+    if ! registry_has 3 "$port"; then
       echo "$port"
       return
     fi
@@ -286,12 +284,10 @@ move_allocation_port() {
 # Find the next available Redis DB (1-15) for a given project, skipping any in use.
 allocate_redis_db() {
   local project="$1"
-  local alloc
-  alloc="$(allocations_file)"
   local db=1
 
   while [ "$db" -le 15 ]; do
-    if [ ! -f "$alloc" ] || ! awk -F'\t' -v p="$project" '$1 == p {print $4}' "$alloc" | grep -qxF "$db"; then
+    if ! registry_has 4 "$db" "$project"; then
       echo "$db"
       return
     fi
@@ -306,12 +302,10 @@ allocate_redis_db() {
 # Find the next available Redis port starting from base+1, skipping any already in the registry.
 allocate_redis_port() {
   local base_port="$1"
-  local alloc
-  alloc="$(allocations_file)"
   local port=$(( base_port + 1 ))
 
   while true; do
-    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $5}' "$alloc" | grep -qxF "$port"; then
+    if ! registry_has 5 "$port"; then
       echo "$port"
       return
     fi
