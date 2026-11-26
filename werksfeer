@@ -251,22 +251,126 @@ port_range_full_error() {
   log_error "No free port left in WERKSFEER_PORT_RANGE ${PORT_RANGE_FIRST}-${PORT_RANGE_LAST}. Free ports with 'werksfeer --prune' (or --cleanup for a worktree you no longer use), or widen the range."
 }
 
-# Before anything is changed: stop when this worktree needs a port from the
-# range and the range is full. write_env_overrides checks again under the lock.
-port_range_preflight() {
+# Decide the ports of a worktree and make the registry say so. The state lock
+# must be held. Sets WT_PORT, WT_REDIS_DB and WT_REDIS_PORT. A worktree with a
+# registry line keeps it, except that a port outside the port range is
+# replaced by one from the range. Returns 1 (error logged, registry untouched)
+# when the range is full.
+allocate_worktree_ports() {
+  local project_type="$1" project_root="$2" wt_name="$3"
+  local existing base_redis
+  existing="$(lookup_allocation "$project_root" "$wt_name")"
+  base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
+  WT_PORT="" WT_REDIS_DB="" WT_REDIS_PORT=""
+  if [ -n "$existing" ]; then
+    WT_PORT="$(echo "$existing" | cut -f1)"
+    WT_REDIS_DB="$(echo "$existing" | cut -f2)"
+    WT_REDIS_PORT="$(echo "$existing" | cut -f3)"
+    log_debug "Reusing allocation: port=$WT_PORT redis_db=$WT_REDIS_DB redis_port=$WT_REDIS_PORT"
+    if [ -n "$PORT_RANGE_FIRST" ] && ! port_in_range "$WT_PORT"; then
+      local old_port="$WT_PORT" new_port
+      if ! new_port="$(allocate_port_in_range)"; then
+        port_range_full_error
+        return 1
+      fi
+      move_allocation_port "$project_root" "$wt_name" "$new_port" || {
+        log_error "Could not update the allocation of $wt_name"
+        return 1
+      }
+      WT_PORT="$new_port"
+      log_info "Port ${old_port} is outside WERKSFEER_PORT_RANGE ${PORT_RANGE_FIRST}-${PORT_RANGE_LAST}, moved to ${WT_PORT}"
+    fi
+  else
+    if [ -n "$PORT_RANGE_FIRST" ]; then
+      WT_PORT="$(allocate_port_in_range)" || {
+        port_range_full_error
+        return 1
+      }
+    else
+      local base_port
+      base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
+      WT_PORT="$(allocate_port "$base_port")"
+    fi
+    WT_REDIS_DB="$(allocate_redis_db "$project_root")"
+  fi
+
+  if [ -n "$base_redis" ] && [ -z "$WT_REDIS_PORT" ]; then
+    local base_redis_port
+    base_redis_port="$(echo "$base_redis" | grep -oE ':[0-9]+' | tail -1 | tr -d ':')"
+    base_redis_port="${base_redis_port:-6379}"
+    WT_REDIS_PORT="$(allocate_redis_port "$base_redis_port")"
+  fi
+
+  if [ -z "$existing" ]; then
+    register_allocation "$project_root" "$wt_name" "$WT_PORT" "$WT_REDIS_DB" "$WT_REDIS_PORT"
+  fi
+}
+
+# The whole registry line of a worktree (empty when it has none).
+registry_line() {
+  local alloc
+  alloc="$(allocations_file)"
+  [ -f "$alloc" ] || return 0
+  awk -F'\t' -v p="$1" -v w="$2" '$1 == p && $2 == w { print; exit }' "$alloc"
+}
+
+# With a port range, reserve the ports of this worktree before anything else is
+# changed: stop when the range is full, so that a setup that cannot get a port
+# changes nothing, and two setups at the same moment cannot both take the last
+# free port. The reservation is a normal registry line. It is taken back (the
+# line the worktree had before the run is restored) by werksfeer_on_exit unless
+# reservation_keep ran, which write_env_overrides does once the environment
+# files are written.
+port_range_reserve() {
   [ -n "$PORT_RANGE_FIRST" ] || return 0
-  local project_root wt_name existing port
+  local project_type="$1" project_root wt_name before after
   project_root="$(get_main_worktree_path)"
   wt_name="$(get_worktree_name)"
   state_lock_acquire || return 1
-  existing="$(lookup_allocation "$project_root" "$wt_name" | cut -f1)"
-  if port_in_range "$existing" || allocate_port_in_range >/dev/null; then
+  before="$(registry_line "$project_root" "$wt_name")"
+  if ! allocate_worktree_ports "$project_type" "$project_root" "$wt_name"; then
     state_lock_release
-    return 0
+    return 1
+  fi
+  after="$(registry_line "$project_root" "$wt_name")"
+  if [ "$before" != "$after" ]; then
+    WERKSFEER_RESERVED_PROJECT="$project_root"
+    WERKSFEER_RESERVED_WORKTREE="$wt_name"
+    WERKSFEER_RESERVED_BEFORE="$before"
   fi
   state_lock_release
-  port_range_full_error
-  return 1
+}
+
+reservation_keep() {
+  WERKSFEER_RESERVED_PROJECT=""
+  WERKSFEER_RESERVED_WORKTREE=""
+  WERKSFEER_RESERVED_BEFORE=""
+}
+
+# Put the registry line of the worktree back as it was before the reservation:
+# the old line, or none.
+reservation_rollback() {
+  [ -n "$WERKSFEER_RESERVED_WORKTREE" ] || return 0
+  local project="$WERKSFEER_RESERVED_PROJECT" wt_name="$WERKSFEER_RESERVED_WORKTREE"
+  local before="$WERKSFEER_RESERVED_BEFORE" alloc tmp
+  reservation_keep
+  alloc="$(allocations_file)"
+  state_lock_acquire || {
+    log_warn "Could not take back the port reserved for $wt_name: werksfeer --prune frees it"
+    return 0
+  }
+  if [ -f "$alloc" ]; then
+    tmp="${alloc}.tmp"
+    WERKSFEER_BEFORE_LINE="$before" awk -F'\t' -v p="$project" -v w="$wt_name" '
+      $1 == p && $2 == w {
+        if (!done && ENVIRON["WERKSFEER_BEFORE_LINE"] != "") print ENVIRON["WERKSFEER_BEFORE_LINE"]
+        done = 1
+        next
+      }
+      { print }
+    ' "$alloc" > "$tmp" && mv "$tmp" "$alloc"
+  fi
+  state_lock_release
 }
 
 # Give a worktree whose registered port lies outside the range a new one.
@@ -322,6 +426,9 @@ allocate_redis_port() {
 WERKSFEER_LOCK_DEPTH=0
 WERKSFEER_LOCK_DIR=""
 WERKSFEER_WORKTREE_LOCK_DIR=""
+WERKSFEER_RESERVED_PROJECT=""
+WERKSFEER_RESERVED_WORKTREE=""
+WERKSFEER_RESERVED_BEFORE=""
 
 # Take the lock directory $1, waiting up to $2 seconds. Used by both locks.
 lock_take() {
@@ -407,6 +514,7 @@ werksfeer_on_exit() {
     state_lock_release
   fi
   worktree_lock_release
+  reservation_rollback || true
 }
 
 # Register an allocation
@@ -1582,66 +1690,22 @@ allow_project_environment() {
 write_env_overrides() {
   local project_type="$1"
   local worktree_root="$2"
-  local wt_name project_root existing base_redis
+  local wt_name project_root base_redis
   wt_name="$(get_worktree_name)"
   project_root="$(get_main_worktree_path)"
-  existing="$(lookup_allocation "$project_root" "$wt_name")"
   base_redis="$(toml_get "redis" "url" "$(default_redis_url "$project_type")")"
+  port_range_load || return 1
 
   # Choosing free ports and registering them must not interleave with another
-  # setup, or two worktrees could get the same port.
+  # setup, or two worktrees could get the same port. With a port range the
+  # preflight of run_setup has reserved them already; this finds that line.
   state_lock_acquire || return 1
-  existing="$(lookup_allocation "$project_root" "$wt_name")"
-  local wt_port redis_db redis_port=""
-  if ! port_range_load; then
+  if ! allocate_worktree_ports "$project_type" "$project_root" "$wt_name"; then
     state_lock_release
     return 1
   fi
-  if [ -n "$existing" ]; then
-    wt_port="$(echo "$existing" | cut -f1)"
-    redis_db="$(echo "$existing" | cut -f2)"
-    redis_port="$(echo "$existing" | cut -f3)"
-    log_debug "Reusing allocation: port=$wt_port redis_db=$redis_db redis_port=$redis_port"
-    if [ -n "$PORT_RANGE_FIRST" ] && ! port_in_range "$wt_port"; then
-      local old_port="$wt_port"
-      if ! wt_port="$(allocate_port_in_range)"; then
-        state_lock_release
-        port_range_full_error
-        return 1
-      fi
-      if ! move_allocation_port "$project_root" "$wt_name" "$wt_port"; then
-        state_lock_release
-        log_error "Could not update the allocation of $wt_name"
-        return 1
-      fi
-      log_info "Port ${old_port} is outside WERKSFEER_PORT_RANGE ${PORT_RANGE_FIRST}-${PORT_RANGE_LAST}, moved to ${wt_port}"
-    fi
-  else
-    if [ -n "$PORT_RANGE_FIRST" ]; then
-      if ! wt_port="$(allocate_port_in_range)"; then
-        state_lock_release
-        port_range_full_error
-        return 1
-      fi
-    else
-      local base_port
-      base_port="$(toml_get "port" "base" "$(default_base_port "$project_type")")"
-      wt_port="$(allocate_port "$base_port")"
-    fi
-    redis_db="$(allocate_redis_db "$project_root")"
-  fi
-
-  if [ -n "$base_redis" ] && [ -z "$redis_port" ]; then
-    local base_redis_port
-    base_redis_port="$(echo "$base_redis" | grep -oE ':[0-9]+' | tail -1 | tr -d ':')"
-    base_redis_port="${base_redis_port:-6379}"
-    redis_port="$(allocate_redis_port "$base_redis_port")"
-  fi
-
-  if [ -z "$existing" ]; then
-    register_allocation "$project_root" "$wt_name" "$wt_port" "$redis_db" "$redis_port"
-  fi
   state_lock_release
+  local wt_port="$WT_PORT" redis_db="$WT_REDIS_DB" redis_port="$WT_REDIS_PORT"
 
   local wt_redis=""
   if [ -n "$base_redis" ]; then
@@ -1696,6 +1760,7 @@ ${service_env}"
   # files above remain available for processes that load them themselves.
   write_managed_env_block ".envrc" "$(managed_shell_environment "$common_assignments")"
   allow_project_environment
+  reservation_keep
 
   log_info "Port: ${wt_port}"
   if [ -n "$wt_redis" ]; then
@@ -2841,9 +2906,8 @@ run_setup() {
   log_info "Main:     $main_path"
   log_info "Worktree: $worktree_path"
 
-  # A bad or full port range stops the setup before anything is changed.
+  # A bad value of the port range stops the setup before anything is changed.
   port_range_load || return 1
-  port_range_preflight || return 1
 
   load_project_configuration "$worktree_path"
 
@@ -2851,6 +2915,7 @@ run_setup() {
   local project_type
   project_type="$(detect_project_type "$main_path")"
   log_info "Project type: $project_type"
+  port_range_reserve "$project_type" || return 1
 
   if managed_cache_auto_warm_enabled; then
     if ! managed_cache_warm "$worktree_path"; then

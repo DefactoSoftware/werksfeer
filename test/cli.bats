@@ -3283,3 +3283,73 @@ write_long_registry() {
   [ "$status" -eq 0 ]
   [ "$(registered_port_of "$MAIN_REPO" one)" = 4002 ]
 }
+
+@test "setups at the same moment cannot take more ports than the range has" {
+  install_fake_pg
+  write_shared_config
+  local three="${TEST_ROOT}/worktrees/three" dir pid i=0
+  git -C "$MAIN_REPO" -c core.hooksPath=/dev/null worktree add -q --detach "$three" HEAD
+  cp "${MAIN_REPO}/.worktree.toml" "${three}/.worktree.toml"
+
+  local -a dirs=("$WORKTREE_ONE" "$WORKTREE_TWO" "$three") pids=()
+  for dir in "${dirs[@]}"; do
+    (cd "$dir" && PATH="$FAKE_BIN:$PATH" WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER" > "${TEST_ROOT}/out.$i" 2>&1) &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  local ok=0 failed=""
+  for i in 0 1 2; do
+    if wait "${pids[$i]}"; then
+      ok=$((ok + 1))
+      [ -f "${dirs[$i]}/.envrc" ]
+    else
+      failed="$i"
+    fi
+  done
+  [ "$ok" -eq 2 ]
+  [ -n "$failed" ]
+  grep -q 'No free port left in WERKSFEER_PORT_RANGE 7500-7501' "${TEST_ROOT}/out.${failed}"
+
+  [ "$(cut -f3 "${XDG_DATA_HOME}/werksfeer/allocations" | sort | tr '\n' ' ')" = "7500 7501 " ]
+  [ ! -e "${dirs[$failed]}/.envrc" ]
+  [ -z "$(registered_port_of "$MAIN_REPO" "$(basename "${dirs[$failed]}")")" ]
+  # The loser never reached the database step.
+  [ "$(grep -c 'CREATE DATABASE' "$PG_LOG")" -eq 4 ]
+}
+
+@test "a setup that fails after reserving its port gives the port back" {
+  install_fake_pg
+  write_shared_config
+  touch "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [ ! -e "${WORKTREE_ONE}/.envrc" ]
+  [ -z "$(registered_port_of "$MAIN_REPO" one)" ]
+  [ ! -e "${XDG_DATA_HOME}/werksfeer/state.lock" ]
+
+  rm -f "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_TWO" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(registered_port_of "$MAIN_REPO" two)" = 7500 ]
+}
+
+@test "a setup that fails after moving a port restores the line the worktree had" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001
+  cp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+  touch "$PG_LIST_FAIL"
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  cmp "${XDG_DATA_HOME}/werksfeer/allocations" "${TEST_ROOT}/allocations.before"
+}
+
+@test "a setup that finishes keeps its reserved port and the Redis fields of the line" {
+  install_fake_pg
+  write_shared_config
+  write_allocations "$MAIN_REPO" one 4001
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7501 "$WERKSFEER"
+  [ "$status" -eq 0 ]
+  [ "$(cut -f3,4,5 "${XDG_DATA_HOME}/werksfeer/allocations")" = "$(printf '7500\t1\t10001')" ]
+  [ "$(grep -c 'moved to 7500' <<< "$output")" -eq 1 ]
+}
