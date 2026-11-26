@@ -3252,3 +3252,24 @@ managed_port_of() {
   wait
   [ "$(cut -f3 "${XDG_DATA_HOME}/werksfeer/allocations" | sort -u | tr '\n' ' ')" = "7500 7501 7502 " ]
 }
+
+# A registry so long that grep quits before awk has written everything: a
+# pipe into "grep -q" fails under pipefail then and a taken port looks free.
+write_long_registry() {
+  mkdir -p "${XDG_DATA_HOME}/werksfeer"
+  {
+    printf '%s\t%s\t%s\t%s\t%s\n' "$OTHER_REPO" first "$1" 1 6000
+    awk -v repo="$OTHER_REPO" 'BEGIN { for (i = 1; i <= 30000; i++) printf "%s\tw%d\t%d\t1\t%d\n", repo, i, 20000 + i, 30000 + i }'
+  } > "${XDG_DATA_HOME}/werksfeer/allocations"
+}
+
+@test "a port range with its only port taken is full however long the registry is" {
+  install_fake_pg
+  write_shared_config
+  OTHER_REPO="${TEST_ROOT}/other"
+  write_long_registry 7500
+  run_in_worktree "$WORKTREE_ONE" env WERKSFEER_PORT_RANGE=7500-7500 "$WERKSFEER"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"No free port left in WERKSFEER_PORT_RANGE 7500-7500"* ]]
+  [ -z "$(registered_port_of "$MAIN_REPO" one)" ]
+}

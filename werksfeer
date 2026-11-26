@@ -170,6 +170,21 @@ allocations_file() {
   echo "${XDG_DATA_HOME:-$HOME/.local/share}/werksfeer/allocations"
 }
 
+# Succeeds when column COLUMN of the registry holds VALUE (for the rows of
+# PROJECT only, when given). One awk decides by its exit status: a pipe into
+# "grep -q" would fail under pipefail when awk is killed by SIGPIPE after grep
+# found the value and quit, and a taken value would count as free.
+registry_has() {
+  local column="$1" value="$2" project="${3:-}" alloc
+  alloc="$(allocations_file)"
+  [ -f "$alloc" ] || return 1
+  awk -F'\t' -v c="$column" -v v="$value" -v p="$project" '
+    p != "" && $1 != p { next }
+    ($c "") == (v "") { found = 1; exit }
+    END { exit !found }
+  ' "$alloc"
+}
+
 # Find the next available port starting from base+1, skipping any already in the registry.
 allocate_port() {
   local base_port="$1"
@@ -223,11 +238,9 @@ port_in_range() {
 # Print the lowest port of the range that is not in the registry. Returns 1
 # when the range is full.
 allocate_port_in_range() {
-  local alloc port
-  alloc="$(allocations_file)"
-  port="$PORT_RANGE_FIRST"
+  local port="$PORT_RANGE_FIRST"
   while [ "$port" -le "$PORT_RANGE_LAST" ]; do
-    if [ ! -f "$alloc" ] || ! awk -F'\t' '{print $3}' "$alloc" | grep -qxF "$port"; then
+    if ! registry_has 3 "$port"; then
       echo "$port"
       return 0
     fi
